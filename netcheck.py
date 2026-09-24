@@ -137,13 +137,20 @@ class NvrHealth:
 class NetworkMonitor:
     """Checks each unique NVR every `interval` seconds in one background thread."""
 
-    def __init__(self, nvrs, cctv_subnet, interval=5.0, timeout=1.0, endpoint_fn=None):
+    def __init__(self, nvrs, cctv_subnet, interval=5.0, timeout=1.0, endpoint_fn=None,
+                 fail_threshold=3):
         self._nvrs        = nvrs
         self._subnet      = cctv_subnet
         self._interval    = interval
         self._timeout     = timeout
         self._endpoint    = endpoint_fn or (lambda k: (nvrs[k]["ip"], nvrs[k].get("port", 554)))
         self._health      = {k: NvrHealth() for k in nvrs}
+        self._fails       = {k: 0 for k in nvrs}
+        # Consecutive failed checks before an NVR is declared unreachable. The port
+        # check is a single TCP connect with a short timeout; over the public path
+        # it is jittery, so one slow check must NOT drop live cameras. Only after
+        # this many failures in a row (interval * threshold seconds) do we gate.
+        self._fail_threshold = max(1, fail_threshold)
         self._lock        = threading.Lock()
         self._running     = False
 
@@ -173,15 +180,23 @@ class NetworkMonitor:
         on_lan = on_subnet(self._subnet)
         for key in self._nvrs:
             ip, port = self._endpoint(key)
+            ok = check_port(ip, port, self._timeout)
+            self._fails[key] = 0 if ok else self._fails.get(key, 0) + 1
+
             h = NvrHealth()
-            h.on_lan    = on_lan
-            h.port_open = check_port(ip, port, self._timeout)
-            if not h.port_open:
-                h.route   = has_route_to(ip)
-                h.host_up = check_host(ip, self._timeout)
+            h.on_lan = on_lan
+            # Hysteresis: treat the NVR as reachable while a working link has only
+            # briefly hiccuped (fewer than _fail_threshold failures in a row), so a
+            # single slow public-path check never interrupts streaming cameras.
+            if ok or self._fails[key] < self._fail_threshold:
+                h.port_open = True
+                h.route     = True
+                h.label     = S_LIVE_OK
             else:
-                h.route = True
-            h.label   = self._classify(h)
+                h.port_open = False
+                h.route     = has_route_to(ip)
+                h.host_up   = check_host(ip, self._timeout)
+                h.label     = self._classify(h)
             h.checked = time.time()
             with self._lock:
                 self._health[key] = h

@@ -197,4 +197,61 @@ HONEST LIMITATIONS (not hidden):
   Measurement scripts kept in-repo    : measure_startup.py, measure_stagger.py,
      measure_final.py, measure_timeout.py, measure_params.py, measure_tune.py
      (these are the raw evidence for every number above; safe to delete).
+
+--------------------------------------------------------------------------------
+10. FOLLOW-UP: "some cameras never come / stuck on Waiting for NVR slot" on the
+    later pages (2-5)
+--------------------------------------------------------------------------------
+Symptom: on pages 2/3/4/5, only 1-2 tiles showed video; others sat on
+"Connecting...", "Waiting for NVR slot..." or flickered in and out.
+
+Diagnosed with /api/status + a direct channel probe (map_channels.py) and a
+concurrency test (test_stability.py). THREE distinct causes, all now fixed:
+
+(1) DEAD-CHANNEL SLOT STARVATION -> "Waiting for NVR slot...".
+    A dead/absent channel held one of the NVR's 6 slots for the whole ~8 s of its
+    (failing) open, so on a page with 1-2 dead channels the working cameras were
+    starved of slots, especially during page hand-offs.
+    FIX: take the NVR slot AFTER a successful open, not before -- a failing open
+    now never occupies a slot. Only real live streams count against the cap.
+    RESULT: pages 2/3/4 show every working camera; "Waiting for NVR slot" is gone.
+
+(2) NETWORK-MONITOR FLAPPING -> healthy cameras dropped to "CCTV NETWORK
+    UNREACHABLE". The monitor did a single 1 s TCP check every 5 s; over the
+    PUBLIC path one jittery check flipped a healthy NVR to "down" and gated its
+    live cameras.
+    FIX: hysteresis -- an NVR is only declared down after 3 consecutive failed
+    checks (~15 s), and the check timeout was raised to 2 s (CCTV_NETWORK_TIMEOUT).
+    RESULT: zero false "unreachable" over sustained polling.
+
+(3) DEAD-CHANNEL CHURN + wasted CPU -> live streams flickered.
+    Dead channels retried every ~5 s; each 8 s open hogged the serialized connect
+    gate, so a healthy stream that briefly dropped could not re-open for 15-25 s.
+    Separately, each worker JPEG-encoded EVERY decoded frame (~20-25 fps) though
+    only 8 fps is served -- needless CPU that starved the reads.
+    FIX: exponential backoff for repeatedly-failing channels (1,2,4,8,16,30 s cap)
+    so a dead channel stops hammering the NVR/gate; and decode every frame but
+    ENCODE only at the serve rate (STREAM_FPS).
+    RESULT: page 4 went from 1-2 flickering to a steady 5 LIVE; server CPU for 5
+    live cameras dropped from ~1.2 cores to ~0.46 core; memory ~266 MB.
+
+GROUND TRUTH (map_channels.py, direct open of every channel): 7 of 25 channels
+were dead or intermittent at test time -- nvr2 ch4,7,12,13 and nvr1 ch7,10,12
+(several are flaky rather than fully dead and recover on their own). These show
+"Offline" now, which is correct: there is no working camera on those channels, so
+no software change can produce video for them. Every WORKING channel now streams.
+
+  Per page after the fix (working / dead-or-offline):
+    Page 1 (nvr2 1-6):        5 live / 1 offline
+    Page 2 (nvr2 7-12):       4 live / 2 offline
+    Page 3 (nvr2 13+nvr1 3-7):5 live / 1 offline
+    Page 4 (nvr1 8-13):       5 live / 1 offline
+    Page 5 (nvr1 14):         1 live / 0
+
+  New verification:
+    python -m py_compile server.py  : PASS
+    python test_lifecycle.py        : 11 / 11 PASS
+    Real-browser pages 1-5          : PASS (all working cameras live, stable)
+    Diagnostic scripts in-repo      : map_channels.py (which channels are dead),
+                                      test_stability.py (NVR concurrent-stream test)
 ================================================================================

@@ -34,13 +34,22 @@ def _envint(name, default):
     except (TypeError, ValueError):
         return default
 
+def _envfloat(name, default):
+    try:
+        return float(os.getenv(name, ""))
+    except (TypeError, ValueError):
+        return default
+
 
 # ── network settings ──────────────────────────────────────────────────
 SUBNET      = _env("CCTV_SUBNET_PREFIX", "192.168.1")
 CCTV_SUBNET = _env("CCTV_SUBNET_CIDR", "192.168.1.0/24")
 RTSP_PORT   = _envint("CCTV_RTSP_PORT", 554)
 NETWORK_CHECK_INTERVAL = 5.0
-NETWORK_TIMEOUT        = 1.0
+# TCP-connect timeout for the reachability check. 2 s (not 1 s) tolerates the
+# latency/jitter of reaching the NVRs over the public internet, so healthy NVRs
+# are not falsely flagged down. Combined with the monitor's failure hysteresis.
+NETWORK_TIMEOUT        = _envfloat("CCTV_NETWORK_TIMEOUT", 2.0)
 
 # The site's static public IP (used when the server is off the CCTV LAN).
 # Real value comes from CCTV_PUBLIC_IP in .env; empty here on purpose.

@@ -14,12 +14,15 @@ wrong. A camera's worker stops as soon as its last viewer leaves.
 NVR SLOT LIFECYCLE (the important part)
 ---------------------------------------
 Each NVR allows a limited number of simultaneous RTSP pulls (CCTV_NVR_MAX_CONN).
-A worker holds a slot ONLY while it actually has a stream open, and releases it:
+A worker takes a slot ONLY AFTER it has successfully opened the stream, and holds
+it only while it is actually pulling frames. It releases the slot:
   - the moment its last viewer leaves (worker exits, releases immediately), and
-  - after every failed/lost connection, BEFORE backing off — so an offline or
-    slow camera never hogs a slot and starve others.
-A worker also does not even try (and never takes a slot) while its NVR is
-unreachable, per the shared NetworkMonitor.
+  - the instant the stream drops.
+Crucially, a worker does NOT hold a slot during the (up to ~8 s) RTSP open, so a
+dead or slow channel's open attempt never occupies a slot a working camera needs
+-- this is what stops healthy tiles getting stuck on "Waiting for NVR slot..." on
+pages that also contain dead channels. A worker also does not even try (and never
+takes a slot) while its NVR is unreachable, per the shared NetworkMonitor.
 
 TIME-TO-FIRST-FRAME (measured, not guessed)
 -------------------------------------------
@@ -305,8 +308,40 @@ class CamStream:
                     time.sleep(2)
                     continue
 
-                # 2. Take an NVR active-stream slot for THIS attempt only.
-                self._set_status(gen, "Connecting...")
+                # 2. OPEN the stream FIRST, through the serialized fresh-first gate,
+                #    holding NO NVR slot yet. This is the key fix for "some cameras
+                #    stay on Waiting for NVR slot": a dead/slow channel's long (up to
+                #    ~8 s) open must never occupy one of the NVR's limited slots that
+                #    a working camera needs. The slot is taken only AFTER a successful
+                #    open (step 3), so only real, live streams count against the cap.
+                self._set_status(gen, "Connecting..." if fail_count == 0 else "Offline")
+                t0 = time.time()
+                is_retry = fail_count > 0 or _recently_failed(self.index)
+                cap = self._open_with_priority(gen, is_retry)
+                if cap is None:
+                    break                       # viewer left while we waited
+                if not cap.isOpened():
+                    cap.release()
+                    _note_open_fail(self.index)
+                    fail_count += 1
+                    self._set_status(gen, "Offline")
+                    self._log(gen, f"OPEN-FAIL after {time.time() - t0:.2f}s")
+                    if not self._current(gen):
+                        break
+                    # Escalating backoff WITHOUT holding a slot: 1,2,4,8,16,30 s cap.
+                    # A channel that keeps failing is almost certainly dead, so we
+                    # stop hammering the NVR/connect gate every few seconds -- those
+                    # repeated dead opens were disrupting the healthy cameras that
+                    # share the NVR and the serialized open path.
+                    time.sleep(min(2 ** min(fail_count - 1, 6), 30))
+                    continue
+                t_open = time.time()
+                _clear_open_fail(self.index)
+                fail_count = 0
+
+                # 3. Stream is open -> take an NVR slot and pull frames. This wait is
+                #    now rare (only if >CAP live streams on one NVR overlap, e.g. a
+                #    brief page hand-off), never caused by dead channels.
                 got = False
                 while self._current(gen) and not got:
                     if _slot_try_acquire(nvr):
@@ -314,69 +349,49 @@ class CamStream:
                     else:
                         self._set_status(gen, "Waiting for NVR slot...")
                 if not got:
-                    break   # viewer left while waiting
-
-                cap = None
-                live = False
+                    cap.release()
+                    break
                 try:
-                    # 3. Open the stream through the serialized, fresh-first connect
-                    #    gate (OpenCV serializes opens process-wide anyway); the gate
-                    #    is held ONLY across the open, never during streaming, and a
-                    #    just-failed camera yields it to healthy ones.
-                    t0 = time.time()
-                    is_retry = fail_count > 0 or _recently_failed(self.index)
-                    cap = self._open_with_priority(gen, is_retry)
-                    if cap is None:
-                        break                   # viewer left while we waited
-                    opened = cap.isOpened()
-                    t_open = time.time()
-
-                    if not opened:
-                        _note_open_fail(self.index)
-                        self._set_status(gen, "OFFLINE")
-                        self._log(gen, f"OPEN-FAIL after {t_open - t0:.2f}s")
-                    else:
-                        _clear_open_fail(self.index)
-                        live = True
-                        self._set_status(gen, "LIVE")
-                        self._log(gen, f"opened in {t_open - t0:.2f}s")
-                        first = True
-                        while self._current(gen):
-                            ok, frame = cap.read()
-                            if not ok or frame is None:
-                                self._set_status(gen, "Reconnecting...")
-                                break
-                            small = cv2.resize(frame, (STREAM_W, STREAM_H))
-                            okj, buf = cv2.imencode(
-                                ".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-                            if okj:
-                                data = buf.tobytes()
-                                with self._flock:
-                                    if gen == self._gen:
-                                        self.jpeg_bytes = data
-                                if first:
-                                    first = False
-                                    now = time.time()
-                                    self._log(gen, f"FIRST FRAME +{now - t_open:.2f}s "
-                                                   f"after open ({now - t0:.2f}s total)")
+                    self._set_status(gen, "LIVE")
+                    self._log(gen, f"opened in {t_open - t0:.2f}s")
+                    first = True
+                    last_encode = 0.0
+                    interval = 1.0 / max(1, STREAM_FPS)
+                    while self._current(gen):
+                        ok, frame = cap.read()
+                        if not ok or frame is None:
+                            self._set_status(gen, "Reconnecting...")
+                            break
+                        # Decouple decode from publish: a substream can arrive at
+                        # 20-25 fps but we only serve STREAM_FPS. Keep READING every
+                        # frame (so the RTSP stream stays current and does not stall),
+                        # but only resize+JPEG-encode at the publish rate -- encoding
+                        # every frame for every camera was needless CPU that could
+                        # starve the reads and cause drops.
+                        now = time.time()
+                        if not first and now - last_encode < interval:
+                            continue
+                        last_encode = now
+                        small = cv2.resize(frame, (STREAM_W, STREAM_H))
+                        okj, buf = cv2.imencode(
+                            ".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                        if okj:
+                            data = buf.tobytes()
+                            with self._flock:
+                                if gen == self._gen:
+                                    self.jpeg_bytes = data
+                            if first:
+                                first = False
+                                self._log(gen, f"FIRST FRAME +{now - t_open:.2f}s "
+                                               f"after open ({now - t0:.2f}s total)")
                 finally:
-                    if cap is not None:
-                        cap.release()
-                    _slot_release(nvr)   # ALWAYS free the slot after each attempt
+                    cap.release()
+                    _slot_release(nvr)   # free the slot the instant streaming ends
 
-                # 4. Back off between attempts WITHOUT holding a slot or the gate.
-                #    A stream that was LIVE and merely dropped retries fast; one that
-                #    fails to OPEN backs off progressively (1,2,3,4,5 s cap) so a dead
-                #    channel drifts to the back of the queue and stops delaying the
-                #    healthy cameras behind it on the serialized open path.
+                # 4. Stream was LIVE and merely dropped -> quick retry.
                 if not self._current(gen):
                     break
-                if live:
-                    fail_count = 0
-                    time.sleep(0.4)
-                else:
-                    fail_count += 1
-                    time.sleep(min(1.0 * fail_count, 5.0))
+                time.sleep(0.4)
         finally:
             with self._flock:
                 if gen == self._gen:
