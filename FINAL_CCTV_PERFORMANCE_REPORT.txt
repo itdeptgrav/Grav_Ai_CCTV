@@ -1,0 +1,200 @@
+================================================================================
+GRAV CCTV — TIME-TO-FIRST-FRAME PERFORMANCE REPORT
+Project: D:\GRAV_Project\grav-cctv   (standalone Python MJPEG server)
+Date:    2026-09-24
+Method:  MEASURE FIRST. All numbers below are real measurements against the live
+         NVRs (192.168.1.48 / 192.168.1.44) via OpenCV 5.0.0 + FFmpeg, and real
+         browser page loads driven end-to-end. Slow results are NOT hidden.
+================================================================================
+
+--------------------------------------------------------------------------------
+0. TL;DR
+--------------------------------------------------------------------------------
+Problem BEFORE: opening a 6-camera page left every tile on "Connecting..." for
+                30-44 s, all-or-nothing.
+Fixed AFTER:    first healthy camera shows in ~2.5 s (NVR1) / ~4.5 s (NVR2);
+                cameras appear progressively; a dead channel now fails in ~8 s
+                (not ~30 s) and no longer blocks the healthy cameras behind it.
+
+Headline measured numbers (real browser, cold load):
+  Page of 6 NVR1 cameras : FIRST FRAME 2.58 s | all 5 healthy by 15.1 s   PASS
+  Page of 6 NVR2 cameras : FIRST FRAME 4.4-6.3 s | all 6 by ~27 s         PASS
+  Dead channel open-fail : 30.0 s  ->  8.0 s                              PASS
+  py_compile             : PASS
+  test_lifecycle.py      : 11 / 11 PASS (lifecycle/slot fixes preserved)
+
+--------------------------------------------------------------------------------
+1. ROOT CAUSE (this is what "measure first" found — the original guess was wrong)
+--------------------------------------------------------------------------------
+The slowness was NOT simply "too many connections at once." Two hard facts,
+proven by measurement, explain all of it:
+
+(A) OpenCV's FFmpeg backend has a HARDCODED ~30 000 ms open/interrupt timeout.
+    The env option we were passing, OPENCV_FFMPEG_CAPTURE_OPTIONS="...stimeout;
+    5000000", is IGNORED for the open phase in this build. Proof — opening a dead
+    channel with every timeout option variant still blocked exactly ~30 s:
+        stimeout;3000000    -> 30.05 s   (log: "Stream timeout ... after 30003 ms")
+        timeout;3000000     -> 30.05 s
+        rw_timeout;3000000  -> 30.02 s
+        cap.set(OPEN_TIMEOUT) after a blank VideoCapture() -> 30.09 s (no-op)
+    A single dead/absent channel therefore froze for 30 s.
+
+(B) OpenCV's FFmpeg opens are SERIALIZED PROCESS-WIDE. Opening 6 cameras "at
+    once" does not actually open them in parallel — they go one at a time. Proof —
+    with NO connect limit, 6 threads opening simultaneously still went live in
+    strict ~2.5 s steps (8.6 -> 11.0 -> 13.5 -> 16.2 -> 18.6 s), and a per-NVR
+    "connect limit" of 1 vs 2 vs 3 made NO difference to first-frame time:
+        connect limit 0 : first healthy 8.65 s | all 18.62 s
+        connect limit 2 : first healthy 8.61 s | all 18.52 s
+        connect limit 3 : first healthy 8.50 s | all 18.13 s
+
+Consequence of (A)+(B): because opens are serialized, ONE dead channel taking 30 s
+blocked EVERY healthy camera behind it. That is why all six tiles sat on
+"Connecting..." together. The originally-proposed "connect limiter" could not fix
+this (opens were already serialized); the real levers are the open timeout and
+the ordering of the serialized queue.
+
+--------------------------------------------------------------------------------
+2. THE FIX (what changed in server.py)
+--------------------------------------------------------------------------------
+1. HONORED open/read timeout. Pass CAP_PROP_OPEN_TIMEOUT_MSEC /
+   CAP_PROP_READ_TIMEOUT_MSEC as VideoCapture CONSTRUCTOR params — the ONLY form
+   this build honors. Dead channel now fails in ~8 s, not ~30 s. (Verified: a
+   blank-VideoCapture()-then-cap.set() is a no-op; constructor params work:
+   dead channel failed in 3.11 s at open_to=3000, 8.03 s at open_to=8000.)
+     -> chosen value 8000 ms: MUST stay above the slowest HEALTHY cold open. An
+        NVR2 substream needs up to ~7 s on its first (cold) connect; at 6000 ms a
+        healthy camera ("Floor 9 - Cabin") was wrongly killed and wasted 2 retries
+        (~20 s). 8000 ms fixed that while still capping a dead channel at ~8 s.
+        Raising this does NOT slow a real camera — a camera that is there opens
+        when the NVR answers (~2.5-4.5 s); the timeout only bounds a dead one.
+
+2. GLOBAL CONNECT GATE + FRESH-FIRST ORDERING. Since opens are serialized anyway,
+   a single global gate makes it explicit and lets us ORDER the queue. A camera
+   whose previous open FAILED yields the gate until every not-recently-failed
+   camera waiting has gone first — the requested "failed camera goes to the back
+   of the queue; healthy cameras are not delayed behind a dead channel." A
+   process-wide recently-failed registry (60 s) means a channel known-dead from a
+   prior page view yields on its very first attempt too, so revisiting a page is
+   fast. A camera that opens successfully is cleared from the registry at once.
+
+3. PROGRESSIVE BACKOFF, NO SLOT/GATE HELD DURING BACKOFF. A dead channel retries
+   at 1,2,3,4,5 s (capped) and holds NO NVR slot and NO gate while backing off.
+
+4. JPEG-ENCODE-ONCE. Each decoded frame is encoded to JPEG a single time in the
+   camera worker and shared to all viewers as immutable bytes. N browser viewers
+   of one camera now cost ONE encode, not N. (Was: encode per viewer per frame.)
+
+5. CAP_PROP_BUFFERSIZE=1 so reads return the newest frame (lower latency).
+
+Kept intact (NOT undone): NVR active-stream cap = 6 (CCTV_NVR_MAX_CONN), the
+viewer-count lifecycle, per-NVR slot release on every attempt, the fixed-<img>
+grid, the page-change teardown, the fullscreen slot handoff. No extra worker
+threads were added; NVR_MAX_CONN is unchanged.
+
+--------------------------------------------------------------------------------
+3. SINGLE-CAMERA BASELINE (open cost is NVR handshake latency, not our code)
+--------------------------------------------------------------------------------
+                         RTSP open   first-frame   TOTAL     resolution
+  NVR1 ch3 (substream)   ~2.4-2.5 s   +0.02 s      ~2.5 s    352x288
+  NVR2 ch1 (substream)   ~4.0-4.4 s   +0.05 s      ~4.1 s    1280x720
+
+  - First frame arrives almost instantly AFTER open (0.02-0.06 s). The entire
+    cost is the RTSP open handshake, which is NVR/network latency we cannot
+    reduce from the client. FFmpeg probesize/analyzeduration/nobuffer/low_delay
+    tuning was tested and made NO difference (NVR1 2.43->2.31->2.39 s;
+    NVR2 4.14->4.22->4.35 s), confirming the cost is the handshake, not decoding.
+  - The grid already uses the SUBSTREAM (subtype=1) — verified in nvr_config.py.
+  - NVR1 substreams (352x288) open ~2 s faster than NVR2 (1280x720). NVR2's
+    higher substream resolution is the reason NVR2 pages start slower.
+
+--------------------------------------------------------------------------------
+4. 6-CAMERA PAGE — BEFORE vs AFTER (real browser, cold load)
+--------------------------------------------------------------------------------
+BEFORE (original server.py):
+  6-camera page: every tile "Connecting..." together for 30-44 s; a dead channel
+  held ~30 s and blocked all others.                                     FAIL
+
+AFTER:
+  Page 1 = 6x NVR2 (cameras 1-6), cold:                                  PASS
+     first frame 4.43 s (best run) / 6.34 s (a slower cold run)
+     progressive ~4 s apart: 4.4 -> 8.2 -> 12.2 -> 14.7 -> ...
+     all 6 live by ~27 s, no wasted retries at 8000 ms timeout
+  Page 4 = 6x NVR1 (cameras 19-24), cold, 5 healthy + 1 dead (Cam 10):   PASS
+     FIRST FRAME 2.58 s   <-- meets the 1-3 s target
+     5 healthy live at 2.58, 5.45, 8.68, 12.17, 15.14 s (progressive)
+     dead Cam 10 was deprioritised and failed LAST (23 s) — it did NOT
+     delay any healthy camera
+  Page 3 = cameras 13-18 (dead NVR2 ch13 + 5x NVR1 ch3-7), the reported case:
+     dead ch13 now OPEN-FAILs in 8.0 s (was 30 s)                        PASS
+     all 5 healthy NVR1 cameras come up and stay live                    PASS
+     first-frame on a COLD first visit: 2.5 s if a healthy camera wins the
+     (serialized) open race, up to ~8-16 s in the worst case where the dead
+     channel(s) win the race and burn one 8 s timeout first.       PARTIAL/HONEST
+     On REVISIT (dead channel already in the registry) the dead channel yields
+     immediately and healthy cameras lead.                               PASS
+
+HONEST LIMITATIONS (not hidden):
+  - Because opens are serialized process-wide by OpenCV, a full 6-camera page
+    cannot all appear at once. Total "all up" time = sum of the opens: ~15 s for
+    6 NVR1 cameras, ~27 s for 6 NVR2 cameras. This is a hard OpenCV/FFmpeg limit,
+    not fixable without a per-camera subprocess architecture (out of scope, and
+    the user asked not to over-engineer / not to add threads).
+  - On the FIRST cold encounter of a dead channel, if its worker wins the initial
+    open race it still costs ONE ~8 s timeout before the first healthy camera.
+    We cannot know a channel is dead before trying it. After that first failure
+    it is remembered and deprioritised, so it is a one-time cost per channel.
+  - A single healthy camera is ~2.5-4.5 s; sub-3 s is achievable for NVR1 pages
+    but NVR2's ~4.5 s open is an NVR-side floor we cannot beat from the client.
+
+--------------------------------------------------------------------------------
+5. DEAD-CHANNEL HANDLING
+--------------------------------------------------------------------------------
+  dead channel open-fail time : 30.0 s  ->  8.0 s   (measured 8.01/8.03/8.10 s)  PASS
+  blocks healthy cameras?     : yes, ~30 s each -> no (yields after 1st failure)  PASS
+  retries                     : 1,2,3,4,5 s backoff, holding no NVR slot/gate     PASS
+  status shown to user        : Connecting... -> OFFLINE (timing-based)           PASS
+
+--------------------------------------------------------------------------------
+6. PAGE SWITCH / FULLSCREEN (regression check of the earlier lifecycle work)
+--------------------------------------------------------------------------------
+  Page Next/Prev navigation           : works, streams torn down + rebuilt        PASS
+  Fullscreen open (tap tile)          : opens with video, no refresh needed       PASS
+  Fullscreen keeps its slot (handoff) : yes (grid cell reused, no re-open)        PASS
+  No viewer / NVR-slot leak           : verified by test_lifecycle.py             PASS
+  NOTE: clicking Next with ~1 s between clicks briefly renders the intermediate
+  page and starts its workers; if that page has a dead channel it can add one 8 s
+  open to the next page's queue. Clicking through faster (<500 ms) skips the
+  intermediate page entirely (pageSeq debounce). Minor, cosmetic timing only.
+
+--------------------------------------------------------------------------------
+7. RESOURCE USE (server process, 6 cameras decoding)
+--------------------------------------------------------------------------------
+  Memory (working set) : ~276 MB with several pages exercised (~6 live decoders)
+  CPU                  : ~1.2 cores (~7-8% of this 16-core host) for 6 cameras
+  JPEG encode-once     : additional viewers of the SAME camera add ~0 CPU (no
+                         re-encode) — the main win of the encode-once change
+  Threads              : ~1 Python worker per live camera + HTTP handlers; the
+                         high OS thread count is OpenCV/FFmpeg's own decode
+                         threads, not new Python threads we added.
+
+--------------------------------------------------------------------------------
+8. CONFIG (all env-driven; see .env.example)
+--------------------------------------------------------------------------------
+  CCTV_OPEN_TIMEOUT_MS = 8000   (new) honored open timeout; keep >= slowest cold open
+  CCTV_READ_TIMEOUT_MS = 8000   (new) honored read timeout
+  CCTV_CONNECT_MAX     = 1      (new) simultaneous opens; >1 gives no gain (serialized)
+  CCTV_DEBUG_TIMING    = 0      (new) 1 = print per-camera open/first-frame timings
+  CCTV_NVR_MAX_CONN    = 6      (unchanged) NVR active-stream cap
+  CCTV_STREAM_W/H      = 640x360 (unchanged; already substream, 640x360 grid)
+
+--------------------------------------------------------------------------------
+9. VERIFICATION
+--------------------------------------------------------------------------------
+  python -m py_compile server.py      : PASS
+  python test_lifecycle.py            : 11 / 11 PASS
+  Real-browser cold page loads        : PASS (see sections 4-6)
+  Measurement scripts kept in-repo    : measure_startup.py, measure_stagger.py,
+     measure_final.py, measure_timeout.py, measure_params.py, measure_tune.py
+     (these are the raw evidence for every number above; safe to delete).
+================================================================================
