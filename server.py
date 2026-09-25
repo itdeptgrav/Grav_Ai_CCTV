@@ -13,29 +13,27 @@ wrong. A camera's worker stops as soon as its last viewer leaves.
 
 NVR SLOT LIFECYCLE (the important part)
 ---------------------------------------
-Each NVR allows a limited number of simultaneous RTSP pulls (CCTV_NVR_MAX_CONN).
+Each NVR allows a limited number of simultaneous live pulls (CCTV_NVR_MAX_CONN).
 A worker takes a slot ONLY AFTER it has successfully opened the stream, and holds
-it only while it is actually pulling frames. It releases the slot:
-  - the moment its last viewer leaves (worker exits, releases immediately), and
-  - the instant the stream drops.
-Crucially, a worker does NOT hold a slot during the (up to ~8 s) RTSP open, so a
-dead or slow channel's open attempt never occupies a slot a working camera needs
--- this is what stops healthy tiles getting stuck on "Waiting for NVR slot..." on
-pages that also contain dead channels. A worker also does not even try (and never
-takes a slot) while its NVR is unreachable, per the shared NetworkMonitor.
+it only while it is actually pulling frames. It releases the slot the moment its
+last viewer leaves and the instant the stream drops. A failing/dead channel never
+holds a slot, and never holds one while it backs off. Who owns every slot is
+tracked (NVR_OWNERS) and reported in /api/status and in the log whenever a camera
+has to wait for a slot.
 
-TIME-TO-FIRST-FRAME (measured, not guessed)
--------------------------------------------
-OpenCV's FFmpeg backend serializes RTSP opens process-wide and, by default, lets
-a dead channel block ~30 s on its internal interrupt timeout. Two things fix the
-"all tiles stuck on Connecting..." delay:
-  - a per-capture OPEN/READ timeout passed as VideoCapture CONSTRUCTOR params
-    (CAP_PROP_OPEN_TIMEOUT_MSEC/READ) -- the only form this build honors -- so a
-    dead camera fails in ~6 s, not ~30 s, and stops blocking the ones behind it;
-  - a global CONNECT_GATE around the open only, plus progressive backoff on open
-    failure, so a dead channel drifts to the back of the serialized open queue and
-    healthy cameras appear progressively (first one in ~2.5-4.5 s) instead of all
-    waiting on the slowest/dead one. See FINAL_CCTV_PERFORMANCE_REPORT.txt.
+STARTUP PATH (measured, see FINAL_CCTV_DIAGNOSTIC_REPORT.txt)
+------------------------------------------------------------
+OpenCV's FFmpeg backend opens RTSP streams one at a time, process-wide. The NVRs
+never answer a DESCRIBE for a channel with no camera, and a healthy NVR2 channel
+takes ~3 s to answer when "cold". So each camera start is:
+  1. PRE-FLIGHT (rtsp_preflight.py): authenticated DESCRIBE, in parallel, outside
+     OpenCV's lock. Dead channels are detected here and never reach step 2; a
+     healthy channel's connection is held open, which keeps the NVR channel warm.
+  2. OpenCV open through CONNECT_GATE (serialized, fresh-first). Because the channel
+     is warm its DESCRIBE is answered in ~20 ms instead of ~3 s.
+  3. NVR slot, then frames: first frame is JPEG-encoded and published at once;
+     afterwards frames are decoded at full rate but encoded at CCTV_STREAM_FPS,
+     once per camera, and shared by every viewer.
 
 Host-ready: all settings come from the environment (see .env.example). Run:
 
@@ -59,16 +57,14 @@ try:
 except Exception:
     pass
 
-os.environ.setdefault(
-    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-    # Force RTSP-over-TCP. NOTE (measured): the FFmpeg 'stimeout'/'timeout'/
-    # 'rw_timeout' options are NOT honored by this OpenCV build for the OPEN phase
-    # -- a dead channel blocks on OpenCV's hardcoded 30 000 ms interrupt timeout
-    # regardless. The real open/read timeout is therefore set per-capture through
-    # CAP_PROP_OPEN_TIMEOUT_MSEC / CAP_PROP_READ_TIMEOUT_MSEC (see _open_capture),
-    # which IS honored, but only when passed as VideoCapture constructor params.
-    "rtsp_transport;tcp",
-)
+# RTSP over TCP, enforced BEFORE cv2 is imported -- also when the variable was
+# already set (e.g. in .env) without a transport. NOTE (measured): FFmpeg's
+# 'stimeout'/'timeout' options are not honored for the open phase by this OpenCV
+# build; the real timeouts are VideoCapture constructor params (_cap_open_params).
+_ffopts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", "")
+if "rtsp_transport" not in _ffopts:
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(
+        x for x in ("rtsp_transport;tcp", _ffopts) if x)
 
 import cv2
 import numpy as np
@@ -77,7 +73,10 @@ from nvr_config import (
     CAMERAS, NVRS, CCTV_SUBNET, NETWORK_CHECK_INTERVAL, NETWORK_TIMEOUT,
     make_url, resolve_nvr_ips, endpoint,
 )
-from netcheck import NetworkMonitor
+from netcheck import NetworkMonitor, sanitize_url
+import rtsp_preflight as rp
+from camera_settings import CameraSettings, camera_key
+from settings_page import SETTINGS_PAGE
 
 
 def _envint(name, default):
@@ -85,6 +84,18 @@ def _envint(name, default):
         return int(os.getenv(name, ""))
     except (TypeError, ValueError):
         return default
+
+
+def _envfloat(name, default):
+    try:
+        return float(os.getenv(name, ""))
+    except (TypeError, ValueError):
+        return default
+
+
+def _envflag(name, default):
+    v = os.getenv(name, "").strip().lower()
+    return default if not v else v in ("1", "true", "yes", "on")
 
 
 PORT         = _envint("CCTV_PORT", 8000)
@@ -95,45 +106,103 @@ STREAM_FPS   = _envint("CCTV_STREAM_FPS", 8)
 JPEG_QUALITY = _envint("CCTV_JPEG_QUALITY", 70)
 IDLE_TIMEOUT = _envint("CCTV_IDLE_TIMEOUT", 60)
 NVR_MAX_CONN = _envint("CCTV_NVR_MAX_CONN", 6)
-# Per-capture open/read timeout (ms). MEASURED: a healthy nvr1 substream opens in
-# ~2.5 s and a warm nvr2 substream in ~4.0-4.4 s, BUT some nvr2 channels need
-# 6-7 s on their very first (cold) open. The timeout MUST stay above the slowest
-# healthy open or real cameras get killed mid-handshake and waste a whole retry;
-# 8000 covers the cold outliers while still failing a truly dead channel in ~8 s
-# instead of OpenCV's hardcoded ~30 s default. Healthy first-frame time is set by
-# the NVR handshake (~2.5-4.5 s), not by this value -- raising it does not slow a
-# camera that is actually there; it only bounds how long a dead one may block.
+# OpenCV open/read timeout (ms). MEASURED on this LAN: healthy opens take up to
+# ~5.2 s (NVR2, cold) and ~3.1 s (NVR1); over the public path they were up to
+# ~7 s. A 3-5 s value would kill healthy cameras. Dead channels no longer reach
+# OpenCV (the pre-flight catches them), so this value rarely matters any more.
 OPEN_TIMEOUT_MS = _envint("CCTV_OPEN_TIMEOUT_MS", 8000)
 READ_TIMEOUT_MS = _envint("CCTV_READ_TIMEOUT_MS", 8000)
-# How many RTSP opens may be in-flight at once, process-wide. MEASURED: OpenCV's
-# FFmpeg backend serializes opens globally, so >1 gives no speed-up; the gate just
-# makes that serialization explicit and keeps one slow open from stampeding.
+# Concurrent OpenCV opens, process-wide. MEASURED: 1, 2 or 6 threads finish in the
+# same time (OpenCV serializes opens internally), so 1 is kept: it lets the gate
+# decide the ORDER (fresh cameras first) instead of OpenCV's internal lock.
 CONNECT_MAX  = _envint("CCTV_CONNECT_MAX", 1)
-# Optional per-camera startup timing to stdout (open/first-frame ms). Off by default.
-DEBUG_TIMING = os.getenv("CCTV_DEBUG_TIMING", "").lower() in ("1", "true", "yes", "on")
+# Pre-flight (see rtsp_preflight.py). Timeout = how long an authenticated DESCRIBE
+# may take before the channel is declared dead. MEASURED: healthy cold answers are
+# usually 2.7-3.4 s on NVR2 but one took 6.1 s (Floor 9 - Cabin); dead channels never
+# answer. A dead channel's pre-flight blocks nobody (it runs outside the open lock),
+# so a generous value only delays that one dead tile's "Retrying..." label.
+PREFLIGHT_ENABLED    = _envflag("CCTV_PREFLIGHT", True)
+PREFLIGHT_TIMEOUT_MS = _envint("CCTV_PREFLIGHT_TIMEOUT_MS", 8000)
+# Simultaneous pre-flight handshakes per NVR (the "setup" limit, separate from the
+# live-stream limit NVR_MAX_CONN). MEASURED: 6 parallel cold handshakes on NVR2 take
+# the same ~3.1 s each as one alone (all ready in 3.7 s vs 22.6 s one-by-one).
+PREFLIGHT_PER_NVR    = _envint("CCTV_PREFLIGHT_PER_NVR", 6)
+# A cached frame older than this is not shown (placeholder with the real state is
+# shown instead). Covers page/fullscreen hand-offs without freezing a dead feed.
+FRAME_MAX_AGE_S = _envfloat("CCTV_FRAME_MAX_AGE_S", 5.0)
+# FFmpeg decoder threads per camera. MEASURED (6 x NVR2 1280x720 H.265 @25 fps):
+# auto = 497 MB RSS / 125 OS threads, 1 = 109 MB / 26 threads, same CPU and full
+# 25 fps on every stream. Many small streams gain nothing from 16-way decoding each.
+DECODE_THREADS = _envint("CCTV_DECODE_THREADS", 1)
+# After the NVR rejects the credentials, pause that NVR this long (lockout safety).
+AUTH_PAUSE_S = _envfloat("CCTV_AUTH_PAUSE_S", 900.0)
+LOG_EVENTS   = _envflag("CCTV_LOG_EVENTS", True)
+DEBUG_TIMING = _envflag("CCTV_DEBUG_TIMING", False)
+# Diagnostics: log every HTTP request (path without ?key=, client port). Off by default.
+LOG_REQUESTS = _envflag("CCTV_LOG_REQUESTS", False)
 
-# one connection-limiter per NVR, shared by all camera threads
-NVR_SEM = {k: threading.BoundedSemaphore(NVR_MAX_CONN) for k in NVRS}
-# live count of held slots per NVR, for /api/status (BoundedSemaphore hides it)
-NVR_ACTIVE = {k: 0 for k in NVRS}
+# Tile / API status vocabulary.
+S_IDLE       = "Idle"
+S_CONNECTING = "Connecting..."
+S_WAIT_SLOT  = "Waiting for NVR slot..."
+S_NVR_DOWN   = "NVR unreachable"
+S_OFFLINE    = "Camera offline"
+S_RETRYING   = "Retrying..."
+S_LIVE       = "LIVE"
+S_LOGIN      = "NVR login failed"
+
+_LOG_LOCK = threading.Lock()
+
+
+def ev(msg):
+    """Concise event log line (viewer/slot/state/startup events, never per frame)."""
+    if LOG_EVENTS:
+        with _LOG_LOCK:
+            print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _ms(t):
+    return round((time.monotonic() - t) * 1000)
+
+
+# User-editable display names / order (Settings page). Presentation only: streams,
+# slots and workers stay keyed by the technical camera index.
+SETTINGS_FILE = os.getenv("CCTV_SETTINGS_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "camera-settings.json")
+SETTINGS = CameraSettings(SETTINGS_FILE, CAMERAS, log=ev)
+SETTINGS_MAX_BODY = 64 * 1024
+
+
+# ── per-NVR live-stream slots (the NVR_MAX_CONN limit) + ownership tracking ──
+NVR_SEM     = {k: threading.BoundedSemaphore(NVR_MAX_CONN) for k in NVRS}
+NVR_ACTIVE  = {k: 0 for k in NVRS}          # == len(NVR_OWNERS[k]); kept for callers/tests
+NVR_OWNERS  = {k: {} for k in NVRS}         # nvr -> {camera index: monotonic acquired}
+NVR_WAITERS = {k: {} for k in NVRS}         # nvr -> {camera index: monotonic wait start}
 _ACTIVE_LOCK = threading.Lock()
 
-# Global gate serializing the RTSP OPEN handshake (see CONNECT_MAX). Held ONLY
-# across cv2.VideoCapture(...) open, never during streaming, so a live camera
-# never blocks another camera's frames -- only their initial connect.
+# ── setup limits ──
+# Global gate around the OpenCV open only (never held while streaming).
 CONNECT_GATE = threading.BoundedSemaphore(max(1, CONNECT_MAX))
+# Per-NVR limit on simultaneous pre-flight handshakes.
+PREFLIGHT_SEM    = {k: threading.BoundedSemaphore(max(1, PREFLIGHT_PER_NVR)) for k in NVRS}
+PREFLIGHT_ACTIVE = {k: 0 for k in NVRS}
 
-# Fair open ordering. Because opens are serialized, a dead channel whose worker
-# reaches the gate first would make every healthy camera behind it wait out its
-# full open timeout. So a camera whose PREVIOUS open failed yields the gate (up to
-# ~2 s) to any camera that has NOT just failed -- the "failed camera goes to the
-# back of the queue" rule -- while a never-failed / previously-live camera keeps
-# priority. _FRESH_WAITING counts fresh cameras currently queued for the gate.
+# ── credential safety ──
+# Until an NVR has accepted our credentials once, its pre-flights run ONE at a time,
+# so wrong credentials can cause at most one failed login (not a burst that locks
+# the NVR account). After a 401 the whole NVR is paused for AUTH_PAUSE_S.
+_AUTH_OK         = {k: False for k in NVRS}
+_AUTH_LOCK       = {k: threading.Lock() for k in NVRS}
+_AUTH_PAUSED_TIL = {k: 0.0 for k in NVRS}
+
+# Fair open ordering. Because opens are serialized, a camera whose PREVIOUS attempt
+# failed yields the gate to cameras that have not just failed ("failed camera goes
+# to the back of the queue"). _FRESH_WAITING counts fresh cameras queued for it.
 _ORDER_LOCK    = threading.Lock()
 _FRESH_WAITING = 0
-# Channels that failed to open recently, remembered ACROSS worker restarts (index
-# -> monotonic time) so a known-dead channel yields the gate even on the first
-# attempt of a fresh page view, not only on its own in-session retries.
+# Channels that failed recently, remembered ACROSS worker restarts (index ->
+# monotonic time), so a known-dead channel yields -- and shows "Camera offline" --
+# even on the first attempt of a fresh page view.
 _LAST_FAIL     = {}
 _FAIL_WINDOW   = 60.0
 
@@ -165,37 +234,84 @@ def _recently_failed(index):
     return t is not None and (time.monotonic() - t) < _FAIL_WINDOW
 
 
+def _backoff_s(fail_count):
+    """Retry delay after `fail_count` consecutive failures: 1,2,4,8,16,30 s cap.
+    A dead channel stops hammering the NVR; a transient failure retries fast."""
+    return min(2 ** min(max(fail_count, 1) - 1, 6), 30)
+
+
+def _nvr_auth_paused(nvr):
+    return time.monotonic() < _AUTH_PAUSED_TIL[nvr]
+
+
+def _pause_nvr_auth(nvr):
+    _AUTH_OK[nvr] = False
+    _AUTH_PAUSED_TIL[nvr] = time.monotonic() + AUTH_PAUSE_S
+    ev(f"[{nvr.upper()}] NVR REJECTED THE CONFIGURED CREDENTIALS -- all {nvr} cameras paused "
+       f"{AUTH_PAUSE_S:.0f}s to avoid locking the NVR account. Fix {nvr.upper()}_USERNAME/"
+       f"{nvr.upper()}_PASSWORD in .env and restart.")
+
+
 def _cap_open_params():
     """Open/read timeouts as VideoCapture constructor params -- the ONLY form this
-    build honors (a post-open cap.set() or an FFmpeg 'stimeout' is ignored for the
-    open phase). Returns [] on builds without the properties (e.g. the test stub)."""
+    build honors. Returns [] on builds without the properties (e.g. the test stub)."""
     p = []
     if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
         p += [int(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC), OPEN_TIMEOUT_MS]
     if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
         p += [int(cv2.CAP_PROP_READ_TIMEOUT_MSEC), READ_TIMEOUT_MS]
+    if DECODE_THREADS > 0 and hasattr(cv2, "CAP_PROP_N_THREADS"):
+        p += [int(cv2.CAP_PROP_N_THREADS), DECODE_THREADS]
     return p
 
-# shared reachability monitor; workers consult it before taking a slot
+
+def _new_preflight(nvr, channel, alive):
+    """Factory (tests replace it). Credential-free URL; auth is done by the probe."""
+    n = NVRS[nvr]
+    host, port = endpoint(nvr)
+    url = f"rtsp://{host}:{port}/cam/realmonitor?channel={channel}&subtype=1"
+    return rp.Preflight(host, port, n["user"], n["pass"], url,
+                        timeout_s=PREFLIGHT_TIMEOUT_MS / 1000.0, alive=alive)
+
+
+# shared reachability monitor (background thread); workers only read its cache
 MONITOR = NetworkMonitor(
     NVRS, CCTV_SUBNET,
     interval=NETWORK_CHECK_INTERVAL, timeout=NETWORK_TIMEOUT, endpoint_fn=endpoint,
 )
 
 
-def _slot_try_acquire(nvr):
-    """Try to take an NVR slot (waits up to 1s). Returns True if taken."""
+def _slot_try_acquire(nvr, index):
+    """Try to take an NVR slot for camera `index` (waits up to 1 s)."""
     if NVR_SEM[nvr].acquire(timeout=1.0):
         with _ACTIVE_LOCK:
             NVR_ACTIVE[nvr] += 1
+            NVR_OWNERS[nvr][index] = time.monotonic()
+            NVR_WAITERS[nvr].pop(index, None)
         return True
     return False
 
 
-def _slot_release(nvr):
-    NVR_SEM[nvr].release()
+def _slot_release(nvr, index):
     with _ACTIVE_LOCK:
         NVR_ACTIVE[nvr] = max(0, NVR_ACTIVE[nvr] - 1)
+        NVR_OWNERS[nvr].pop(index, None)
+    NVR_SEM[nvr].release()
+
+
+def _slot_report(nvr):
+    """One log line: who owns every occupied slot on `nvr` (no credentials)."""
+    now = time.monotonic()
+    with _ACTIVE_LOCK:
+        owners = sorted(NVR_OWNERS[nvr].items())
+        active = NVR_ACTIVE[nvr]
+    parts = []
+    for idx, t in owners:
+        s = STREAMS[idx]
+        age = s.frame_age_ms()
+        parts.append(f"cam{idx + 1} '{s.name}' viewers={s.viewers} status={s.status} "
+                     f"held={now - t:.1f}s lastFrame={'-' if age is None else f'{age}ms'}")
+    return f"[{nvr.upper()}] active={active} max={NVR_MAX_CONN} owners=[{'; '.join(parts)}]"
 
 
 class CamStream:
@@ -204,67 +320,38 @@ class CamStream:
         self.name     = info["name"]
         self.info     = info
         self.index    = index
-        # The latest frame is cached ALREADY JPEG-encoded (encode once per decoded
-        # frame, in the worker) and shared to every viewer as immutable bytes, so
-        # N viewers cost one encode, not N. None means "no frame yet".
+        self.label    = f"Cam {index + 1} {info['name']}"
+        # Latest frame, cached ALREADY JPEG-encoded (encoded once, in the worker)
+        # and shared to every viewer as immutable bytes. Served only while younger
+        # than FRAME_MAX_AGE_S (see frame()).
         self.jpeg_bytes = None
-        self.status   = "Idle"
+        self.frame_ts = 0.0
+        self.status   = S_IDLE
+        self.status_since = time.monotonic()
+        self.last_error = ""
         self.viewers  = 0
         self.last_use = time.time()
+        self.startup  = {}            # timing breakdown of the last successful start
+        self.first_http_ms = None     # last viewer's connect -> first live frame sent
+        self.attempts = 0             # connection attempts (pre-flight or open)
+        self.opens    = 0             # successful OpenCV opens
+        self.published = 0            # JPEG frames published (-> delivered fps)
         self._gen     = 0
         self._running = False
         self._vlock   = threading.Lock()
         self._flock   = threading.Lock()
+        self._ph_key  = None
+        self._ph_bytes = None
 
     @property
     def url(self):
         return make_url(self.info["nvr"], self.info["channel"])
 
-    def _log(self, gen, msg):
+    def _dbg(self, gen, msg):
         if DEBUG_TIMING:
-            print(f"[{time.strftime('%H:%M:%S')}] cam{self.index:2d} "
-                  f"{self.name[:20]:20} g{gen} {msg}", flush=True)
+            ev(f"[{self.label}] g{gen} {msg}")
 
-    def _open_capture(self):
-        """Open the RTSP stream with the honored open/read timeout, buffer of 1."""
-        params = _cap_open_params()
-        cap = (cv2.VideoCapture(self.url, cv2.CAP_FFMPEG, params) if params
-               else cv2.VideoCapture(self.url, cv2.CAP_FFMPEG))
-        try:
-            if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep only the newest frame
-        except Exception:
-            pass
-        return cap
-
-    def _open_with_priority(self, gen, is_retry):
-        """Open the RTSP stream through the serialized connect gate, giving fresh
-        cameras priority over ones that just failed. Returns the (opened-or-not)
-        VideoCapture, or None if the viewer left before we could open."""
-        if is_retry:
-            # A just-failed camera steps aside until EVERY fresh camera waiting to
-            # open has gone first -- otherwise a dead channel that grabs the single
-            # open slot holds it for the full ~8 s timeout and stalls the healthy
-            # cameras behind it. The cap is only a safety backstop (fresh cameras on
-            # a page drain within ~30 s); it re-checks liveness so it exits at once
-            # if the viewer leaves.
-            deadline = time.monotonic() + 30.0
-            while time.monotonic() < deadline and self._current(gen) and _fresh_pending():
-                time.sleep(0.1)
-            counted = False
-        else:
-            _fresh_wait(1)          # announce ourselves as a fresh camera waiting
-            counted = True
-        CONNECT_GATE.acquire()
-        if counted:
-            _fresh_wait(-1)         # holding the gate now; no longer "waiting"
-        try:
-            if not self._current(gen):
-                return None
-            return self._open_capture()
-        finally:
-            CONNECT_GATE.release()
-
+    # ── viewers / lifecycle ──────────────────────────────────────────────
     def add_viewer(self):
         with self._vlock:
             self.viewers += 1
@@ -285,149 +372,375 @@ class CamStream:
                 self.viewers -= 1
             if self.viewers == 0 and self._running:
                 self._running = False   # signal the worker to exit now
+            return self.viewers
 
     def _current(self, gen):
         with self._vlock:
             return self._running and gen == self._gen
 
-    def _set_status(self, gen, s):
-        with self._vlock:
-            if gen == self._gen:
-                self.status = s
-
-    def _run(self, gen):
-        nvr = self.info["nvr"]
-        fail_count = 0            # consecutive OPEN failures -> escalating backoff
-        self._log(gen, "worker start")
-        try:
-            while self._current(gen):
-                # 1. Skip entirely (take NO slot) if the NVR is unreachable.
-                h = MONITOR.get(nvr)
-                if h is not None and h.checked and not h.reachable:
-                    self._set_status(gen, h.label)
-                    time.sleep(2)
-                    continue
-
-                # 2. OPEN the stream FIRST, through the serialized fresh-first gate,
-                #    holding NO NVR slot yet. This is the key fix for "some cameras
-                #    stay on Waiting for NVR slot": a dead/slow channel's long (up to
-                #    ~8 s) open must never occupy one of the NVR's limited slots that
-                #    a working camera needs. The slot is taken only AFTER a successful
-                #    open (step 3), so only real, live streams count against the cap.
-                self._set_status(gen, "Connecting..." if fail_count == 0 else "Offline")
-                t0 = time.time()
-                is_retry = fail_count > 0 or _recently_failed(self.index)
-                cap = self._open_with_priority(gen, is_retry)
-                if cap is None:
-                    break                       # viewer left while we waited
-                if not cap.isOpened():
-                    cap.release()
-                    _note_open_fail(self.index)
-                    fail_count += 1
-                    self._set_status(gen, "Offline")
-                    self._log(gen, f"OPEN-FAIL after {time.time() - t0:.2f}s")
-                    if not self._current(gen):
-                        break
-                    # Escalating backoff WITHOUT holding a slot: 1,2,4,8,16,30 s cap.
-                    # A channel that keeps failing is almost certainly dead, so we
-                    # stop hammering the NVR/connect gate every few seconds -- those
-                    # repeated dead opens were disrupting the healthy cameras that
-                    # share the NVR and the serialized open path.
-                    time.sleep(min(2 ** min(fail_count - 1, 6), 30))
-                    continue
-                t_open = time.time()
-                _clear_open_fail(self.index)
-                fail_count = 0
-
-                # 3. Stream is open -> take an NVR slot and pull frames. This wait is
-                #    now rare (only if >CAP live streams on one NVR overlap, e.g. a
-                #    brief page hand-off), never caused by dead channels.
-                got = False
-                while self._current(gen) and not got:
-                    if _slot_try_acquire(nvr):
-                        got = True
-                    else:
-                        self._set_status(gen, "Waiting for NVR slot...")
-                if not got:
-                    cap.release()
-                    break
-                try:
-                    self._set_status(gen, "LIVE")
-                    self._log(gen, f"opened in {t_open - t0:.2f}s")
-                    first = True
-                    last_encode = 0.0
-                    interval = 1.0 / max(1, STREAM_FPS)
-                    while self._current(gen):
-                        ok, frame = cap.read()
-                        if not ok or frame is None:
-                            self._set_status(gen, "Reconnecting...")
-                            break
-                        # Decouple decode from publish: a substream can arrive at
-                        # 20-25 fps but we only serve STREAM_FPS. Keep READING every
-                        # frame (so the RTSP stream stays current and does not stall),
-                        # but only resize+JPEG-encode at the publish rate -- encoding
-                        # every frame for every camera was needless CPU that could
-                        # starve the reads and cause drops.
-                        now = time.time()
-                        if not first and now - last_encode < interval:
-                            continue
-                        last_encode = now
-                        small = cv2.resize(frame, (STREAM_W, STREAM_H))
-                        okj, buf = cv2.imencode(
-                            ".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-                        if okj:
-                            data = buf.tobytes()
-                            with self._flock:
-                                if gen == self._gen:
-                                    self.jpeg_bytes = data
-                            if first:
-                                first = False
-                                self._log(gen, f"FIRST FRAME +{now - t_open:.2f}s "
-                                               f"after open ({now - t0:.2f}s total)")
-                finally:
-                    cap.release()
-                    _slot_release(nvr)   # free the slot the instant streaming ends
-
-                # 4. Stream was LIVE and merely dropped -> quick retry.
-                if not self._current(gen):
-                    break
-                time.sleep(0.4)
-        finally:
-            with self._flock:
-                if gen == self._gen:
-                    self.jpeg_bytes = None
-            with self._vlock:
-                if gen == self._gen and not self._running:
-                    self.status = "Idle"
-
-    def jpeg(self):
-        # Already-encoded bytes, shared to every viewer (encode happens once, in
-        # the worker). bytes are immutable so no copy/lock-during-send is needed.
-        with self._flock:
-            return self.jpeg_bytes
-
-    def jpeg_or_status(self):
-        jpg = self.jpeg()
-        if jpg:
-            return jpg
-        ph = np.zeros((STREAM_H, STREAM_W, 3), dtype=np.uint8)
-        ph[:] = (30, 30, 40)
-        cv2.putText(ph, self.status, (20, STREAM_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 170), 2)
-        cv2.putText(ph, self.name, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 220), 1)
-        ok, buf = cv2.imencode(".jpg", ph)
-        return buf.tobytes() if ok else None
-
     def force_stop(self):
         with self._vlock:
             self._running = False
+
+    def _state(self, gen, status, err=None):
+        """Set status (and the masked last error); log real changes only."""
+        with self._vlock:
+            if gen != self._gen:
+                return
+            if err is not None:
+                self.last_error = sanitize_url(err)[:160]
+            old = self.status
+            if status == old:
+                return
+            self.status = status
+            self.status_since = time.monotonic()
+        ev(f"[{self.label}] {old} -> {status}" + (f"  ({sanitize_url(err)})" if err else ""))
+
+    @staticmethod
+    def _fail_status(fail, known_dead):
+        """First failure of a camera that was fine -> "Retrying..." (NVR2 sometimes
+        does not answer a healthy channel once); repeated / known -> "Camera offline"."""
+        return S_RETRYING if fail == 1 and not known_dead else S_OFFLINE
+
+    def _sleep(self, gen, seconds):
+        """Back-off sleep that ends early when the last viewer leaves."""
+        end = time.monotonic() + seconds
+        while self._current(gen) and time.monotonic() < end:
+            time.sleep(min(0.1, max(0.0, end - time.monotonic())))
+
+    def _acquire(self, sem, gen):
+        """Abortable semaphore acquire: gives up as soon as the viewer leaves."""
+        while self._current(gen):
+            if sem.acquire(timeout=0.25):
+                return True
+        return False
+
+    # ── opening ──────────────────────────────────────────────────────────
+    def _open_capture(self):
+        """OpenCV open with the honored open/read timeouts. (CAP_PROP_BUFFERSIZE
+        is not set: measured, the FFmpeg backend rejects it -- cap.set -> False.)"""
+        params = _cap_open_params()
+        return (cv2.VideoCapture(self.url, cv2.CAP_FFMPEG, params) if params
+                else cv2.VideoCapture(self.url, cv2.CAP_FFMPEG))
+
+    def _open_with_priority(self, gen, is_retry):
+        """Open through the serialized connect gate; fresh cameras before ones that
+        just failed. -> (cap or None if the viewer left, gate_wait_ms, open_ms)."""
+        t_q = time.monotonic()
+        if is_retry:
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline and self._current(gen) and _fresh_pending():
+                time.sleep(0.1)
+            counted = False
+        else:
+            _fresh_wait(1)
+            counted = True
+        got = self._acquire(CONNECT_GATE, gen)
+        if counted:
+            _fresh_wait(-1)
+        gate_ms = _ms(t_q)
+        if not got:
+            return None, gate_ms, 0
+        try:
+            if not self._current(gen):
+                return None, gate_ms, 0
+            t_o = time.monotonic()
+            cap = self._open_capture()
+            return cap, gate_ms, _ms(t_o)
+        finally:
+            CONNECT_GATE.release()
+
+    def _preflight(self, gen):
+        """Run the pre-flight (see rtsp_preflight.py). -> (Preflight, result)."""
+        nvr, ch = self.info["nvr"], self.info["channel"]
+        auth_lock = None
+        if not _AUTH_OK[nvr]:
+            if not self._acquire(_AUTH_LOCK[nvr], gen):
+                return None, rp.ABORTED
+            if _AUTH_OK[nvr]:
+                _AUTH_LOCK[nvr].release()      # confirmed while we waited: go parallel
+            else:
+                auth_lock = _AUTH_LOCK[nvr]    # still unconfirmed: one login at a time
+        try:
+            if _nvr_auth_paused(nvr):
+                return None, rp.AUTH_FAIL
+            if not self._acquire(PREFLIGHT_SEM[nvr], gen):
+                return None, rp.ABORTED
+            with _ACTIVE_LOCK:
+                PREFLIGHT_ACTIVE[nvr] += 1
+            try:
+                pf = _new_preflight(nvr, ch, lambda: self._current(gen))
+                res = pf.run()
+            finally:
+                with _ACTIVE_LOCK:
+                    PREFLIGHT_ACTIVE[nvr] -= 1
+                PREFLIGHT_SEM[nvr].release()
+            if res == rp.OK:
+                _AUTH_OK[nvr] = True
+            elif res == rp.AUTH_FAIL:
+                _pause_nvr_auth(nvr)
+            return pf, res
+        finally:
+            if auth_lock is not None:
+                auth_lock.release()
+
+    def _acquire_slot(self, gen, nvr):
+        """Take a live-stream slot; while waiting, report who owns them (<=1 per 10 s)."""
+        t_w = time.monotonic()
+        last_report = 0.0
+        waited = False
+        try:
+            while self._current(gen):
+                if _slot_try_acquire(nvr, self.index):
+                    if waited:
+                        ev(f"[{self.label}] got {nvr.upper()} slot after waiting {_ms(t_w)} ms")
+                    return True
+                if not waited:
+                    waited = True
+                    with _ACTIVE_LOCK:
+                        NVR_WAITERS[nvr][self.index] = t_w
+                self._state(gen, S_WAIT_SLOT, f"all {NVR_MAX_CONN} {nvr.upper()} slots in use")
+                if time.monotonic() - last_report >= 10.0:
+                    last_report = time.monotonic()
+                    ev(f"{_slot_report(nvr)}  waiting camera={self.label}")
+            return False
+        finally:
+            with _ACTIVE_LOCK:
+                NVR_WAITERS[nvr].pop(self.index, None)
+
+    # ── the worker ───────────────────────────────────────────────────────
+    def _run(self, gen):
+        nvr = self.info["nvr"]
+        fail = 0                       # consecutive failures -> backoff + status
+        t_worker = time.monotonic()
+        # Failed on a PREVIOUS visit (e.g. same page a minute ago)? Then say
+        # "Camera offline" while re-checking, and let fresh cameras open first.
+        # Evaluated once: failures in THIS session are counted by `fail`, so a
+        # healthy camera with one sporadic NVR hang shows "Retrying...", not offline.
+        known_dead = _recently_failed(self.index)
+        ev(f"[{self.label}] worker start ({nvr} ch{self.info['channel']})")
+        try:
+            while self._current(gen):
+                # 1. NVR reachable? (cached by the background monitor; never blocks)
+                h = MONITOR.get(nvr)
+                if h is not None and h.checked and not h.reachable:
+                    self._state(gen, S_NVR_DOWN, h.label)
+                    self._sleep(gen, 2.0)
+                    continue
+                if _nvr_auth_paused(nvr):
+                    self._state(gen, S_LOGIN, "NVR rejected the configured credentials; "
+                                              "paused to avoid an account lockout")
+                    self._sleep(gen, 5.0)
+                    continue
+                if known_dead or fail >= 2:
+                    self._state(gen, S_OFFLINE)
+                else:
+                    self._state(gen, S_CONNECTING if fail == 0 else S_RETRYING)
+                self.attempts += 1
+                t0 = time.monotonic()
+                timing = {}
+
+                # 2. PRE-FLIGHT: parallel, outside OpenCV's lock. Dead channels stop here.
+                pf = None
+                if PREFLIGHT_ENABLED:
+                    pf, res = self._preflight(gen)
+                    timing["preflight_ms"] = pf.ms if pf else 0
+                    if res == rp.ABORTED:
+                        if pf:
+                            pf.close()
+                        break
+                    if res != rp.OK:
+                        detail = pf.detail if pf else "NVR paused after a credential failure"
+                        if pf:
+                            pf.close()
+                        if res == rp.AUTH_FAIL:
+                            self._state(gen, S_LOGIN, detail)
+                            continue                 # loop top shows the pause
+                        fail += 1
+                        _note_open_fail(self.index)
+                        if res == rp.UNREACHABLE:
+                            self._state(gen, S_NVR_DOWN, detail)
+                        else:
+                            self._state(gen, self._fail_status(fail, known_dead), detail)
+                        self._dbg(gen, f"pre-flight {res} after {timing['preflight_ms']} ms")
+                        self._sleep(gen, _backoff_s(fail))
+                        continue
+                    self._dbg(gen, f"pre-flight OK in {timing['preflight_ms']} ms (channel warm)")
+
+                # 3. OpenCV open through the serialized gate (channel is warm now).
+                try:
+                    cap, gate_ms, open_ms = self._open_with_priority(
+                        gen, fail > 0 or known_dead)
+                finally:
+                    if pf is not None:
+                        pf.close()               # warm-up no longer needed
+                timing["gate_wait_ms"], timing["open_ms"] = gate_ms, open_ms
+                if cap is None:
+                    break                        # viewer left while queued
+                if not cap.isOpened():
+                    cap.release()
+                    fail += 1
+                    _note_open_fail(self.index)
+                    self._state(gen, self._fail_status(fail, known_dead),
+                                f"RTSP open failed after {open_ms} ms")
+                    self._sleep(gen, _backoff_s(fail))
+                    continue
+                self.opens += 1
+                _AUTH_OK[nvr] = True
+
+                # 4. A live stream needs a slot (only now -- never while opening/failing).
+                t_slot = time.monotonic()
+                if not self._acquire_slot(gen, nvr):
+                    cap.release()
+                    break
+                timing["slot_wait_ms"] = _ms(t_slot)
+                published = False
+                try:
+                    t_read = time.monotonic()
+                    next_pub = 0.0
+                    interval = 1.0 / max(1, STREAM_FPS)
+                    while self._current(gen):
+                        # grab() demuxes + decodes EVERY frame (keeps the RTSP stream
+                        # current); retrieve() -- the BGR conversion -- and the resize +
+                        # JPEG encode run only for frames we publish. MEASURED: 26% ->
+                        # 18% of a core per NVR2 camera vs read() on every frame.
+                        if not cap.grab():
+                            break
+                        now = time.monotonic()
+                        if published and now < next_pub:
+                            continue
+                        ok, frame = cap.retrieve()
+                        if not ok or frame is None:
+                            break
+                        # steady STREAM_FPS cadence (a plain "now - last >= 1/fps" check
+                        # only managed ~6.25 fps from 25 fps input); the FIRST frame at once
+                        next_pub = next_pub + interval if next_pub + interval > now else now + interval
+                        small = cv2.resize(frame, (STREAM_W, STREAM_H))
+                        okj, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                        if not okj:
+                            continue
+                        self._publish(gen, buf.tobytes())
+                        if not published:
+                            published = True
+                            fail = 0
+                            known_dead = False
+                            _clear_open_fail(self.index)
+                            timing["first_read_ms"] = round((now - t_read) * 1000)
+                            timing["jpeg_ms"] = _ms(now)
+                            timing["total_ms"] = _ms(t0)
+                            timing["since_worker_start_ms"] = _ms(t_worker)
+                            self.startup = dict(timing)
+                            self._state(gen, S_LIVE)
+                            pre = f"preflight {timing['preflight_ms']} | " if "preflight_ms" in timing else ""
+                            ev(f"[{self.label}] FIRST FRAME in {timing['total_ms']} ms  ({pre}gate wait "
+                               f"{gate_ms} | open {open_ms} | slot wait {timing['slot_wait_ms']} | first read "
+                               f"{timing['first_read_ms']} | jpeg {timing['jpeg_ms']} ms)")
+                finally:
+                    cap.release()
+                    _slot_release(nvr, self.index)   # released BEFORE any back-off
+
+                if not self._current(gen):
+                    break
+                # 5. Stream dropped (or opened but produced no frame): retry.
+                if published:
+                    self._state(gen, S_RETRYING, "stream dropped (no frame within read timeout)")
+                    self._sleep(gen, 0.4)
+                else:
+                    fail += 1
+                    _note_open_fail(self.index)
+                    self._state(gen, self._fail_status(fail, known_dead), "opened but no frame arrived")
+                    self._sleep(gen, _backoff_s(fail))
+        finally:
+            with self._vlock:
+                if gen == self._gen and not self._running and self.status != S_IDLE:
+                    self.status = S_IDLE
+                    self.status_since = time.monotonic()
+            ev(f"[{self.label}] worker stopped")
+
+    # ── frames ───────────────────────────────────────────────────────────
+    def _publish(self, gen, data):
+        with self._flock:
+            if gen == self._gen:
+                self.jpeg_bytes = data
+                self.frame_ts = time.monotonic()
+                self.published += 1
+
+    def frame_age_ms(self):
+        with self._flock:
+            if self.jpeg_bytes is None:
+                return None
+            return round((time.monotonic() - self.frame_ts) * 1000)
+
+    def jpeg(self):
+        """Latest JPEG, shared by all viewers -- but only if it is younger than
+        FRAME_MAX_AGE_S. That keeps a hand-off seamless (page/fullscreen switch
+        shows the last frame at once) without ever freezing a dead feed."""
+        with self._flock:
+            if self.jpeg_bytes is not None and time.monotonic() - self.frame_ts <= FRAME_MAX_AGE_S:
+                return self.jpeg_bytes
+        return None
+
+    def _placeholder(self):
+        # user's display name; OpenCV's Hershey font is ASCII-only, so a non-ASCII
+        # name (e.g. Hindi) falls back to the technical name on this image only
+        name = SETTINGS.display_name(self.index)
+        if not name.isascii():
+            name = self.name
+        key = (self.status, name)
+        with self._flock:
+            if self._ph_key == key:
+                return self._ph_bytes
+        ph = np.zeros((STREAM_H, STREAM_W, 3), dtype=np.uint8)
+        ph[:] = (30, 30, 40)
+        cv2.putText(ph, self.status, (20, STREAM_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 170), 2)
+        cv2.putText(ph, name, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 220), 1)
+        ok, buf = cv2.imencode(".jpg", ph)
+        data = buf.tobytes() if ok else None
+        with self._flock:
+            self._ph_key, self._ph_bytes = key, data   # encoded once per status change
+        return data
+
+    def frame_or_placeholder(self):
+        """-> (jpeg bytes, True if it is a live camera frame)."""
+        jpg = self.jpeg()
+        return (jpg, True) if jpg else (self._placeholder(), False)
+
+    def jpeg_or_status(self):
+        return self.frame_or_placeholder()[0]
+
+    # ── diagnostics ──────────────────────────────────────────────────────
+    def diag(self, now, owners, waiters, position=None):
+        nvr = self.info["nvr"]
+        held = self.index in owners.get(nvr, {})
+        w = waiters.get(nvr, {}).get(self.index)
+        with self._vlock:
+            status, viewers, running = self.status, self.viewers, self._running
+            since, err = self.status_since, self.last_error
+        return {
+            "index": self.index, "key": camera_key(self.info),
+            "name": self.name, "technicalName": self.name,
+            "displayName": SETTINGS.display_name(self.index), "displayOrder": position,
+            "nvr": nvr, "channel": self.info["channel"],
+            "status": status, "statusForMs": round((now - since) * 1000),
+            "viewers": viewers, "running": running,
+            "hasFrame": self.jpeg() is not None, "lastFrameAgeMs": self.frame_age_ms(),
+            "slotHeld": held,
+            "slotHeldMs": round((now - owners[nvr][self.index]) * 1000) if held else None,
+            "slotWaitMs": round((now - w) * 1000) if w else None,
+            "lastErrorMasked": err or None,
+            "startup": self.startup or None, "firstHttpFrameMs": self.first_http_ms,
+            "attempts": self.attempts, "opens": self.opens, "framesPublished": self.published,
+        }
 
 
 STREAMS = [CamStream(c, i) for i, c in enumerate(CAMERAS)]
 
 
 def reaper():
-    """Failsafe only: stop a worker still running with no viewers (a handler that
-    died without cleanup) after IDLE_TIMEOUT. Normal cleanup is immediate."""
+    """Failsafe only. (1) Stop a worker still running with no viewers (a handler that
+    died without cleanup) after IDLE_TIMEOUT. (2) Shout if a slot is ever held by a
+    camera nobody watches -- with correct code this never happens."""
+    suspect = {}
     while True:
         time.sleep(5)
         now = time.time()
@@ -437,16 +750,66 @@ def reaper():
                 stale  = now - s.last_use > IDLE_TIMEOUT
             if leaked and stale:
                 s.force_stop()
+        with _ACTIVE_LOCK:
+            owners = [(k, i) for k, o in NVR_OWNERS.items() for i in o]
+        suspect = {key: n for key, n in suspect.items() if key in owners}
+        for k, i in owners:
+            if STREAMS[i].viewers == 0:
+                # 3 checks (10-15 s): a stalled read may legitimately hold a slot
+                # for up to READ_TIMEOUT after the viewer left before it notices.
+                suspect[(k, i)] = suspect.get((k, i), 0) + 1
+                if suspect[(k, i)] == 3:
+                    ev(f"[{k.upper()}] SLOT LEAK? cam{i + 1} holds a slot with 0 viewers. {_slot_report(k)}")
+            else:
+                suspect.pop((k, i), None)
 
 
 def system_status():
+    now = time.monotonic()
     with _ACTIVE_LOCK:
-        nvrs = {k: {"active": NVR_ACTIVE[k], "max": NVR_MAX_CONN} for k in NVRS}
-    cams = []
-    for s in STREAMS:
-        cams.append({"index": s.index, "name": s.name, "nvr": s.info["nvr"],
-                     "viewers": s.viewers, "status": s.status})
-    return {"nvrs": nvrs, "cameras": cams}
+        owners = {k: dict(v) for k, v in NVR_OWNERS.items()}
+        waiters = {k: dict(v) for k, v in NVR_WAITERS.items()}
+        active = dict(NVR_ACTIVE)
+        pf_active = dict(PREFLIGHT_ACTIVE)
+    nvrs = {}
+    for k in NVRS:
+        h = MONITOR.get(k)
+        nvrs[k] = {
+            "active": active[k], "max": NVR_MAX_CONN,
+            "waiting": len(waiters[k]),
+            "waitingCameras": [{"index": i, "name": STREAMS[i].name,
+                                "displayName": SETTINGS.display_name(i), "waitMs": round((now - t) * 1000)}
+                               for i, t in sorted(waiters[k].items())],
+            "owners": [{"index": i, "name": STREAMS[i].name, "displayName": SETTINGS.display_name(i),
+                        "viewers": STREAMS[i].viewers,
+                        "status": STREAMS[i].status, "heldMs": round((now - t) * 1000),
+                        "lastFrameAgeMs": STREAMS[i].frame_age_ms(),
+                        "suspectLeak": STREAMS[i].viewers == 0}
+                       for i, t in sorted(owners[k].items())],
+            "preflightActive": pf_active[k], "preflightMax": PREFLIGHT_PER_NVR,
+            "reachable": (h.reachable if h is not None and h.checked else None),
+            "monitor": (h.label if h is not None else None),
+            "credentialsConfirmed": _AUTH_OK[k], "authPaused": _nvr_auth_paused(k),
+        }
+    order = SETTINGS.ordered_indices()
+    pos = {idx: p + 1 for p, idx in enumerate(order)}
+    cams = [s.diag(now, owners, waiters, pos[s.index]) for s in STREAMS]
+    config = {"nvrMaxConn": NVR_MAX_CONN, "connectMax": CONNECT_MAX,
+              "preflight": PREFLIGHT_ENABLED, "preflightTimeoutMs": PREFLIGHT_TIMEOUT_MS,
+              "preflightPerNvr": PREFLIGHT_PER_NVR, "openTimeoutMs": OPEN_TIMEOUT_MS,
+              "readTimeoutMs": READ_TIMEOUT_MS, "frameMaxAgeS": FRAME_MAX_AGE_S,
+              "streamFps": STREAM_FPS, "streamSize": f"{STREAM_W}x{STREAM_H}"}
+    return {"nvrs": nvrs, "cameras": cams, "config": config}
+
+
+def cameras_for_ui():
+    """Credential-free camera list for the grid, in TECHNICAL order (compatible with
+    earlier clients); the page sorts by displayOrder. 'index' is what /stream/<index>
+    uses -- it never changes when a camera is renamed or re-ordered."""
+    return [{"index": c["index"], "key": c["key"], "name": c["technicalName"],
+             "technicalName": c["technicalName"], "displayName": c["displayName"],
+             "displayOrder": c["displayOrder"], "nvr": c["nvr"], "channel": c["channel"]}
+            for c in SETTINGS.snapshot()["cameras"]]
 
 
 PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
@@ -465,28 +828,46 @@ PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial
  #view{position:fixed;inset:0;background:#000;display:none;flex-direction:column;z-index:9}
  #view img{flex:1;object-fit:contain;min-height:0}
  #bar{background:#1e1e28;padding:10px;display:flex;gap:12px;align-items:center}
- button{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:6px 14px;cursor:pointer}
- button:hover{border-color:#0c8}
+ button,a.btn{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:6px 14px;cursor:pointer;font:inherit;font-size:13.3px;text-decoration:none}
+ button:hover,a.btn:hover{border-color:#0c8}
  .hint{color:#888;font-size:12px}
+ #top .grow{flex:1}
+ #title{font-weight:600}
 </style>
 <div id=top>
   <button onclick="page(-1)">&larr; Prev (P)</button>
   <b id=pageinfo>-</b>
   <button onclick="page(1)">Next (N) &rarr;</button>
   <span class=hint>tap a camera for live video</span>
+  <span class=grow></span>
+  <a class=btn id=settingsLink href="/settings" title="Rename and re-order cameras">&#9881; Settings</a>
 </div>
 <div class=grid id=grid></div>
-<div id=view><div id=bar><button onclick="close_()">&larr; Back</button><span id=title></span></div><img id=live></div>
+<div id=view><div id=bar><button onclick="close_()">&larr; Back</button><span id=title></span><span id=tech class=hint></span></div><img id=live fetchpriority=high></div>
 <script>
 const PER  = 6;
 const KEY  = new URLSearchParams(location.search).get('key') || '';
 const q    = KEY ? '?key='+encodeURIComponent(KEY) : '';
 let cams = [], pg = 0;
 
-fetch('/api/cameras'+q).then(r=>r.json()).then(list=>{ cams = list; draw(); });
+// Cameras in DISPLAY order (names/order come from the Settings page). Each camera
+// keeps its technical 'index', which is what /stream/<index> uses -- renaming or
+// re-ordering never changes which RTSP stream a tile opens. Pages are cut from
+// this sorted list, so displayOrder 1-6 = page 1, 7-12 = page 2, ...
+function loadCameras(){
+  return fetch('/api/cameras'+q).then(r=>r.json()).then(list=>{
+    cams = list.slice().sort((a, b) => (a.displayOrder - b.displayOrder) || (a.index - b.index));
+  });
+}
+loadCameras().then(draw);
+document.getElementById('settingsLink').href = '/settings' + q;
 
 function pages(){ return Math.max(1, Math.ceil(cams.length/PER)); }
 function streamUrl(i){ return '/stream/'+i+q; }
+// Cache-busting retry URL. Must work with AND without ?key= (e.g. cookie/SSO access):
+// appending '&_r=' to '/stream/5' would give '/stream/5&_r=..', which the server
+// rejects as a bad camera id, so a retried tile would never recover.
+function retryUrl(i){ return streamUrl(i) + (q ? '&' : '?') + '_r=' + Date.now(); }
 
 /* FIXED CELLS. We create PER <img> cells ONCE and only change their src. Changing
    (or clearing) an <img>'s src reliably ABORTS its current MJPEG connection, so a
@@ -497,18 +878,23 @@ function streamUrl(i){ return '/stream/'+i+q; }
 let cells = [];
 let fullscreen = false;
 
+/* fetchpriority=high: browsers throttle LOW-priority image loads while a page is
+   "still loading" or the network looks slow, and wait for in-flight images to
+   finish first. An MJPEG <img> never finishes, so throttled tiles could wait
+   forever (measured: only 3 of 6 streams were even requested, the rest held back
+   in the browser for 40 s to indefinitely). High priority exempts the streams. */
 function buildCells(){
   const grid = document.getElementById('grid');
   grid.innerHTML = Array.from({length: PER}, () =>
-    `<div class=cam><img><span></span></div>`).join('');
+    `<div class=cam><img fetchpriority=high><span></span></div>`).join('');
   cells = [...grid.querySelectorAll('.cam')].map((cell) => {
-    const c = { cell, img: cell.querySelector('img'), span: cell.querySelector('span'), idx: null };
-    cell.onclick = () => { if (c.idx != null) open_(c.idx); };
+    const c = { cell, img: cell.querySelector('img'), span: cell.querySelector('span'), idx: null, cam: null };
+    cell.onclick = () => { if (c.cam) open_(c.cam); };
     // server-restart / transient recovery: retry this cell's own camera
     c.img.onerror = () => {
       const i = c.idx;
       setTimeout(() => {
-        if (!fullscreen && c.idx === i && i != null) c.img.src = streamUrl(i) + '&_r=' + Date.now();
+        if (!fullscreen && c.idx === i && i != null) c.img.src = retryUrl(i);
       }, 2000);
     };
     return c;
@@ -520,21 +906,26 @@ function buildCells(){
 // per-host connections for its whole life; you MUST free them before opening a
 // new page's streams or the new ones can't connect.)
 function clearCells(){
-  cells.forEach(c => { c.idx = null; c.span.textContent = ''; c.img.removeAttribute('src'); });
+  cells.forEach(c => { c.idx = null; c.cam = null; c.span.textContent = ''; c.img.removeAttribute('src'); });
 }
 
 function showPage(){
+  if (pg >= pages()) pg = pages() - 1;
   const start = pg*PER, shown = cams.slice(start, start+PER);
   document.getElementById('pageinfo').textContent =
      `Page ${pg+1}/${pages()}  (cameras ${start+1}-${start+shown.length} of ${cams.length})`;
   cells.forEach((c, k) => {
     if (k < shown.length){
-      c.idx = start + k;
-      c.span.textContent = shown[k].name;
+      const cam = shown[k];
+      c.cam = cam;
+      c.idx = cam.index;                   // technical index = the stream to open
+      c.span.textContent = cam.displayName;  // text only -- never parsed as HTML
+      c.cell.title = cam.displayName + ' \\u2014 ' + cam.technicalName + ' \\u00b7 CH' + cam.channel;
       c.cell.style.display = '';
       c.img.src = streamUrl(c.idx);
     } else {
       c.idx = null;
+      c.cam = null;
       c.span.textContent = '';
       c.cell.style.display = 'none';
       c.img.removeAttribute('src');
@@ -556,19 +947,35 @@ function page(d){
   clearCells();
   pg = (pg + d + pages()) % pages();
   document.getElementById('pageinfo').textContent = 'Loading page ' + (pg+1) + '/' + pages() + '…';
-  setTimeout(() => { if (my === pageSeq && !fullscreen) showPage(); }, 500);
+  // The streams were just aborted, so a connection is free: pick up names/order
+  // saved on the Settings page (from any browser) before showing the next page.
+  const fresh = loadCameras().catch(() => {});
+  setTimeout(() => fresh.then(() => { if (my === pageSeq && !fullscreen) showPage(); }), 500);
 }
 
-function open_(i){
-  // Handoff: keep camera i's grid cell streaming (slot reused, no restart) and
-  // stop the OTHER cells, freeing their slots for the fullscreen main view.
+// Saved on the Settings page in another tab of this browser: reload names/order now.
+window.addEventListener('storage', (e) => {
+  if (e.key !== 'cctv-camera-settings-rev' || fullscreen) return;
+  const my = ++pageSeq;
+  clearCells();
+  const fresh = loadCameras().catch(() => {});
+  setTimeout(() => fresh.then(() => { if (my === pageSeq && !fullscreen) showPage(); }), 300);
+});
+
+function open_(cam){
+  // Handoff: keep this camera's grid cell streaming (same worker, slot and cached
+  // frame -- no restart) and stop the OTHER cells FIRST, so the fullscreen stream
+  // gets a browser connection at once instead of queuing behind the per-host limit.
+  const i = cam.index;
   fullscreen = true;
-  const live = document.getElementById('live');
-  live.onerror = () => setTimeout(() => { if (fullscreen) live.src = streamUrl(i) + '&_r=' + Date.now(); }, 2000);
-  live.src = streamUrl(i);
-  document.getElementById('title').textContent = cams[i].name;
-  document.getElementById('view').style.display = 'flex';
   cells.forEach((c) => { if (c.idx !== i) c.img.removeAttribute('src'); });
+  const live = document.getElementById('live');
+  live.onerror = () => setTimeout(() => { if (fullscreen) live.src = retryUrl(i); }, 2000);
+  live.src = streamUrl(i);
+  document.getElementById('title').textContent = cam.displayName;
+  document.getElementById('tech').textContent = (cam.displayName !== cam.technicalName
+      ? cam.technicalName : cam.nvr.toUpperCase()) + ' \\u00b7 CH' + cam.channel;
+  document.getElementById('view').style.display = 'flex';
 }
 function close_(){
   fullscreen = false;
@@ -579,6 +986,20 @@ function close_(){
   // restore every grid cell's stream (they were stopped for fullscreen)
   cells.forEach((c) => { if (c.idx != null) c.img.src = streamUrl(c.idx); });
 }
+
+// Refresh / close / navigate away: abort every MJPEG stream FIRST. Each open <img>
+// stream holds one of the browser's ~6 HTTP/1.1 connections to this host, and the
+// old page's streams are only torn down after the NEW page has loaded -- so a
+// reload needs a 7th connection that never frees up and hangs forever (measured:
+// a reload hung ~7 min until the tab was closed). 'beforeunload' runs before the
+// reload request is sent (no prompt is shown); 'pagehide' covers mobile Safari.
+function stopAllStreams(){
+  cells.forEach(c => c.img.removeAttribute('src'));
+  const live = document.getElementById('live');
+  if (live) { live.onerror = null; live.removeAttribute('src'); }
+}
+window.addEventListener('beforeunload', stopAllStreams);
+window.addEventListener('pagehide', stopAllStreams);
 
 document.addEventListener('keydown', e=>{
   const k = e.key.toLowerCase();
@@ -598,6 +1019,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def handle(self):
+        if LOG_REQUESTS:
+            ev(f"TCP open  :{self.client_address[1]}")
+        try:
+            super().handle()
+        finally:
+            if LOG_REQUESTS:
+                ev(f"TCP close :{self.client_address[1]}")
+
     def _authorised(self, query):
         return not TOKEN or query.get("key", [""])[0] == TOKEN
 
@@ -605,21 +1035,80 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path   = parsed.path
         query  = parse_qs(parsed.query)
+        if LOG_REQUESTS:
+            ev(f"HTTP {self.command} {path} from :{self.client_address[1]} "
+               f"(Connection: {self.headers.get('Connection', '-')})")
         if not self._authorised(query):
             self._send(401, b"unauthorised", "text/plain")
             return
         if path == "/":
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+        elif path in ("/settings", "/camera-settings"):
+            self._send(200, SETTINGS_PAGE.encode(), "text/html; charset=utf-8")
         elif path == "/api/cameras":
-            self._send(200, json.dumps(CAMERAS).encode(), "application/json")
+            self._send(200, json.dumps(cameras_for_ui()).encode(), "application/json")
+        elif path == "/api/camera-settings":
+            self._send(200, json.dumps(SETTINGS.snapshot()).encode(), "application/json")
         elif path == "/api/status":
             self._send(200, json.dumps(system_status()).encode(), "application/json")
         elif path.startswith("/snapshot/"):
             self._snapshot(path)
         elif path.startswith("/stream/"):
-            self._stream(path)
+            self._stream(path, query)
         else:
             self._send(404, b"not found", "text/plain")
+
+    # Camera settings are changed with PUT (or POST) /api/camera-settings, behind the
+    # same access check as everything else. A JSON content type is required: a
+    # cross-site form cannot send one without a CORS preflight, which this server
+    # never approves (CSRF protection once access moves to cookies/SSO).
+    def do_PUT(self):
+        self._update_settings()
+
+    def do_POST(self):
+        self._update_settings()
+
+    def _update_settings(self):
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        if LOG_REQUESTS:
+            ev(f"HTTP {self.command} {parsed.path} from :{self.client_address[1]}")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if 0 <= length <= SETTINGS_MAX_BODY:
+            body = self.rfile.read(length)            # always drain (keep-alive safe)
+        else:
+            self.close_connection = True
+            return self._json(413, {"ok": False, "errors": [{"message": "Request too large."}]})
+        if not self._authorised(query):
+            return self._json(401, {"ok": False, "errors": [{"message": "unauthorised"}]})
+        if parsed.path != "/api/camera-settings":
+            return self._json(404, {"ok": False, "errors": [{"message": "not found"}]})
+        ctype = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            return self._json(415, {"ok": False, "errors": [{"message": "Content-Type must be application/json."}]})
+        try:
+            doc = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return self._json(400, {"ok": False, "errors": [{"message": "Body is not valid JSON."}]})
+        if not isinstance(doc, dict):
+            return self._json(400, {"ok": False, "errors": [{"message": "Body must be a JSON object."}]})
+        base = doc.get("baseRevision")
+        if base is not None and (isinstance(base, bool) or not isinstance(base, int)):
+            return self._json(400, {"ok": False, "errors": [{"message": "baseRevision must be an integer."}]})
+        try:
+            status, payload = SETTINGS.update(doc.get("cameras"), base)
+        except OSError as e:
+            ev(f"[SETTINGS] SAVE FAILED: could not write {SETTINGS.path}: {e}")
+            return self._json(500, {"ok": False, "errors": [{"message": "Could not save the settings file on the server."}]})
+        if status == 200 and payload.get("changed"):
+            ev(f"[SETTINGS] saved revision {payload['revision']}: " + "; ".join(payload["changed"]))
+        self._json(status, payload)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj).encode(), "application/json")
 
     def _index(self, path, prefix):
         try:
@@ -636,7 +1125,7 @@ class Handler(BaseHTTPRequestHandler):
         cam = STREAMS[i]
         cam.add_viewer()
         try:
-            for _ in range(50):
+            for _ in range(100):
                 jpg = cam.jpeg()
                 if jpg:
                     self._send(200, jpg, "image/jpeg")
@@ -648,31 +1137,48 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             cam.remove_viewer()
 
-    def _stream(self, path):
+    def _stream(self, path, query=None):
         i = self._index(path, "/stream/")
         if i is None:
             self._send(404, b"bad camera", "text/plain")
             return
+        # ?fps=N (1..STREAM_FPS): lower send rate for low-bandwidth previews (Settings
+        # page). Same camera worker, same NVR slot, same cached JPEG -- only fewer
+        # frames are written to THIS viewer.
+        try:
+            fps = int((query or {}).get("fps", [STREAM_FPS])[0])
+        except (TypeError, ValueError):
+            fps = STREAM_FPS
+        fps = max(1, min(STREAM_FPS, fps))
         cam = STREAMS[i]
-        cam.add_viewer()
+        n = cam.add_viewer()
+        ev(f"[{cam.label}] HTTP viewer connected (viewers {n - 1} -> {n})")
+        t_conn = time.monotonic()
+        sent_live = False
         try:
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")   # nginx: do not buffer MJPEG
             self.end_headers()
-            delay = 1.0 / max(1, STREAM_FPS)
+            delay = 1.0 / fps
             while True:
                 cam.last_use = time.time()
-                jpg = cam.jpeg_or_status()
+                jpg, live = cam.frame_or_placeholder()
                 if jpg:
                     self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n"
                                      b"Content-Length: " + str(len(jpg)).encode() +
                                      b"\r\n\r\n" + jpg + b"\r\n")
+                    if live and not sent_live:
+                        sent_live = True
+                        cam.first_http_ms = _ms(t_conn)
+                        ev(f"[{cam.label}] first live frame sent to viewer {cam.first_http_ms} ms after it connected")
                 time.sleep(delay)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             pass
         finally:
-            cam.remove_viewer()
+            n = cam.remove_viewer()
+            ev(f"[{cam.label}] HTTP viewer disconnected (viewers {n + 1} -> {n})")
 
     def _send(self, code, body, ctype):
         self.send_response(code)
@@ -701,14 +1207,43 @@ def local_ips():
     return ips
 
 
+def confirm_credentials():
+    """Background, once at startup: prove each NVR accepts our credentials (first
+    camera that answers). Until then pre-flights on that NVR run one at a time."""
+    def run(nvr):
+        for cam in STREAMS:
+            if cam.info["nvr"] != nvr or _AUTH_OK[nvr] or _nvr_auth_paused(nvr):
+                continue
+            with _AUTH_LOCK[nvr]:
+                if _AUTH_OK[nvr]:
+                    return
+                pf = _new_preflight(nvr, cam.info["channel"], lambda: True)
+                res = pf.run()
+                pf.close()
+            if res == rp.OK:
+                _AUTH_OK[nvr] = True
+                ev(f"[{nvr.upper()}] credentials confirmed (ch{cam.info['channel']} answered in {pf.ms} ms)")
+                return
+            if res == rp.AUTH_FAIL:
+                _pause_nvr_auth(nvr)
+                return
+    for nvr in NVRS:
+        threading.Thread(target=run, args=(nvr,), daemon=True).start()
+
+
 def main():
     resolve_nvr_ips()
     MONITOR.start()
     threading.Thread(target=reaper, daemon=True).start()
+    if PREFLIGHT_ENABLED:
+        confirm_credentials()
     print(f"\n{len(CAMERAS)} cameras ready on port {PORT}. Open:")
     for ip in local_ips():
-        print(f"   http://{ip}:{PORT}/" + (f"?key={TOKEN}" if TOKEN else ""))
-    print("\nPress Ctrl+C to stop.\n")
+        print(f"   http://{ip}:{PORT}/" + ("?key=<CCTV_TOKEN>" if TOKEN else ""))
+    print(f"\nstream slots/NVR={NVR_MAX_CONN}  pre-flight={'on' if PREFLIGHT_ENABLED else 'off'}"
+          f" (timeout {PREFLIGHT_TIMEOUT_MS} ms, {PREFLIGHT_PER_NVR}/NVR)  open timeout={OPEN_TIMEOUT_MS} ms"
+          f"  RTSP={os.environ.get('OPENCV_FFMPEG_CAPTURE_OPTIONS')}")
+    print("Press Ctrl+C to stop.\n", flush=True)
     try:
         QuietServer(("0.0.0.0", PORT), Handler).serve_forever()
     except KeyboardInterrupt:

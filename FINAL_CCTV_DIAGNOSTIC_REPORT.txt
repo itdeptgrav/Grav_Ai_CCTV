@@ -1,0 +1,490 @@
+================================================================================
+GRAV CCTV -- DIAGNOSTIC REPORT: "Pages 2-5: some cameras never show / stuck on
+Waiting for NVR slot... / Connecting... / only 1-2 work / video slow"
+Project : D:\GRAV_Project\grav-cctv   (standalone Python MJPEG server)
+Date    : 2026-09-25
+Baseline: commit e0b9450 ("Fix multi-camera reliability on later pages")
+Host    : 192.168.1.51 -- ON the CCTV LAN, so ACCESS_MODE=auto used the private
+          NVR IPs for every test below (see 23. for what that leaves untested).
+Method  : every claim below was measured: raw RTSP probes (diag_cctv.py), OpenCV
+          opens, a headless reproduction of the grid UI (walk_pages.py), the real
+          browser, /api/status and the server's own event log. No credentials or
+          secrets are printed in this report.
+Labels  : PASS / FAIL / NOT TESTED
+================================================================================
+
+--------------------------------------------------------------------------------
+1. EXACT ROOT CAUSES (proven)
+--------------------------------------------------------------------------------
+R1  4 CHANNELS HAVE NO LIVE VIDEO (hardware / camera side).            PROVEN
+    NVR2 ch7 ("NVR2 Cam 7"), NVR2 ch12, NVR2 ch13, NVR1 ch10.
+    The NVR accepts the TCP connection and answers the unauthenticated DESCRIBE
+    with a 401 challenge in ~10-60 ms (like every channel), but NEVER answers the
+    authenticated DESCRIBE. Same result from OpenCV (hits its 8 s timeout). No
+    software change can produce video for these; check those cameras/cabling/PoE.
+    These are the tiles that "never come" on pages 2, 3 and 4.
+
+R2  OpenCV OPENS ARE SERIALIZED PROCESS-WIDE, AND NVR2 IS SLOW TO     PROVEN
+    ANSWER A "COLD" CHANNEL -> cameras appeared one by one, ~4 s apart, and a
+    dead channel (R1) blocked every camera behind it for 8 s.
+      * NVR2 answers DESCRIBE for a cold channel in 2.8-3.3 s (it starts pulling
+        the camera substream on demand); while ANY other connection to that
+        channel is open (even an idle DESCRIBE-only one) it answers in 12-56 ms.
+        (4/4 channels tested; warmth ends the moment the other connection closes.)
+      * NVR side is NOT the limit: 6 cold handshakes in parallel on NVR2 finish in
+        3.7 s (22.6 s one-by-one); per-handshake time unchanged (3.18 s vs 3.16 s).
+        => "six simultaneous opens overload the NVR" is FALSE.
+      * OpenCV IS the limit: 1, 2 or 6 opening threads all take ~23-32 s for 6
+        NVR2 cameras, in the same ~4 s staircase.
+      * Consequence measured on the old server: page 2 first camera 10.7 s,
+        page 3 8.9 s, page 4 10.5 s, and page 5 (ONE camera that opens in 1.4 s)
+        took 10.2 s because page 4's dead channel was still inside an
+        un-interruptible 8 s OpenCV open holding the serialized path. Dead tiles
+        sat on "Connecting..." for 20+ s before their first attempt even started.
+
+R3  NVR2 INTERMITTENTLY DOES NOT ANSWER HEALTHY CHANNELS.              PROVEN
+    Observed on ch1, ch2, ch3, ch4, ch5, ch9 at different times (also with strictly
+    one-at-a-time handshakes, so not caused by our concurrency). Sometimes the
+    answer is just slow (one healthy answer took 6.1 s, one 7.5 s); sometimes no
+    answer at all for 8 s, then the next attempt succeeds. This is why the list of
+    "dead" cameras changed between yesterday and today (ch4, NVR1 ch7/ch12 were
+    "dead" yesterday, healthy today). In the old code each such hang also held the
+    global open path for 8 s. NVR-side; see recommendations (section 23).
+
+R4  BROWSER RELOAD DEADLOCK (UI bug, existed before too).               PROVEN
+    Each MJPEG <img> holds one of the browser's 6 HTTP/1.1 connections to the host
+    for its whole life. On reload the browser keeps the old page (and its 6
+    streams) until the NEW page has loaded -- which needs a 7th connection. Result
+    measured in the real browser: reload hung ~7 minutes, zero requests reached
+    the server, until the tab was closed. Looks exactly like "cameras never come".
+
+R5  BROWSER THROTTLES LOW-PRIORITY IMAGE LOADS; AN MJPEG IMAGE NEVER    PROVEN
+    FINISHES -> held-back tiles may wait forever. Measured in the real browser
+    (after R4 had occurred): only 3 of a page's 6 stream requests were even sent;
+    the other 3 were held inside the browser for 43 s in one case and >80 s
+    (never, until closed) in another, although the browser had a free connection.
+    A/B in the same browser state: with fetchpriority=high all 6 were sent in the
+    same second. (The exact trigger inside the browser is not proven; the first
+    load of the session opened all 6 at once. Plausible on the hosted site over the
+    public internet too -- NOT TESTED there.)
+
+R6  LATENT UI BUG: tile retry URL broken when the page has no ?key=.   PROVEN
+    onerror retry built '/stream/5&_r=...' (no '?'), which the server rejects
+    as a bad camera id, so a tile that errored once never recovered. Harmless today
+    (the page uses ?key=), but the .env now says access is moving to CMS SSO
+    (no ?key= in the URL) -- then every errored tile would stay dead.
+
+R7  "WAITING FOR NVR SLOT..." -- NOT REPRODUCIBLE ON THE BASELINE.     PROVEN
+    No slot leak on commit e0b9450: across 1->2->3->4->5->1 (headless and real
+    browser) both NVRs dropped to 0/6 after every page cleanup, no stale owners.
+    The earlier "Waiting for NVR slot" came from the older slot-before-open design
+    (dead channels holding slots), fixed in e0b9450. If it is still seen on the
+    HOSTED site, that server is likely running older code (NOT TESTED here).
+    Now fully observable: /api/status lists every slot owner and every waiter, and
+    the log prints the owner list whenever a camera waits.
+
+R8  NVR IP CHANGE / WRONG IP / WRONG PORT / SWAPPED NVRs / BAD MAPPING: NONE.  PROVEN
+    See sections 2-4.
+
+--------------------------------------------------------------------------------
+2. DID ANY NVR IP CHANGE?                                     answer: NO
+--------------------------------------------------------------------------------
+  NVR1: configured IP = 192.168.1.48   current/resolved IP = 192.168.1.48   changed: NO
+        (the NVR1 MAC from .env is at 192.168.1.48 in this host's ARP table, and the
+         device at 192.168.1.48 has that MAC)
+  NVR2: configured IP = 192.168.1.44   current/resolved IP = 192.168.1.44   changed: NO
+        (same MAC check)
+  RTSP port: 554 on both, unchanged (both answer RTSP on 554).
+  The two endpoints answer as two DIFFERENT devices (distinct digest realms
+  "Login to 9bbb...b56b" vs "Login to ec97...acd9"), so they are not swapped or
+  shared.
+  Public path (used by a HOSTED server off this LAN): CCTV_PUBLIC_IP 103.39.***.30,
+  ports 10554 (NVR1) / 20554 (NVR2): TCP connect FAILS from inside the LAN -- the
+  router most likely has no NAT loopback. It worked from off-site in the previous
+  session. Public path: NOT TESTED today.
+
+--------------------------------------------------------------------------------
+3. NVR ENDPOINT TEST (from this host, LAN mode)
+--------------------------------------------------------------------------------
+  NVR   configured IP:port  resolved (MAC)  changed  TCP  RTSP  cameras
+  nvr1  192.168.1.48:554    192.168.1.48    NO       yes  yes   12 (ch3-14)
+  nvr2  192.168.1.44:554    192.168.1.44    NO       yes  yes   13 (ch1-13)
+  TCP connect median: nvr1 9.9 ms (max 33.7), nvr2 5.0 ms (max 22.5).  PASS
+
+--------------------------------------------------------------------------------
+4. ALL 25 CAMERAS -- MAPPING  (UI number = /stream/<n-1> = CAMERAS[n-1])
+--------------------------------------------------------------------------------
+   #  page slot  name                  NVR   ch  RTSP (credentials masked)
+   1   1    1   Floor 19 - Storage    nvr2   1  rtsp://***@192.168.1.44:554/cam/realmonitor?channel=1&subtype=1
+   2   1    2   NVR2 Cam 2            nvr2   2  ...channel=2&subtype=1
+   3   1    3   NVR2 Cam 3            nvr2   3  ...channel=3&subtype=1
+   4   1    4   Floor 9 - Cabin       nvr2   4  ...channel=4&subtype=1
+   5   1    5   NVR2 Cam 5            nvr2   5  ...channel=5&subtype=1
+   6   1    6   NVR2 Cam 6            nvr2   6  ...channel=6&subtype=1
+   7   2    1   NVR2 Cam 7            nvr2   7  ...channel=7&subtype=1
+   8   2    2   Floor 10 - Reception  nvr2   8  ...channel=8&subtype=1
+   9   2    3   NVR2 Cam 9            nvr2   9  ...channel=9&subtype=1
+  10   2    4   NVR2 Cam 10           nvr2  10  ...channel=10&subtype=1
+  11   2    5   NVR2 Cam 11           nvr2  11  ...channel=11&subtype=1
+  12   2    6   NVR2 Cam 12           nvr2  12  ...channel=12&subtype=1
+  13   3    1   NVR2 Cam 13           nvr2  13  ...channel=13&subtype=1
+  14   3    2   NVR1 Cam 3            nvr1   3  rtsp://***@192.168.1.48:554/cam/realmonitor?channel=3&subtype=1
+  15   3    3   NVR1 Cam 4            nvr1   4  ...channel=4&subtype=1
+  16   3    4   NVR1 Cam 5            nvr1   5  ...channel=5&subtype=1
+  17   3    5   NVR1 Cam 6            nvr1   6  ...channel=6&subtype=1
+  18   3    6   NVR1 Cam 7            nvr1   7  ...channel=7&subtype=1
+  19   4    1   NVR1 Cam 8            nvr1   8  ...channel=8&subtype=1
+  20   4    2   NVR1 Cam 9            nvr1   9  ...channel=9&subtype=1
+  21   4    3   NVR1 Cam 10           nvr1  10  ...channel=10&subtype=1
+  22   4    4   NVR1 Cam 11           nvr1  11  ...channel=11&subtype=1
+  23   4    5   NVR1 Cam 12           nvr1  12  ...channel=12&subtype=1
+  24   4    6   NVR1 Cam 13           nvr1  13  ...channel=13&subtype=1
+  25   5    1   NVR1 Cam 14           nvr1  14  ...channel=14&subtype=1
+  Checks:  duplicates none | gaps inside ranges none | invalid entries none |
+           UI index == /stream index == CAMERAS index (same list, same order) |
+           no off-by-one.                                                  PASS
+  Missing cameras? All UNMAPPED channels were probed: NVR1 ch1, ch2, ch15, ch16 and
+  NVR2 ch14, ch15, ch16 -> no live video on any of them. No live camera is missing
+  from the grid (NVR1 correctly starts at ch3).                            PASS
+
+--------------------------------------------------------------------------------
+5. ALL 25 CAMERAS -- DIRECT TEST (sequential; server stopped; LAN)
+--------------------------------------------------------------------------------
+  "DESCRIBE" = raw authenticated RTSP DESCRIBE answer time (NVR-side prepare time)
+  "open/1st" = OpenCV open ms / first frame ms after open (server-identical params)
+   #  camera                NVR  ch  result   DESCRIBE  open/1st      codec  res       kbps  GOP
+   1  Floor 19 - Storage    nvr2  1  PASS       2962    5236 / 76     H.265  1280x720   971  2.0s
+   2  NVR2 Cam 2            nvr2  2  PASS       3186    4179 / 53     H.265  1280x720   996  2.0s
+   3  NVR2 Cam 3            nvr2  3  PASS       2972    4097 / 59     H.265  1280x720  1025  2.0s
+   4  Floor 9 - Cabin       nvr2  4  PASS       2995    4323 / 66     H.265  1280x720  1037  2.0s
+   5  NVR2 Cam 5            nvr2  5  PASS       2969    4206 / 66     H.265  1280x720  1046  2.0s
+   6  NVR2 Cam 6            nvr2  6  PASS       2780    4111 / 67     H.265  1280x720  1046  2.0s
+   7  NVR2 Cam 7            nvr2  7  TIMEOUT    no reply  8038 / -      -      -           -     -
+   8  Floor 10 - Reception  nvr2  8  PASS        831    2902 / 61     H.265  1280x720  1141  2.0s
+   9  NVR2 Cam 9            nvr2  9  PASS       3081    4246 / 92     H.265  1280x720   955  2.0s
+  10  NVR2 Cam 10           nvr2 10  PASS       3125    4187 / 64     H.265  1280x720   978  2.0s
+  11  NVR2 Cam 11           nvr2 11  PASS       1996    3235 / 78     H.265  1280x720  1023  2.0s
+  12  NVR2 Cam 12           nvr2 12  TIMEOUT    no reply  8073 / -      -      -           -     -
+  13  NVR2 Cam 13           nvr2 13  TIMEOUT    no reply  8089 / -      -      -           -     -
+  14  NVR1 Cam 3            nvr1  3  PASS       1189    1398 / 26     H.264  352x288    354  2.0s
+  15  NVR1 Cam 4            nvr1  4  PASS         75    1359 / 20     H.264  352x288    463  2.0s
+  16  NVR1 Cam 5            nvr1  5  PASS        916    1361 / 24     H.264  352x288    317  2.0s
+  17  NVR1 Cam 6            nvr1  6  PASS        848    1464 / 21     H.264  352x288    359  2.0s
+  18  NVR1 Cam 7            nvr1  7  PASS        188    1400 / 32     H.264  352x288    495  2.0s
+  19  NVR1 Cam 8            nvr1  8  PASS         38    2378 / 20     H.264  352x288    533  2.0s
+  20  NVR1 Cam 9            nvr1  9  PASS         73    2807 / 26     H.264  352x288    829  2.0s
+  21  NVR1 Cam 10           nvr1 10  TIMEOUT    no reply  8048 / -      -      -           -     -
+  22  NVR1 Cam 11           nvr1 11  PASS         46    2655 / 23     H.264  352x288   1008  2.0s
+  23  NVR1 Cam 12           nvr1 12  PASS         60    2774 / 19     H.264  352x288   1014  2.0s
+  24  NVR1 Cam 13           nvr1 13  PASS         42    3052 / 22     H.264  352x288   1003  2.0s
+  25  NVR1 Cam 14           nvr1 14  PASS       1723    2634 / 19     H.264  352x288    808  2.0s
+  TOTAL: 21 PASS, 4 TIMEOUT (= no live video; R1). No AUTH_FAIL, BAD_CHANNEL or
+  NVR_UNREACHABLE. First keyframe arrives WITH the first RTP packet (NVR2 ~0.3 s,
+  NVR1 ~0.1 s after PLAY), so keyframe/GOP waiting is NOT a startup bottleneck.
+
+--------------------------------------------------------------------------------
+6. PAGE-BY-PAGE (exactly as the UI pages; NVR_MAX_CONN = 6)
+--------------------------------------------------------------------------------
+  page  cameras  NVR1  NVR2  direct PASS  > 6 streams from one NVR?  dead channels
+   1     1-6       0     6      6/6       no (exactly 6)             none
+   2     7-12      0     6      4/6       no (exactly 6)             #7, #12
+   3     13-18     5     1      5/6       no                         #13
+   4     19-24     6     0      5/6       no (exactly 6)             #21 (NVR1 ch10)
+   5     25        1     0      1/1       no                         none
+  No page ever needs more than NVR_MAX_CONN live streams from one NVR.     PASS
+
+--------------------------------------------------------------------------------
+7. SLOT OWNERSHIP (who holds each NVR slot)
+--------------------------------------------------------------------------------
+  New debug structure: NVR_OWNERS (camera -> time acquired) and NVR_WAITERS.
+  /api/status -> nvrs.<nvr>.owners[] {index, name, viewers, status, heldMs,
+  lastFrameAgeMs, suspectLeak} and waitingCameras[]. When a camera must wait, the
+  log prints e.g.:
+    [NVR2] active=6 max=6 owners=[cam1 'Floor 19 - Storage' viewers=1 status=LIVE
+    held=12.3s lastFrame=80ms; ...]  waiting camera=Cam 7 NVR2 Cam 7
+  A reaper alarm logs "SLOT LEAK?" if a slot is ever held by a camera with 0
+  viewers for 10-15 s.
+  Findings: in every real test the owners were EXACTLY the healthy cameras of the
+  current page (page 1: #1-6; page 2: #8-11; page 3: #14-18; page 4: #19,20,22,23,24;
+  page 5: #25). Dead channels never appear as owners. 0 slot waits and 0 leak
+  alarms during all browser and headless runs.                            PASS
+
+--------------------------------------------------------------------------------
+8. SLOT LEAK TEST (page transitions 1->2->3->4->5->1)
+--------------------------------------------------------------------------------
+  Headless reproduction of the UI (6 concurrent MJPEG streams, close, 500 ms, open):
+  transition   before           after old-page cleanup   after new page started
+  -> page 1    N1 0/6 N2 0/6    N1 0/6 N2 0/6             N1 0/6 N2 6/6
+  -> page 2    N1 0/6 N2 6/6    N1 0/6 N2 0/6             N1 0/6 N2 4/6
+  -> page 3    N1 0/6 N2 4/6    N1 0/6 N2 0/6             N1 5/6 N2 0/6
+  -> page 4    N1 5/6 N2 0/6    N1 0/6 N2 0/6             N1 5/6 N2 0/6
+  -> page 5    N1 5/6 N2 0/6    N1 0/6 N2 0/6             N1 1/6 N2 0/6
+  -> page 1    N1 1/6 N2 0/6    N1 0/6 N2 0/6             N1 0/6 N2 6/6
+  all closed                    N1 0/6 N2 0/6
+  No old-page camera held a viewer or a slot after cleanup (strays: none), on the
+  baseline AND on the new code.                                           PASS
+  Real browser (same walk, plus fullscreen, Back, reload): old-page viewers go
+  1 -> 0 and their slots are released within ~1 s of every switch.        PASS
+  Browser clean-up per action (server log "HTTP viewer connected/disconnected"):
+    page change ... 6 disconnects then 6 connects                         PASS
+    fullscreen .... other 5 disconnect + workers stop; the fullscreen <img> reuses
+                    the SAME browser connection (same URL) -> 0 new connections,
+                    same worker, same slot, frame already flowing        PASS
+    Back .......... the other 5 reconnect (viewers 0 -> 1), camera 1 untouched PASS
+    reload ........ BEFORE fix: hung ~7 min (R4)                          FAIL
+                    AFTER fix : 6 disconnects + 6 connects within 1 s     PASS
+
+--------------------------------------------------------------------------------
+9. FILES CHANGED
+--------------------------------------------------------------------------------
+  server.py          (modified) startup path, slot ownership, statuses, API, logs,
+                     page JS fixes (details below)
+  rtsp_preflight.py  (new)  lock-free RTSP pre-flight / NVR warm-up (185 lines)
+  test_lifecycle.py  (modified: test setup only -- CCTV_PREFLIGHT=0, quiet logs,
+                     stub gains grab()/retrieve(); no assertion changed)
+  test_slots.py      (new)  16 tests / 59 checks (list in 21.)
+  diag_cctv.py       (new)  diagnostics used for this report (env/map/rtsp/extra/
+                     cv/conc/openspeed/pages)
+  walk_pages.py      (new)  headless page-walk harness (before/after + slot leak)
+  NOT changed: nvr_config.py, netcheck.py, .env, NVR_MAX_CONN (still 6).
+  NOTE .env.example has an UNCOMMITTED change that is NOT from this work (CMS SSO
+  keys) and it contains the REAL CCTV_SSO_SECRET value -- do not commit it as is.
+
+  server.py changes in detail:
+   * Pre-flight before every OpenCV open (rtsp_preflight.py): authenticated
+     DESCRIBE, run in parallel OUTSIDE OpenCV's global open lock.
+       - dead channel -> no answer -> "Retrying..." / "Camera offline", backoff,
+         NEVER enters the serialized open path (cannot delay other cameras);
+       - healthy -> the connection is held open (idle, no video transferred) until
+         the camera's OpenCV open is done, keeping the NVR channel warm: the OpenCV
+         open's DESCRIBE is answered in ~20 ms instead of ~3 s (open ~1.3 s).
+       - aborts within 0.25 s when the viewer leaves (a hung OpenCV open cannot).
+   * Credential safety: until an NVR has accepted the credentials once, its
+     pre-flights run one at a time; a 401 pauses that NVR for 15 min -> wrong
+     credentials cause ONE failed login, never a burst that locks the NVR account.
+     Credentials are confirmed in the background at startup.
+   * Slot ownership tracking + waiter tracking + owner dump on wait + leak alarm.
+   * Status vocabulary: Connecting... | Waiting for NVR slot... | NVR unreachable |
+     Camera offline | Retrying... | LIVE | NVR login failed | Idle, with the
+     masked last error per camera. First failure of a previously-fine camera =
+     "Retrying..." (R3); repeated or known-dead = "Camera offline"; a camera that
+     was dead on a recent visit shows "Camera offline" at once.
+   * Retry back-off 1,2,4,8,16,30 s (no slot / no gate held while waiting); sleeps
+     end immediately when the viewer leaves.
+   * Frame max-age (CCTV_FRAME_MAX_AGE_S, 5 s): the last frame is kept briefly for
+     hand-offs (page/fullscreen) but never shown frozen after a feed dies.
+   * Placeholder (status) image encoded once per status change, not per viewer
+     per frame.
+   * Decode: grab() every frame, retrieve()+resize+JPEG only for published frames;
+     1 FFmpeg decoder thread per camera; steady STREAM_FPS pacing (see 12.).
+   * RTSP over TCP enforced even when OPENCV_FFMPEG_CAPTURE_OPTIONS is pre-set.
+   * Removed CAP_PROP_BUFFERSIZE=1: measured unsupported by the FFmpeg backend
+     (cap.set returns False for all 25 cameras) -- it was a no-op.
+   * /stream responses send "X-Accel-Buffering: no" (nginx must not buffer MJPEG).
+   * Logs (CCTV_LOG_EVENTS, default on, never per frame): viewer connected/
+     disconnected with counts, worker start/stop, state changes with reason,
+     one-line startup breakdown per camera, first live frame sent per viewer,
+     slot waits with owners. CCTV_LOG_REQUESTS=1 adds per-request/TCP logging.
+   * Startup banner no longer prints the ?key= token.
+   * Page JS (no redesign): stopAllStreams() on beforeunload/pagehide (R4);
+     fetchpriority=high on stream <img>s (R5); retryUrl() works with and without
+     ?key= (R6); fullscreen frees the other tiles BEFORE opening its stream.
+
+--------------------------------------------------------------------------------
+10. TIMEOUT SETTINGS (chosen from measurements, not guessed)
+--------------------------------------------------------------------------------
+  CCTV_PREFLIGHT_TIMEOUT_MS = 8000  (new) authenticated-DESCRIBE deadline = dead-
+      channel detection. Healthy answers: usually 2.7-3.4 s (NVR2) / 0.04-1.7 s
+      (NVR1), but NVR2 answered healthy channels in 6.1 s and 7.5 s in live runs,
+      so the 6000 first tried would have misreported healthy cameras. Costs nothing
+      to other cameras (pre-flight runs outside the open lock).
+  CCTV_OPEN_TIMEOUT_MS = 8000 / CCTV_READ_TIMEOUT_MS = 8000 (unchanged). Requested
+      3-5 s REJECTED by data: healthy cold OpenCV opens take up to 5.2 s (NVR2, LAN)
+      and ~7 s over the public path. Dead channels no longer reach OpenCV, so this
+      value is now rarely hit.
+  Reduced FFmpeg probing (analyzeduration=0 / probesize / fpsprobesize) was tested
+      and REJECTED: 2 of 6 cold opens hung to the 8 s timeout.
+  RTSP transport: TCP -- verified at runtime: 6 TCP sessions to NVR port 554 for 6
+      live cameras, 0 UDP ports bound by the server.                     PASS
+
+--------------------------------------------------------------------------------
+11. CONNECTION / SETUP CONCURRENCY
+--------------------------------------------------------------------------------
+  Live-stream slots per NVR:  NVR_MAX_CONN = 6 (unchanged, as required).
+  Setup limit (separate):     CCTV_PREFLIGHT_PER_NVR = 6 pre-flight handshakes per
+                              NVR in parallel.
+  Measured (6 NVR2 channels, handshake + first keyframe ready):
+      concurrency 1 -> 22.6 s | 2 -> 10.4 s | 6 -> 3.7 s  (handshake avg ~3.1-3.2 s
+      each at every level -> the NVR is not overloaded by parallel setup)
+    NVR1: 1 -> 5.3 s | 2 -> 3.3 s | 6 -> 1.7 s
+  OpenCV opens: CCTV_CONNECT_MAX = 1 (global). Measured 1 / 2 / 6 threads: 6 NVR2
+      cameras all visible at 25.1 / 32.0 / 22.9 s -- OpenCV serializes internally,
+      so >1 gains nothing; 1 lets the gate choose the ORDER (fresh cameras first).
+  => CONNECT_CONCURRENCY 1 vs 2 tested as asked: no difference for OpenCV opens;
+     for NVR handshakes more parallelism is strictly better, hence the pre-flight
+     design.
+
+--------------------------------------------------------------------------------
+12. JPEG / FRAME PIPELINE
+--------------------------------------------------------------------------------
+  JPEG encoded ONCE per published frame in the camera worker, cached as bytes and
+  shared by every viewer (already true since e0b9450; kept).               PASS
+  First frame: encoded and published immediately (first-read -> JPEG 1-8 ms).  PASS
+  New: grab() every frame, retrieve() (BGR conversion) + resize + encode only for
+       published frames: 26% -> 18% of a core per NVR2 camera.
+  New: 1 FFmpeg decoder thread per camera (CCTV_DECODE_THREADS=1): for 6 NVR2
+       streams RSS 497 MB -> 109 MB, OS threads 125 -> 26, same CPU, 25 fps kept.
+  New: publish cadence fixed -- STREAM_FPS=8 used to deliver ~6.25 fps; now
+       measured 8.0-8.1 fps per camera.
+  Whole server, one NVR2 page (6 x 1280x720 H.265) live:
+       before the decode changes (same read()-every-frame, auto-thread decode path
+       as e0b9450): CPU 289% of a core, 570 MB, 233 threads, ~6.25 fps delivered
+       after : CPU 160% of a core, 159 MB,  47 threads,  8.0 fps delivered
+  NVR1 page (5 live): CPU 42%, 98 MB, 8.0 fps.
+
+--------------------------------------------------------------------------------
+13. PERFORMANCE BEFORE (commit e0b9450, headless UI walk, LAN)
+14. PERFORMANCE AFTER  (final code, same walk)
+--------------------------------------------------------------------------------
+  ms from opening the page's 6 streams     BEFORE                AFTER (final run)
+                                           first   all healthy   first   all healthy
+  page 1 (6 x NVR2)                        4,446   25,886        4,565   16,812 (*)
+  page 2 (4 live + 2 dead)                10,696   21,021        1,924    6,315
+  page 3 (5 live + 1 dead)                 8,873   22,564        1,933    7,563
+  page 4 (5 live + 1 dead)                10,535   29,157        1,725    7,507
+  page 5 (1 camera)                       10,228   10,228        2,700    2,700
+  page 1 again                             4,325   25,181        4,379   11,331
+  (*) NVR2 did not answer #1 and #2 within 8 s on that run (R3); both went live
+      on the automatic retry at 15-17 s while the other 4 were visible by 8.4 s.
+      Other AFTER runs of page 1: 11.1 s and 15.0 s all-visible.
+  Smaller scenarios (same harness, BEFORE = e0b9450 run side by side):
+    1 camera NVR1 ........ before 1.5 s   after 1.6 s   (unchanged: bounded by NVR)
+    1 camera NVR2 ........ before 15.2 s (single sample, probably an NVR2 no-answer;
+                           the old server has no event log to confirm) / typical
+                           direct open ~4.1-4.2 s   after 4.2 s  (unchanged)
+    3 cameras NVR2 ....... all visible: before 12.7 s  ->  after 7.0 s
+    3 cameras NVR1 ....... all visible: before 7.4 s   ->  after 5.4 s
+  Where a camera's startup time goes now (server log, typical NVR2 cold camera):
+    pre-flight 2.9-3.5 s (NVR prepares the substream; runs in parallel for all)
+    | gate wait 0-2.9 s (serialized warm opens of the cameras ahead) | open 1.3 s
+    | slot wait 0 | first read 30-120 ms | JPEG 2-8 ms  ->  first frame 4.2-7.2 s
+    Viewer side: "first live frame sent to viewer" 4.4-8.9 s after it connected.
+
+--------------------------------------------------------------------------------
+15. NVR1 TIMING (LAN)                         16. NVR2 TIMING (LAN)
+--------------------------------------------------------------------------------
+  NVR1: reachable yes (TCP ~10 ms)             NVR2: reachable yes (TCP ~5 ms)
+   codec H.264 352x288 ~26 fps, GOP 2 s         codec H.265 1280x720 25 fps, GOP 2 s
+   bitrate 317-1014 kbps (avg ~650)             bitrate 955-1141 kbps (avg ~1020)
+   DESCRIBE avg 473 ms (38-1723)                DESCRIBE avg 2690 ms (831-3186)
+   OpenCV open avg 2116 ms, 1st frame 23 ms     OpenCV open avg 4072 ms, 1st frame 68 ms
+   failures: 1 of 12 channels dead (ch10);      failures: 3 of 13 channels dead
+   no intermittent no-answers observed          (ch7, ch12, ch13) + intermittent
+                                                no-answers on healthy channels (R3)
+  => NVR2 is ~6x slower to start a stream and less reliable. NVR2's "substream"
+     is 1280x720 H.265 @ 25 fps although the grid shows 640x360 @ 8 fps.
+
+--------------------------------------------------------------------------------
+17. PAGE 2 RESULT                                                        PASS
+--------------------------------------------------------------------------------
+  #7  NVR2 Cam 7   direct: TIMEOUT (no live video) | web: Retrying... -> Camera
+                   offline, holds no slot, never reaches OpenCV
+  #8  Floor 10     direct PASS | web LIVE | slot wait 0
+  #9  NVR2 Cam 9   direct PASS | web LIVE | slot wait 0
+  #10 NVR2 Cam 10  direct PASS | web LIVE | slot wait 0
+  #11 NVR2 Cam 11  direct PASS | web LIVE | slot wait 0
+  #12 NVR2 Cam 12  direct: TIMEOUT (no live video) | web: Retrying... -> Camera offline
+  First camera 10.7 s -> 1.9 s; all 4 healthy 21.0 s -> 6.3 s.
+
+18. PAGE 3 RESULT                                                        PASS
+  #13 NVR2 Cam 13  direct: TIMEOUT (no live video) | web: Retrying... / Camera offline
+  #14-#18 NVR1 Cam 3-7: direct PASS | web LIVE | slot wait 0
+  First camera 8.9 s -> 1.9 s; all 5 healthy 22.6 s -> 7.6 s.
+
+19. PAGE 4 RESULT                                                        PASS
+  #21 NVR1 Cam 10  direct: TIMEOUT (no live video) | web: Retrying... / Camera offline
+  #19, #20, #22, #23, #24 (NVR1 Cam 8, 9, 11, 12, 13): direct PASS | web LIVE |
+  slot wait 0.  First camera 10.5 s -> 1.7 s; all 5 healthy 29.2 s -> 7.5 s.
+
+20. PAGE 5 RESULT                                                        PASS
+  #25 NVR1 Cam 14  direct PASS | web LIVE | slot wait 0
+  10.2 s -> 1.7-2.7 s (no longer waits behind page 4's dead channel).
+
+--------------------------------------------------------------------------------
+21. AUTOMATED TESTS
+--------------------------------------------------------------------------------
+  python -m py_compile server.py nvr_config.py netcheck.py rtsp_preflight.py
+      diag_cctv.py walk_pages.py test_slots.py test_lifecycle.py      PASS
+  python test_lifecycle.py   11 / 11 existing checks                       PASS
+  python test_slots.py       16 tests / 59 checks, ~22 s                    PASS
+                             First run: 3 FAILS, caused by the TEST (its open
+                             counters were cumulative across tests, so cameras opened
+                             while healthy in earlier tests counted as "dead camera
+                             reached OpenCV"). Counters are now reset per test; every
+                             run since passed, 2 of them alongside a live server.
+    no slot leak after page switch | failed open never holds a slot | dropped
+    stream releases its slot before back-off | healthy cameras get slots while a
+    dead one backs off (dead never reaches OpenCV) | OpenCV connect cap (1) |
+    per-NVR pre-flight cap | viewer disconnect + last viewer releases worker |
+    25 rapid page switches -> all semaphores/counters restored | retry fairness +
+    rate limit | dead status progression + "Camera offline" on revisit | wrong
+    credentials -> exactly ONE login attempt, NVR paused | slot-wait reporting +
+    hand-off to the waiter | frame max-age | /api/status fields and no
+    credentials | retry URL without ?key= | streams aborted on unload |
+    fetchpriority=high on stream images
+
+--------------------------------------------------------------------------------
+22. REAL TESTS (this LAN, real NVRs)
+--------------------------------------------------------------------------------
+  25-camera direct RTSP + OpenCV tests ........................................ PASS
+  endpoint / IP-change / identity checks ...................................... PASS
+  NVR vs OpenCV concurrency (1/2/6) ........................................... PASS
+  headless page walk before/after, slot counts at every transition ............ PASS
+  real browser: pages 1->2->3->4->5->1, fullscreen, Back ...................... PASS
+  real browser: reload ....................... FAIL before fix (hang) -> PASS after
+  real browser: all 6 streams requested at once (fetchpriority) ... FAIL -> PASS
+  1-camera / 3-camera / 6-camera before vs after .............................. PASS
+  RTSP over TCP at runtime .................................................... PASS
+  CPU / memory / delivered fps ................................................ PASS
+  Success conditions:
+    reachable cameras consistently show video .............................. PASS
+    failed/offline cameras correctly identified (4 dead channels) .......... PASS
+    no old-page slot leak .................................................. PASS
+    "Waiting for NVR slot" never stuck (0 occurrences in all runs) ......... PASS
+    healthy cameras not starved by dead ones ............................... PASS
+    pages 2-5 behave correctly ............................................. PASS
+    video significantly faster (pages 2-5 all-visible 3-4x faster) ........ PASS
+    page switches without refresh; refresh itself works .................... PASS
+    IP changes identified (none) ........................................... PASS
+
+--------------------------------------------------------------------------------
+23. NOT TESTED / OPEN ITEMS / RECOMMENDATIONS
+--------------------------------------------------------------------------------
+  NOT TESTED  the HOSTED instance (https://cctv.grav.in): it uses the public path
+              and the new CMS SSO login, neither of which could be exercised here.
+              Make sure it runs THIS code; if symptoms remain there, compare its
+              /api/status (owners, waitingCameras, lastErrorMasked).
+  NOT TESTED  public RTSP path 103.39.***.30:10554/20554 (no NAT loopback on the
+              LAN). Over that path each NVR2 page is ~6 Mbps from the site uplink
+              per viewer page -- check the uplink if the hosted site stutters.
+  NOT TESTED  browsers other than the app's embedded Chromium (Firefox/Safari:
+              fetchpriority is supported by Safari 17.2+, ignored harmlessly by
+              older ones; pagehide covers Safari's unload).
+  NOT TESTED  behind nginx/Cloudflare (X-Accel-Buffering: no is sent; Cloudflare
+              may still buffer or cut long MJPEG responses).
+  OPEN        R5 trigger inside the browser not proven (fixed regardless).
+  RECOMMEND   Check the 4 dead cameras (NVR2 ch7/12/13, NVR1 ch10) on site, or
+              remove them from nvr_config.CAMERAS if they no longer exist.
+  RECOMMEND   NVR2: its substream is 1280x720 H.265 @ 25 fps for a 640x360 @ 8 fps
+              grid. Setting the substream to ~640x360, 8-15 fps would cut server
+              decode CPU several-fold and NVR2/uplink load; also check NVR2 load and
+              firmware for the intermittent no-answers (R3).
+  RECOMMEND   Faster than ~4 s for a cold NVR2 camera needs NVR-side change
+              (warm substreams) -- the client cannot make NVR2 answer faster.
+              Opening all cameras in parallel inside ONE process is impossible with
+              OpenCV (global open lock); a process-per-camera design could open all
+              6 in ~4-5 s but is a larger architecture change -- not done here.
+  ACTION      .env.example: the uncommitted SSO edit (not from this work) contains
+              the real CCTV_SSO_SECRET. Replace it with a placeholder before any
+              commit; it would otherwise be published to GitHub.
+================================================================================

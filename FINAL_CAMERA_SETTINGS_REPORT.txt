@@ -1,0 +1,227 @@
+================================================================================
+GRAV CCTV -- CAMERA SETTINGS / CAMERA MANAGEMENT  (display names + order)
+Project : D:\GRAV_Project\grav-cctv
+Date    : 2026-09-25
+Labels  : PASS / FAIL / NOT TESTED
+================================================================================
+
+RESULT: implemented and verified. Open Settings -> watch the live preview ->
+type "HR Office" -> Order 1 -> Save -> the CCTV page shows HR Office as the first
+camera. No Python/config editing is needed to rename or re-order cameras.
+
+--------------------------------------------------------------------------------
+1. FILES CHANGED
+--------------------------------------------------------------------------------
+  camera_settings.py       NEW  storage, stable keys, order model, validation,
+                                atomic writes, lock, corrupt-file protection
+  settings_page.py         NEW  the /settings page (HTML/CSS/JS, no dependencies)
+  test_camera_settings.py  NEW  86 checks (persistence, order, validation, API,
+                                auth, previews lifecycle, page safety)
+  server.py                MODIFIED
+     - GET /settings (alias /camera-settings), GET /api/camera-settings,
+       PUT or POST /api/camera-settings
+     - /api/cameras: adds index, key, displayName, displayOrder, technicalName
+       (still technical order and "name" = technical name: backward compatible)
+     - /api/status: every camera (and slot owners / waiting cameras) gets
+       displayName + technicalName + key + displayOrder
+     - grid page: "Settings" button; tiles + fullscreen use the display name,
+       fullscreen also shows "NVR1 Cam 8 · CH8"; cameras sorted by displayOrder
+       BEFORE paging; picks up new names/order on every page switch and
+       immediately when saved in another tab (storage event)
+     - the "Connecting... / Camera offline" status image shows the display name
+     - /stream/<i>?fps=N (1..8): low-frame-rate preview on the SAME worker
+  walk_pages.py            MODIFIED  follows the display order like the grid
+  .gitignore               MODIFIED  data/ is runtime data (like .env): a git
+                                     pull/deploy can never overwrite your names
+  NOT changed: nvr_config.py (CAMERAS / NVR identity / credentials), netcheck.py,
+  rtsp_preflight.py, .env. Streaming, NVR slots, viewer counting, pre-flight,
+  fullscreen hand-off and page switching logic are untouched (streams are still
+  keyed by the technical camera index).
+
+--------------------------------------------------------------------------------
+2. SETTINGS STORAGE
+--------------------------------------------------------------------------------
+  Location : D:\GRAV_Project\grav-cctv\data\camera-settings.json
+             (folder + file are created automatically on the first save;
+              override with CCTV_SETTINGS_FILE for hosting)
+  Format   : {"version": 1, "revision": 7, "updatedAt": "...+05:30",
+              "cameras": {"nvr1:8": {"displayName": "HR Office", "displayOrder": 1}}}
+             Only customised cameras are stored. No credentials, no RTSP URLs.
+  Safety   : validate everything first, then write a temp file, fsync, and
+             atomically replace (os.replace) under a lock; a crash mid-save keeps
+             the previous file intact. An unreadable file is kept as
+             camera-settings.json.corrupt-<time> and defaults are used (never
+             silently overwritten). Optimistic "revision" check: a stale page
+             cannot overwrite newer settings (409 -> "reload the page").
+  Status   : Not created yet on your install -- it appears when you first save.
+
+--------------------------------------------------------------------------------
+3. STABLE CAMERA KEY
+--------------------------------------------------------------------------------
+  "<nvr>:<channel>"  e.g.  nvr1:8 = NVR1 Cam 8,  nvr2:8 = Floor 10 - Reception.
+  Built from the camera's real identity, never from its position in a list.
+  The technical identity (NVR key, channel, technical name, RTSP path,
+  credentials) is never modified; displayName/displayOrder are separate metadata.
+
+--------------------------------------------------------------------------------
+4. API
+--------------------------------------------------------------------------------
+  GET  /api/camera-settings?key=...
+       -> {revision, limits{nameMax 60, orderMax 25}, warnings[], cameras[
+           {key, index, technicalName, nvr, nvrLabel, channel, displayName,
+            customName, displayOrder, customOrder, defaultOrder}]}
+  PUT  /api/camera-settings?key=...   (POST accepted too)
+       body {"baseRevision": 7, "cameras": {"nvr1:8": {"displayName": "HR Office",
+             "displayOrder": 1}}}      a missing field = unchanged, null = reset
+       200 {ok, changed[], ...full snapshot} | 400 {errors[{key, field, message}]}
+       409 stale revision | 401 no access | 413 too large | 415 not JSON
+  Every save is logged:  [SETTINGS] saved revision 1: nvr1:8 name 'NVR1 Cam 8'
+                         -> 'HR Office'; nvr1:8 order auto -> 1
+  No username / password / RTSP URL is ever returned (tested).           PASS
+
+--------------------------------------------------------------------------------
+5. SETTINGS PAGE
+--------------------------------------------------------------------------------
+  URL: http://<server>:8000/settings?key=<CCTV_TOKEN>   (or the "⚙ Settings"
+       button in the CCTV header -- it keeps the key and opens in the same tab)
+  Each camera card: LIVE preview + status badge, display name (big), technical
+  line "NVR1 Cam 8 · NVR1 · CH 8", display-name box, display-order box
+  ("auto (19)" when not pinned), ▲ ▼, Reset name, Reset order, Save.
+  Also: Save All Changes (+ Ctrl+S), search (name / technical name / NVR /
+  channel), "Grid order" panel with drag-and-drop + ▲ ▼ showing exactly which
+  cameras land on CCTV page 1, 2, 3..., Reset all ordering (with confirmation),
+  unsaved-changes warning when leaving, clear inline errors, dark theme.
+  Cards keep their place while you type (they follow the SAVED order); the
+  Grid-order panel shows the pending order live.
+
+  Previews: 4 cameras per settings page, 2 fps, using the normal /stream worker
+  (same RTSP connection, same NVR slot as the grid -- no extra worker).
+  Why 4 and not 6: a browser allows ~6 connections per server and every live
+  preview holds one; with 6 previews the Save request would have no connection
+  left and would hang.
+
+--------------------------------------------------------------------------------
+6. NAMING BEHAVIOUR                                                      PASS
+--------------------------------------------------------------------------------
+  - No custom name -> technical name (existing installs look exactly as before).
+  - Custom name used in: grid tiles, fullscreen title (+ small technical line),
+    the server's status image, /api/status (displayName + technicalName),
+    settings page (with technical identity underneath).
+  - Trimmed, inner spaces collapsed, max 60 characters, no < > or control
+    characters, any language allowed (e.g. Hindi). Empty = technical name.
+  - Rendered as text only everywhere (no innerHTML) -> HTML/script cannot run.
+
+--------------------------------------------------------------------------------
+7. ORDER BEHAVIOUR                                                       PASS
+--------------------------------------------------------------------------------
+  A display order is a POSITION. A camera given order N sits exactly at position
+  N; cameras without an order fill the remaining positions in their original
+  order. So "HR Office = 1, Reception = 2" works without renumbering the other
+  23 cameras. The grid sorts by this order FIRST and then cuts pages:
+  orders 1-6 = page 1, 7-12 = page 2, ... (verified).
+  Drag-and-drop / "move here" set explicit positions for all cameras; ▲ ▼ swap
+  two neighbours; "Reset order" makes one camera automatic again; "Reset all
+  ordering" returns to the original order.
+
+--------------------------------------------------------------------------------
+8. DUPLICATE ORDER VALIDATION                                            PASS
+--------------------------------------------------------------------------------
+  Browser: the field turns red with 'Order 1 is also set for "HR Office".', that
+  camera's Save is disabled, Save All is blocked ("Please fix the highlighted
+  fields first"), and an explicit button offers 'Move "NVR1 Cam 9" to position 1
+  and shift the others' -- nothing is renumbered silently.
+  Server (same check, cannot be bypassed): PUT with a duplicate -> HTTP 400
+  "Order 1 is already used by 'HR Office'. Each order number can be used by one
+  camera only." -- file not written, revision unchanged (tested in the browser,
+  by a direct API call, and in the automated tests).
+
+--------------------------------------------------------------------------------
+9. REAL TESTS (real NVRs, real browser, separate test instance -- see note)
+--------------------------------------------------------------------------------
+  NOTE: while testing I found a CCTV server YOU had started at 11:43 (cmd.exe from
+  Explorer, e.g. run.bat) serving port 8000 and your own browser (page 1). I did
+  NOT stop or change it. All real tests ran on my own instance on port 8010 with a
+  separate settings file in my temp folder, so your camera names and your live
+  view were never touched. (Earlier, one of my test servers briefly bound 8000 as
+  well -- Windows allows two Python servers on one port -- it received no traffic
+  and was stopped.)
+
+  1 Save name NVR1 Cam 8 -> HR Office; grid shows HR Office .............. PASS
+    (found by search, live preview showed the room, per-card Save)
+  2 Restart server -> HR Office remains (API and grid, first tile) ........ PASS
+  3 Order HR Office = 1, Reception = 2 -> grid starts HR Office, Reception  PASS
+    ("Reception" was saved with Save All; it went to NVR2 Cam 9 because the
+     search "Cam 9" matches NVR1 Cam 9 and NVR2 Cam 9 -- the card's technical
+     line showed exactly which camera it was, as intended)
+  4 Duplicate order -> validation error (UI + direct API 400) ............. PASS
+  5 Settings pagination: only the 4 visible previews are viewers and hold
+    slots (page 1: #1,#2,#9,#19; after Next: only #3-#6, page-1 slots freed)  PASS
+  6 Navigate away (Back to CCTV): settings previews cleaned up, grid holds
+    exactly its 6 cameras, one viewer each ................................ PASS
+  7 Fullscreen: header "HR Office" + "NVR1 Cam 8 · CH8" ................... PASS
+  8 Reset name -> NVR1 Cam 8 again (order 1 kept) .......................... PASS
+  9 Reset all ordering (confirmation shown) -> original order, names kept . PASS
+    (the native OK/Cancel dialog was answered by the test tool, not a person)
+  Clean-up: all test names/orders reset; the test file ends with "cameras": {}.
+  Found + fixed during the tests: the save message was a banner that pushed the
+  page down (a click landed on the wrong field) -> now a floating toast.
+
+--------------------------------------------------------------------------------
+10. STREAM LIFECYCLE (no regression)                                     PASS
+--------------------------------------------------------------------------------
+  Settings previews share the grid's camera workers and NVR slots; page switch
+  in Settings releases the old previews before opening new ones; leaving
+  Settings releases all of them; no viewer or slot leak in any real test.
+  Streams are still opened by technical index, so renaming/re-ordering can never
+  make a tile open the wrong RTSP stream.
+
+--------------------------------------------------------------------------------
+11. AUTOMATED CHECKS
+--------------------------------------------------------------------------------
+  python -m py_compile server.py nvr_config.py netcheck.py camera_settings.py
+         settings_page.py (+ all other modules and tests) ............... PASS
+  python test_lifecycle.py        11 / 11 existing checks ................. PASS
+  python test_slots.py            59 / 59 existing checks ................. PASS
+  python test_camera_settings.py  86 / 86 new checks ...................... PASS
+    defaults without a file | rename + restart persistence | file schema |
+    positions (HR 1, Reception 2, others keep order) | duplicate rejected, file
+    untouched | resets | 12 invalid inputs rejected (too long, HTML, control
+    chars, 0, 26, 1.5, "3", true, unknown camera/field, empty) | whitespace |
+    non-English names | stale revision 409 | crash mid-write keeps old file and
+    leaves no temp file | corrupt file preserved | hand-edited duplicates
+    tolerated | 20 concurrent saves | HTTP: 401 without key for page, GET and
+    PUT | no credentials in API | 415/400/413 | grid order + pagination after
+    sorting | /api/status names | status image name | preview fps + viewer/slot
+    clean-up across settings pages | names rendered as text only
+  The tests use a temp folder; the real data/ folder is never touched.
+
+--------------------------------------------------------------------------------
+12. SECURITY                                                             PASS
+--------------------------------------------------------------------------------
+  /settings and /api/camera-settings (read and write) use the same ?key= access
+  check as the CCTV page; writes also require Content-Type: application/json
+  (a cross-site form cannot send it without a CORS preflight, which this server
+  never allows -- protection for when access moves to cookies/SSO); body <= 64 KB.
+
+--------------------------------------------------------------------------------
+13. NOT TESTED / NOTES
+--------------------------------------------------------------------------------
+  NOT TESTED  your running server on port 8000 with the final page: it was
+              started at 11:43, before the toast fix. Restart it (run.bat) to get
+              the final settings page. The first save there creates
+              data\camera-settings.json.
+  NOT TESTED  the hosted site / CMS SSO access, other browsers, mobile touch
+              drag-and-drop (on phones use the ▲ ▼ buttons).
+  NOTE        Keep one CCTV tab at a time: a browser shares its ~6 connections to
+              the server across ALL tabs, so a grid tab with 6 live cameras can
+              stop a Settings page in another tab from loading. The Settings
+              button opens in the same tab for this reason.
+  NOTE        The status image (Connecting... / Camera offline) uses OpenCV's
+              ASCII font: a non-English name shows the technical name on that
+              image only; everywhere else it shows the real name.
+  NOTE        data/ is git-ignored on purpose -- copy data\camera-settings.json
+              to another server if you want the same names there.
+  NOTE        Nothing was committed or pushed. .env.example still contains the
+              real CCTV_SSO_SECRET from the (unrelated) uncommitted SSO edit --
+              replace it with a placeholder before any commit.
+================================================================================

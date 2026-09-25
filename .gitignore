@@ -1,4 +1,8 @@
 .env
+# VS Code "Local History" snapshots -- they include copies of .env (secrets!)
+.history/
+# runtime data written by the server (camera names/order from the Settings page)
+data/
 __pycache__/
 *.pyc
 .venv/

@@ -11,9 +11,14 @@ Run:  python test_lifecycle.py
 Exits non-zero on any failure. Does not need the HTTP server running; it drives
 CamStream / the NVR semaphore directly. cv2 is stubbed so no real RTSP is needed.
 """
+import os
 import sys
 import time
 import types
+
+# Offline unit tests: no real RTSP pre-flight to the NVRs, no event log noise.
+os.environ["CCTV_PREFLIGHT"] = "0"
+os.environ["CCTV_LOG_EVENTS"] = "0"
 
 # ── stub cv2 BEFORE importing server, so tests are deterministic/offline ──
 _fake = types.ModuleType("cv2")
@@ -31,6 +36,13 @@ class _Cap:
     def read(self):
         self._n += 1
         time.sleep(0.02)
+        import numpy as np
+        return True, np.zeros((8, 8, 3), dtype="uint8")
+    def grab(self):                      # server decodes via grab() + retrieve()
+        self._n += 1
+        time.sleep(0.02)
+        return True
+    def retrieve(self):
         import numpy as np
         return True, np.zeros((8, 8, 3), dtype="uint8")
     def release(self):
