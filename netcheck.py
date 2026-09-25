@@ -207,7 +207,12 @@ class NetworkMonitor:
                 self._check_once()
             except Exception:
                 pass
-            time.sleep(self._interval)
+            # while an NVR is declared unreachable, re-check every second: after a
+            # network outage the cameras reconnect as soon as the path is back, not up
+            # to `interval` seconds later (declaring it still takes `fail_threshold`
+            # failed checks at the normal interval)
+            down = any(self._fails.get(k, 0) >= self._fail_threshold for k in self._nvrs)
+            time.sleep(min(1.0, self._interval) if down else self._interval)
 
     def summary(self):
         lines = []

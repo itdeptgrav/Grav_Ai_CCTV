@@ -1,0 +1,301 @@
+FINAL CCTV LIVE-STREAM STABILITY REPORT
+Project : D:\GRAV_Project\grav-cctv          Date: 2026-09-26
+Legend  : PASS = verified   FAIL = verified broken   NOT TESTED = not verified (reason given)
+"real" = real cameras / NVRs / network, "offline" = automated tests with a fake camera,
+"synthetic" = a test server with synthetic video (no NVR contact).
+
+==========================================================================================
+1. EXACT REASON SCREENSHOT 1 BECAME SCREENSHOT 2                          FOUND (real evidence)
+==========================================================================================
+Screenshot 1 -> 2 happened on the server running on this LAPTOP (the only server with
+Original mode -- production does not have it yet). That server lost its connection to
+the NVRs: the stream got no data, hit the 8 s read timeout, reconnected, and new
+connections to the NVR failed until the network came back. What you saw
+("CACHED <time> / Connecting...") was the cache fallback doing its job during a REAL
+outage -- with one wrong label (see the end of this section).
+
+Why the connection was lost -- TWO network problems, both measured:
+
+ a) This laptop's Wi-Fi drops. Windows' WLAN log (Microsoft-Windows-WLAN-AutoConfig)
+    shows disconnects / failed reconnects on 25-09 at 18:27, 20:41, 20:53, 22:20,
+    23:38:20-23:38:36 and 23:54:20-23:54:42 (10-30 s each). A ping log to 1.1.1.1 lost
+    every reply 23:54:16-23:54:47 -- exactly that Wi-Fi drop -- and at the same moment
+    all 6 streams of my 10-minute test froze together (item 13).
+
+ b) The office side of the public path (router / port forwarding / uplink) refuses
+    new inbound connections every ~20 s. TCP connects to the forwarded NVR ports
+    (the same check the server's network monitor does) failed on 17 of 110 tries,
+    in a steady rhythm (t = 17, 20, 39, 42, 61, 83, 86, 106, ... s), with others
+    taking up to 3 s -- while the internet (1.1.1.1) answered 110/110. Both NVR ports
+    fail at the SAME moments (t = 13, 33, 36, 54, 73, 93, 96, 116, 136 s), so it is
+    the office router / uplink, not one NVR. The Cloudflare path to production also
+    dropped (item 12) while this laptop's internet was fine.
+
+The laptop reaches the NVRs through that office public IP (CCTV_ACCESS_MODE resolves to
+the public path off the LAN), so its RTSP streams cross BOTH weak links. Its own
+status API recorded exactly these failures as the last error of its workers:
+  "stream dropped (no frame within read timeout)"   Original cam 9, 14, 25; Standard cam 4, 15, 25
+  "TCP connect to NVR failed (TimeoutError)"        Original cam 2, 3, 4, 8, 10, 15, 17, 18, 19, 20, 23
+  "CCTV NETWORK UNREACHABLE"                        (monitor: 3 failed checks + ping failed)
+  "RTSP open failed after 8022 ms"                   Original cam 11
+  (camera numbers = tile numbers 1..25 in technical order)
+Several Original workers were opened 7-9 times (cams 4, 8, 11, 15, 20, 25): repeated
+reconnects. During the same period the production server on the LAN did not
+reconnect a single stream (items 12-14).
+
+The grid "LIVE -> CACHED -> CONNECTING on several cameras at once": same cause --
+several cameras failing together is the signature of a shared network outage.
+
+Contributing (not the cause): at the time your laptop server and production were
+pulling from the same NVRs (up to 11 streams per NVR at 23:06 / 23:22, beyond the
+verified-safe 6) and production logged "NVR did not answer DESCRIBE within 8s" on NVR2
+for new opens. Production's live streams still had 0 reconnects.
+
+The wrong label: the cached picture said "Connecting..." because the Original viewer's
+stand-in was stamped with the STANDARD worker's state (idle on the on-demand laptop
+server), not with the Original stream's real state (reconnecting / NVR unreachable).
+Fixed: the stand-in now carries the Original's own state, e.g. "Reconnecting...",
+"Stalled - waiting for video", "NVR unreachable", "Waiting for NVR slot...".
+
+==========================================================================================
+2. WHICH CAUSE                                                             (evidence)
+==========================================================================================
+  slot preemption ......... NO. The laptop server runs on-demand (no pool at all). On
+                            production the pool only ever stops workers with 0 viewers
+                            (code + tests); in 25 min of real viewing (items 12-13)
+                            no viewed stream was touched.
+  timeout ................. NOT the cause. The read timeout fired because NO data came
+                            for 8 s (real outages of 10-30 s); a longer timeout would
+                            only have delayed the reconnect.
+  CPU ..................... NO. Laptop CPU was far from full (3 Original tiles = 17 % of
+                            the machine); the errors were network errors (TCP connect
+                            timeouts, no data), not late frames.
+  stale threshold ......... NO. 2.5 s; the outages were 10-30 s.
+  worker rotation ......... NO. Background swaps / cache-refresh visits only touch
+                            0-viewer workers, and only when nobody watches that NVR.
+  NVR disconnect .......... YES, as seen from the laptop -- caused by the network:
+  other ................... YES: laptop Wi-Fi drops + office router/uplink refusing
+                            inbound connections every ~20 s (item 1).
+
+==========================================================================================
+3. FILES CHANGED (this task)                                              PASS
+==========================================================================================
+  server.py        transition log with exact reasons (per worker + event log + API),
+                   stall watchdog, drop classification (READ_TIMEOUT / STREAM_CLOSED),
+                   named slot priorities + pinned flag, 0-viewer-only preemption (also
+                   in on-demand mode), make-before-break quality switch, duplicate
+                   Standard/Original upstream released, Original linger, Original JPEG
+                   encoder on its own thread, frame-gap / lag / encode metrics, slot
+                   table + stability fields in /api/status and /api/stream-info,
+                   correct label on the Original stand-in, every slot taken/released
+                   logged with owner and reason
+  netcheck.py      after an NVR is declared unreachable, re-check every 1 s (recovery
+                   noticed within ~1 s instead of up to 5 s; declaring still takes 3
+                   failed checks at the normal interval)
+  test_live_stability.py  NEW - 44 checks (item 16)
+  stability_bench.py      NEW - long real viewing test, client + server side
+  test_quality.py  adjusted to the new behaviour (priority numbers, Original linger)
+  README.md, .env.example  new settings / diagnostics documented (.env.example SSO
+                   line untouched -- it still holds the leaked secret)
+  (The Standard/Original feature files from the previous task are also still
+   uncommitted: grid_page.py, relay_bench.py, quality_bench.py, test_quality.py.)
+
+==========================================================================================
+4. PRIORITY SYSTEM                                                        PASS (offline + synthetic)
+==========================================================================================
+Explicit values (a free NVR slot goes to the highest waiter):
+  FULLSCREEN_ORIGINAL 100   FULLSCREEN_STANDARD 90   GRID_ORIGINAL 82   GRID_STANDARD 80
+  -- only these have viewers: they are ACTIVE and are NEVER preempted --
+  HANDOFF 40 (bridge of a quality switch)   RECENT 30   LINGER 25 (Original kept briefly)
+  BACKGROUND_WARM 20   CACHE_REFRESH 10   IDLE 0
+Rule enforced in code: a worker can only be stopped for someone else if it has 0
+viewers (pool: stop_bg() refuses a worker with viewers; on-demand: only 0-viewer
+holders are preempted). Background warming stops when viewers need every slot
+(budget = cap - viewed). Tests: 6 viewed tiles on a full NVR survive background churn
+and two waiting viewers with no transition at all; a background worker yields its
+slot at once (viewer LIVE in ~0.2 s). "Other browsers' viewers" cannot be told apart
+from "this browser's" by the server -- every connected viewer is ACTIVE.
+
+==========================================================================================
+5. FULLSCREEN PINNING                                                     PASS (offline + real)
+==========================================================================================
+A fullscreen viewer (?prio=full) makes its worker PINNED (status: "pinned": true,
+priority FULLSCREEN_*). It keeps its slot while the viewer is connected and the RTSP
+stream is healthy; it is released only when the viewer leaves or the source fails.
+Offline: a fullscreen Original stayed LIVE through grid churn, background promotions
+and cache-refresh visits -- 0 reconnects, its only transition FIRST_FRAME, viewer got
+only LIVE frames. Real (production, Standard): 15 min fullscreen, 0 reconnects,
+0 new RTSP opens (item 12).
+
+==========================================================================================
+6. SLOT OWNERSHIP BEHAVIOR                                                PASS
+==========================================================================================
+/api/status per NVR: "slotsText": "6/6" and "slots": [slot, camera, quality, viewers,
+priority + name, pinned, preemptable, state, status, slot age, last frame age]. The
+event log prints every change, e.g. (synthetic run):
+  [NVR1] slot 6/6 taken by Cam 25 NVR1 Cam 14 [Original] ORIGINAL viewers=1 FULLSCREEN_ORIGINAL
+  [NVR1] slot released by Cam 25 NVR1 Cam 14 STANDARD reason=HANDOFF_DONE (the other
+         quality is live; duplicate upstream released) -> 5/6
+  [NVR1] slot released by Cam 18 NVR1 Cam 7 STANDARD reason=POOL_DEMOTION: slot needed
+         by a viewed camera -> 5/6
+Real: production held exactly 6/6 per NVR during all tests (peak never above 6).
+
+==========================================================================================
+7. DUPLICATE STANDARD / ORIGINAL WORKER HANDLING                          PASS (offline + synthetic)
+==========================================================================================
+  Standard -> Original: the Standard stream stays as the BRIDGE (viewer sees it,
+    labelled "switching to Original") until the first Original frame; then it is
+    released (reason HANDOFF_DONE, or pool DUPLICATE) -> one slot for the camera.
+  Original -> Standard: make-before-break -- the Original keeps running and the
+    Standard viewer gets the LIVE Original picture at Standard size until its own
+    Standard stream is live; then the Original is released (HANDOFF_DONE). The viewer
+    never sees CACHED (offline test: only LIVE parts; synthetic: 'live' from 0.01 s).
+  The pool never re-promotes the Standard stream of a camera watched in Original.
+  An Original with no viewer lingers 5 s (reopen = no new handshake), preemptable.
+
+==========================================================================================
+8. READ TIMEOUT BEFORE / AFTER                                            PASS (unchanged, justified)
+==========================================================================================
+  before: 8000 ms (CCTV_READ_TIMEOUT_MS)   after: 8000 ms Standard and Original
+  New knob CCTV_ORIGINAL_READ_TIMEOUT_MS (default = the same). Reason not to change:
+  every real drop was a genuine outage of 10-30 s (item 1); on the LAN the largest
+  frame age seen in 25 min was 968 ms. A drop is now classified: READ_TIMEOUT (no data
+  for the timeout) vs STREAM_CLOSED (NVR / network ended it).
+
+==========================================================================================
+9. STALE THRESHOLD BEFORE / AFTER                                         PASS (unchanged, justified)
+==========================================================================================
+  before: 2.5 s (CCTV_LIVE_MAX_AGE_S)   after: 2.5 s
+  Measured on the LAN (production, sampled every 2 s): max frame age 410 ms over 10 min
+  with 6 viewed cameras, 968 ms over 15 min fullscreen -- 2.5 s is 2.6x the worst.
+  At 8 fps that is 20 frame intervals, so one late frame never marks a stream stale
+  (offline: 1.5 s gaps -> only LIVE, nothing logged). A real stall is now logged the
+  moment it crosses the threshold, with the cause: "LIVE -> STALLED
+  reason=NO_FRAME_AGE_2515MS (connection open, waiting for data from the NVR/network --
+  last packet 2454 ms ago)" or "... frames still arriving but not published
+  (CPU/encoder)". If the server must run over the public path, raise
+  CCTV_LIVE_MAX_AGE_S to 4-5 s there.
+
+==========================================================================================
+10. CPU STANDARD                                                          PASS (earlier real measurement)
+==========================================================================================
+  Real NVRs, this 16-core laptop: 6 NVR2 cameras viewed at 8 fps = 157 % of one core
+  with the original code (~26 % per camera), ~18 % per camera after the grab/retrieve
+  split; RAM ~180 MB. Processing per published frame (measured today on real frames):
+  resize 0.2-0.3 ms + JPEG q70 0.5-0.7 ms (19-41 KB).
+
+==========================================================================================
+11. CPU ORIGINAL                                                          PASS (earlier real measurement) / 6 tiles NOT TESTED
+==========================================================================================
+  Real: 3 Original grid tiles (2560x1440, q90, 6 fps) = 275 % of one core, ~0.9 core
+  per camera (17 % of the machine), RAM 312 MB -- mostly decoding every 4 MP frame.
+  Per published frame (measured today on real 2560x1440 frames):
+    fullscreen: JPEG q90 8.8-12.1 ms (378-754 KB)
+    grid tile : resize to 1280 1.0-1.2 ms + JPEG q90 2.4-3.0 ms (130-243 KB)
+  Encoding now runs on its own thread for Original: offline, with a deliberately slow
+  encoder the capture loop still read the stream at the full source rate (~50 fps),
+  the encoder just published fewer frames -- no stall, no reconnect.
+  6 Original tiles: NOT TESTED (projected ~5-5.5 cores; not safe to run next to
+  production's 6 slots per NVR).
+
+==========================================================================================
+12. 15-MIN FULLSCREEN RESULT                                              PASS Standard (real) / Original NOT TESTED
+==========================================================================================
+TEST A on production (cctv.grav.in, LAN relay), camera "Corridor office" (NVR1 ch14),
+fullscreen, 15 min, Standard (production has no Original yet):
+  server : LIVE the whole time, reconnects 0, RTSP opens 3 -> 3 (not one new
+           connection), max frame age 968 ms (234 samples), NVR1 6/6
+  client : 5104 frames, 0 CACHED/status frames -- but the Cloudflare/office path cut
+           the HTTP stream: nothing for the first ~97 s (every request closed, 64 status
+           polls failed), then 6 disconnects with gaps up to 37 s. This laptop's
+           internet was fine then (ping 1.1.1.1: 0.3 % loss) -> office / Cloudflare side.
+Original fullscreen 15 min: NOT TESTED -- production does not have the code yet, and
+on this laptop it would need a 7th connection on an NVR where production holds 6.
+
+==========================================================================================
+13. 10-MIN GRID RESULT                                                    PASS (real, Standard)
+==========================================================================================
+TEST B on production, page 1 (6 cameras: NVR2 ch4, ch8, ch1, ch2, ch3 + NVR1 ch14),
+Standard, 10 min:
+  server : all 6 LIVE the whole time, reconnects 0, no new RTSP opens, max frame age
+           410 ms, 6/6 per NVR -- no LIVE -> CACHED -> CONNECTING at all
+  client : 0 CACHED frames; gaps up to 33.9 s on ALL 6 at the same moments = this
+           laptop's Wi-Fi drop at 23:54:20-23:54:42 (Windows log + ping log), plus 8
+           dropped HTTP connections (the server saw those viewers leave and return)
+TEST C (6 Original tiles): NOT TESTED -- same reason as item 12.
+
+==========================================================================================
+14. RECONNECT COUNT                                                       PASS (real)
+==========================================================================================
+  production, TEST B (10 min, 6 viewed)        : 0
+  production, TEST A (15 min fullscreen)       : 0
+  production, TEST F (2 browsers, 2.5 min)     : 0 (1 upstream; viewers 1 -> 2 -> 1)
+  production since ~21:03 (hours, 12 HOT)      : 0 live-stream drops
+  laptop server (public path, your session)    : Original workers opened up to 9 times;
+                                                 Standard workers up to 3 reconnects
+
+==========================================================================================
+15. CACHE FALLBACK RESULT                                                 PASS (offline) / real: observed
+==========================================================================================
+Offline: a stream ended by the NVR -> "LIVE -> RECONNECTING reason=STREAM_CLOSED", the
+viewer gets the CACHED picture, then "RECONNECTING -> LIVE reason=RECONNECTED"; a
+stream with no data -> "LIVE -> STALLED reason=NO_FRAME_AGE_..." -> "STALLED ->
+RECONNECTING reason=READ_TIMEOUT" -> "LIVE reason=RECONNECTED"; a 3.2 s stall recovers
+on the same connection ("FRAME_RESUMED", no reconnect). The viewer is never left
+blank. Real: your screenshot 2 is this fallback during a genuine outage. The cached
+picture's text now says why (and /api/status "cachedReason": STALLED / RECONNECTING /
+WAITING_FOR_SLOT / NVR_UNREACHABLE / SOURCE_OFFLINE / NOT_HOT). Cache kept.
+
+==========================================================================================
+16. TESTS                                                                 PASS
+==========================================================================================
+  py_compile server.py nvr_config.py netcheck.py (+ all tools)        OK
+  test_lifecycle.py 11, test_slots.py 59, test_camera_settings.py 86,
+  test_relay.py 65, test_quality.py 60, test_live_stability.py 44 (NEW)
+  = 325 checks, all PASS (test_live_stability 5 runs in a row).
+  test_live_stability.py covers what you listed: active worker cannot be preempted;
+  background worker can be (yields at once, logged POOL_DEMOTION); fullscreen pinned
+  worker survives background promotion; quality switch releases the duplicate worker;
+  no duplicate main + sub slot after the handoff (both directions); frame jitter does
+  not mark stale; cache fallback on genuine stream loss (STREAM_CLOSED, READ_TIMEOUT);
+  reconnect restores LIVE; plus: slow browser never slows the shared worker; 2 Original
+  viewers = 1 upstream and B leaving changes nothing; lingering Original re-used;
+  encoder off the capture thread; status slot table / reasons without credentials;
+  on-demand mode: a 0-viewer holder yields to a waiting viewer (PREEMPTED).
+  Real tests on production: A (15 min fullscreen, Standard), B (10 min grid,
+  Standard), F (2 browsers) -- all server-side PASS.
+
+==========================================================================================
+17. NOT VERIFIED                                                          NOT TESTED
+==========================================================================================
+  * Original on real cameras with the new code (15-min fullscreen, 6-tile grid,
+    Standard <-> Original switching, page switch): needs the new code on production
+    (deploy), or production's pool stopped while testing -- this laptop would add a 7th
+    connection per NVR, beyond the verified-safe 6, over the flaky public path.
+  * The new code's own logs on real NVRs (reasons, stalls, lag): only offline/synthetic
+    so far. After deploying, /api/status shows them for every stream.
+  * Real per-stream bitrate of the main stream (raw RTSP probe = extra NVR connection).
+  * Root cause INSIDE the office network (router model/firmware, port-forward table,
+    ISP link): measured from outside only.
+  * CPU on the production Alienware PC.
+
+==========================================================================================
+WHAT TO DO
+==========================================================================================
+1. Use production (cctv.grav.in) for real viewing and for testing Original. It reads
+   the NVRs over the office LAN and was rock-solid in every test. Do not judge
+   stability from a server on this laptop: its path to the NVRs crosses this laptop's
+   Wi-Fi and the office public IP, both measured to drop.
+2. Deploy (commit + push, then on the Alienware: stop python server.py, git pull,
+   start it). Then run, from any browser machine:
+     python stability_bench.py --base https://cctv.grav.in --key <KEY> --cameras 24 --full --quality original --minutes 15
+     python stability_bench.py --base https://cctv.grav.in --key <KEY> --page 1 --minutes 10
+   The server side of the result (reconnects, transitions with reasons) is what counts;
+   client gaps with server LIVE = network between server and that browser.
+3. Office network: the router / port forwarding refuses new inbound connections
+   every ~20 s and the Cloudflare path to production dropped several times. Have the
+   router / ISP link checked (and its firmware / connection limits). This also
+   affects remote viewers of cctv.grav.in.
+4. Stop the laptop server when not needed: while it runs next to production, the two
+   together can exceed 6 connections per NVR.
+5. Still open: rotate CCTV_SSO_SECRET (it is in .env.example in git).

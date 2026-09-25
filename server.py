@@ -53,6 +53,7 @@ Host-ready: all settings come from the environment (see .env.example). Run:
 then open  http://<server>:<CCTV_PORT>/?key=<CCTV_TOKEN>
 """
 import os
+import re
 import sys
 import time
 import json
@@ -183,6 +184,59 @@ REFRESH_EVERY_S = _envfloat("CCTV_REFRESH_EVERY_S", 300.0)       # cached-frame 
 REFRESH_SWEEP_GAP_S = _envfloat("CCTV_REFRESH_SWEEP_GAP_S", 20.0)  # ... for cameras never captured yet
 REFRESH_VISIT_MAX_S = _envfloat("CCTV_REFRESH_VISIT_MAX_S", 30.0)
 REFRESH_IDLE_S  = _envfloat("CCTV_REFRESH_IDLE_S", 60.0)          # ... only when that NVR had no viewer this long
+
+# ── video quality modes (the viewer chooses; default Standard) ──────────────────
+# Standard: the NVR SUB-stream, resized to STREAM_W x STREAM_H, JPEG_QUALITY,
+#   STREAM_FPS -- light, shared, kept HOT by the relay pool.
+# Original: the NVR MAIN stream at the camera's own resolution (never resized unless
+#   CCTV_ORIGINAL_MAX_W is set), ORIGINAL_JPEG_QUALITY, ORIGINAL_FPS. Only for
+#   cameras someone is viewing in Original mode -- never kept in the background --
+#   and it counts against the same per-NVR slot cap as everything else.
+# Dahua / CP Plus URL (nvr_config.make_url): .../cam/realmonitor?channel=N&subtype=S,
+#   S=0 main stream, S=1 sub-stream.
+STANDARD_SUBTYPE = _envint("CCTV_STANDARD_SUBTYPE", 1)
+ORIGINAL_SUBTYPE = _envint("CCTV_ORIGINAL_SUBTYPE", 0)
+ORIGINAL_JPEG_QUALITY = max(50, min(95, _envint("CCTV_ORIGINAL_JPEG_QUALITY", 90)))
+ORIGINAL_FPS     = max(1, _envint("CCTV_ORIGINAL_FPS", 12))
+ORIGINAL_MAX_W   = _envint("CCTV_ORIGINAL_MAX_W", 0)              # 0 = keep the source size (true original)
+# Original shown ONLY in grid tiles (no fullscreen viewer): the main-stream picture
+# scaled down to this width (never up). MEASURED 2026-09-25: a 2560x1440 q90 frame is
+# 400-720 KB = 19-36 Mbps per tile at 6 fps; a tile is never displayed that large.
+# 0 = full source size in the grid too. The fullscreen view always gets the source size.
+ORIGINAL_GRID_MAX_W = _envint("CCTV_ORIGINAL_GRID_MAX_W", 1280)
+
+# ── live-stream stability (FINAL_CCTV_STABILITY_REPORT.txt) ──────────────────────
+# Make-before-break for a quality switch: a worker whose last viewer left while the
+# SAME camera is being opened in the other quality keeps running (0 viewers) until
+# that stream is live -- then it is released (no duplicate upstream afterwards).
+# HANDOFF_MAX_S is only the safety cap. An Original worker also stays up
+# ORIGINAL_LINGER_S after its last viewer, so a page retry or a reopen re-attaches
+# without a new RTSP handshake. Both hold a slot with 0 viewers: anything a viewer
+# needs takes that slot at once.
+HANDOFF_MAX_S     = _envfloat("CCTV_HANDOFF_MAX_S", 60.0)
+ORIGINAL_LINGER_S = _envfloat("CCTV_ORIGINAL_LINGER_S", 5.0)
+# RTSP read timeout of the main stream (default: the same as CCTV_READ_TIMEOUT_MS).
+ORIGINAL_READ_TIMEOUT_MS = _envint("CCTV_ORIGINAL_READ_TIMEOUT_MS", READ_TIMEOUT_MS)
+
+# NVR slot priority: a free slot goes to the highest waiter. A worker WITH viewers is
+# ACTIVE and is never preempted -- only workers with 0 viewers are (background, recent,
+# cache refresh, a finished quality switch, a lingering Original).
+PRIO_FULLSCREEN_ORIGINAL = 100          # pinned: fullscreen view
+PRIO_FULLSCREEN_STANDARD = 90           # pinned: fullscreen view
+PRIO_GRID_ORIGINAL       = 82           # visible grid tile
+PRIO_GRID_STANDARD       = 80           # visible grid tile
+PRIO_HANDOFF             = 40           # 0 viewers: bridge of a Standard <-> Original switch
+PRIO_RECENT              = 30           # 0 viewers: viewed a moment ago
+PRIO_LINGER              = 25           # 0 viewers: Original kept briefly after its viewer left
+PRIO_BACKGROUND          = 20           # 0 viewers: kept HOT by the pool
+PRIO_REFRESH             = 10           # 0 viewers: short cache-refresh visit
+PRIO_IDLE                = 0
+PRIO_NAMES = {PRIO_FULLSCREEN_ORIGINAL: "FULLSCREEN_ORIGINAL", PRIO_FULLSCREEN_STANDARD: "FULLSCREEN_STANDARD",
+              PRIO_GRID_ORIGINAL: "GRID_ORIGINAL", PRIO_GRID_STANDARD: "GRID_STANDARD",
+              PRIO_HANDOFF: "HANDOFF", PRIO_RECENT: "RECENT", PRIO_LINGER: "LINGER",
+              PRIO_BACKGROUND: "BACKGROUND_WARM", PRIO_REFRESH: "CACHE_REFRESH", PRIO_IDLE: "IDLE"}
+_BG_PRIO = {"handoff": PRIO_HANDOFF, "recent": PRIO_RECENT, "linger": PRIO_LINGER,
+            "background": PRIO_BACKGROUND, "refresh": PRIO_REFRESH}
 
 # Tile / API status vocabulary.
 S_IDLE       = "Idle"
@@ -325,11 +379,11 @@ def _cap_open_params():
     return p
 
 
-def _new_preflight(nvr, channel, alive):
+def _new_preflight(nvr, channel, alive, subtype=1):
     """Factory (tests replace it). Credential-free URL; auth is done by the probe."""
     n = NVRS[nvr]
     host, port = endpoint(nvr)
-    url = f"rtsp://{host}:{port}/cam/realmonitor?channel={channel}&subtype=1"
+    url = f"rtsp://{host}:{port}/cam/realmonitor?channel={channel}&subtype={subtype}"
     return rp.Preflight(host, port, n["user"], n["pass"], url,
                         timeout_s=PREFLIGHT_TIMEOUT_MS / 1000.0, alive=alive)
 
@@ -348,15 +402,46 @@ def _slot_try_acquire(nvr, index, timeout=1.0):
             NVR_ACTIVE[nvr] += 1
             NVR_OWNERS[nvr][index] = time.monotonic()
             NVR_WAITERS[nvr].pop(index, None)
+            n = NVR_ACTIVE[nvr]
+        w = _worker_by_key(index)
+        ev(f"[{nvr.upper()}] slot {n}/{NVR_CAP[nvr]} taken by {w.label} {w.quality.upper()} "
+           f"viewers={w.viewers} {w.priority_name()}")
         return True
     return False
 
 
-def _slot_release(nvr, index):
+def _slot_release(nvr, index, reason=None):
     with _ACTIVE_LOCK:
         NVR_ACTIVE[nvr] = max(0, NVR_ACTIVE[nvr] - 1)
         NVR_OWNERS[nvr].pop(index, None)
+        n = NVR_ACTIVE[nvr]
     NVR_SEM[nvr].release()
+    w = _worker_by_key(index)
+    ev(f"[{nvr.upper()}] slot released by {w.label} {w.quality.upper()} reason={reason or 'STOPPED'} "
+       f"-> {n}/{NVR_CAP[nvr]}")
+
+
+_PREEMPT_T = {}
+
+
+def _preempt_idle_holder(nvr, waiter):
+    """On-demand mode (no pool): a waiting viewer takes the slot of a worker that has
+    NO viewer (a quality-switch bridge or a lingering Original) -- its own twin first,
+    else the lowest priority. Never a worker with viewers."""
+    now = time.monotonic()
+    if now - _PREEMPT_T.get(nvr, 0.0) < 0.3:
+        return
+    with _ACTIVE_LOCK:
+        keys = list(NVR_OWNERS[nvr])
+    mine = waiter.slot_priority()
+    idle = [w for w in (_worker_by_key(k) for k in keys)
+            if w.viewers == 0 and w._bg and w.slot_priority() < mine]
+    if not idle:
+        return
+    tw = waiter.twin()
+    victim = tw if tw in idle else min(idle, key=lambda w: w.slot_priority())
+    _PREEMPT_T[nvr] = now
+    victim.stop_bg(f"PREEMPTED by {waiter.label} ({waiter.priority_name()})")
 
 
 def _slot_report(nvr):
@@ -366,11 +451,11 @@ def _slot_report(nvr):
         owners = sorted(NVR_OWNERS[nvr].items())
         active = NVR_ACTIVE[nvr]
     parts = []
-    for idx, t in owners:
-        s = STREAMS[idx]
+    for key, t in owners:
+        s = _worker_by_key(key)
         age = s.frame_age_ms()
-        parts.append(f"cam{idx + 1} '{s.name}' viewers={s.viewers} status={s.status} "
-                     f"held={now - t:.1f}s lastFrame={'-' if age is None else f'{age}ms'}")
+        parts.append(f"cam{s.index + 1} '{s.name}' {s.quality} viewers={s.viewers} {s.priority_name()} "
+                     f"state={s.vstate} held={now - t:.1f}s lastFrame={'-' if age is None else f'{age}ms'}")
     return f"[{nvr.upper()}] active={active} max={NVR_CAP[nvr]} owners=[{'; '.join(parts)}]"
 
 
@@ -389,12 +474,48 @@ class CamStream:
     In both, a failing camera releases its slot BEFORE any back-off, and there is
     only ever ONE worker thread per camera (a new one waits for the previous one to
     finish), so a camera can never hold two slots or two upstream connections.
+
+    quality="original": the camera's MAIN stream (ORIG_STREAMS). A separate worker
+    with its own viewers, cache and slot identity (slot key = ORIG_KEY_BASE + index);
+    on-demand only (never kept in the background), slot taken before connecting,
+    frames published at the source resolution.
     """
-    def __init__(self, info, index):
+    def __init__(self, info, index, quality="standard"):
         self.name     = info["name"]
         self.info     = info
         self.index    = index
-        self.label    = f"Cam {index + 1} {info['name']}"
+        self.quality  = quality
+        self.original = quality == "original"
+        self.slot_key = index + (ORIG_KEY_BASE if self.original else 0)
+        self.subtype  = ORIGINAL_SUBTYPE if self.original else STANDARD_SUBTYPE
+        self.slot_first = PERSISTENT or self.original   # strict cap: slot before connecting
+        self.label    = f"Cam {index + 1} {info['name']}" + (" [Original]" if self.original else "")
+        self.fallback_viewers = 0     # Original viewers currently shown the Standard stream
+        self.source_size = None       # (w, h) of the incoming stream, from the first frame
+        self.output_size = None       # (w, h) published to viewers
+        # Original: frames per second asked by the current viewers (grid tiles fewer than
+        # the fullscreen view); the worker publishes at the highest of them
+        self._want_fps = collections.Counter()
+        self.pub_fps  = ORIGINAL_FPS
+        # stability diagnostics: viewer-facing state + transition log with exact reasons
+        self.vstate   = "IDLE"
+        self.transitions = collections.deque(maxlen=40)
+        self._tlock   = threading.Lock()
+        self._stop_reason = None      # why _running was cleared (logged when the worker ends)
+        self._drop    = None          # (reason, detail) of the last stream drop
+        self.linger_until = 0.0       # deadline of a handoff / linger (0 viewers)
+        self.stalls   = 0             # LIVE -> STALLED events (no frame, connection open)
+        self.drop_reasons = collections.Counter()
+        self.max_gap_ms = 0           # longest pause between two frames from the NVR
+        self.gaps_over_1s = 0
+        self._last_grab = 0.0         # monotonic time of the last frame read from the NVR
+        self.grab_fps = None          # frames read from the NVR per second (source rate)
+        self.lag_ms   = None          # behind the stream clock (grows = decoding too slowly)
+        self.enc_ms   = None          # resize + JPEG time per published frame (smoothed)
+        self.enc_drops = 0            # Original: frames replaced before the encoder took them
+        self.cached_reason = None     # why a viewer would get the CACHED view right now
+        self._twin_key = None         # Standard view made from the live Original (switch)
+        self._twin_bytes = None
         # Latest frame, cached ALREADY JPEG-encoded (encoded once, in the worker)
         # and shared to every viewer as immutable bytes, plus the resized picture
         # itself (RAM only; never written to disk) so a CACHED view can be drawn.
@@ -432,10 +553,49 @@ class CamStream:
         self._ph_bytes = None
         self._ov_key  = None
         self._ov_bytes = None
+        self._lab_key = None
+        self._lab_bytes = None
 
     @property
     def url(self):
-        return make_url(self.info["nvr"], self.info["channel"])
+        return make_url(self.info["nvr"], self.info["channel"], subtype=self.subtype)
+
+    def twin(self):
+        """The same camera's worker for the other quality."""
+        return STREAMS[self.index] if self.original else ORIG_STREAMS[self.index]
+
+    def is_live(self, now=None):
+        now = time.monotonic() if now is None else now
+        with self._flock:
+            return self.jpeg_bytes is not None and self._is_live(self.frame_ts, now)
+
+    def _trans(self, to, reason, detail=""):
+        """Record a viewer-facing state change with its exact reason (+ one log line)."""
+        detail = sanitize_url(detail or "")[:200]
+        with self._tlock:
+            frm = self.vstate
+            self.vstate = to
+            self.transitions.append({"t": time.monotonic(), "at": time.strftime("%H:%M:%S"), "from": frm,
+                                     "to": to, "reason": reason, "detail": detail,
+                                     "viewers": self.viewers, "fullscreen": self.viewers_full})
+        ev(f"[{self.label}] {frm} -> {to} reason={reason}" + (f" ({detail})" if detail else "")
+           + f" viewers={self.viewers}" + (" FULLSCREEN" if self.viewers_full else ""))
+
+    def transitions_view(self, now, n=12):
+        with self._tlock:
+            items = list(self.transitions)[-n:]
+        return [{"at": e["at"], "agoS": round(now - e["t"], 1), "from": e["from"], "to": e["to"],
+                 "reason": e["reason"], "detail": e["detail"], "viewers": e["viewers"],
+                 "fullscreen": e["fullscreen"]} for e in items]
+
+    def hold_for_handoff(self):
+        """The other quality of this camera just got a viewer: if this stream still runs
+        with no viewer, keep it as the bridge until that one is live."""
+        with self._vlock:
+            if self._running and self.viewers == 0 and HANDOFF_MAX_S > 0:
+                self._bg, self.bg_reason, self.bg_since = True, "handoff", time.monotonic()
+                self.linger_until = time.monotonic() + HANDOFF_MAX_S
+        _ensure_housekeeping()
 
     def _dbg(self, gen, msg):
         if DEBUG_TIMING:
@@ -449,12 +609,17 @@ class CamStream:
         prev, self._worker_done = self._worker_done, threading.Event()
         return self._gen, prev, self._worker_done
 
-    def add_viewer(self, full=False):
+    def add_viewer(self, full=False, fps=None):
         spawn = None
         with self._vlock:
             self.viewers += 1
             if full:
                 self.viewers_full += 1
+            if self.original:
+                self._want_fps[fps or ORIGINAL_FPS] += 1
+                self.pub_fps = max(self._want_fps)
+            if self.bg_reason in ("handoff", "linger"):      # a viewer again: normal worker
+                self._bg, self.bg_reason, self.linger_until = False, None, 0.0
             n = self.viewers
             self.last_use = time.time()
             self._pub_now = True                 # HOT camera at idle rate: next frame at once
@@ -463,25 +628,45 @@ class CamStream:
                 spawn = self._spawn()
         if spawn:
             threading.Thread(target=self._run, args=spawn, daemon=True).start()
+        _ensure_housekeeping()
         _POOL_WAKE.set()
         return n
 
-    def remove_viewer(self, full=False):
+    def remove_viewer(self, full=False, fps=None):
         with self._vlock:
             if self.viewers > 0:
                 self.viewers -= 1
             if full and self.viewers_full > 0:
                 self.viewers_full -= 1
+            if self.original:
+                k = fps or ORIGINAL_FPS
+                if self._want_fps[k] > 0:
+                    self._want_fps[k] -= 1
+                    if not self._want_fps[k]:
+                        del self._want_fps[k]
+                self.pub_fps = max(self._want_fps, default=ORIGINAL_FPS)
             if self.viewers == 0:
-                self.last_view_end = time.monotonic()
+                now = time.monotonic()
+                self.last_view_end = now
                 if self._running:
-                    if PERSISTENT and POOL.running:
+                    tw = self.twin()
+                    if tw.viewers > 0 and HANDOFF_MAX_S > 0 and not tw.is_live(now):
+                        # quality switch of this camera in progress: this stream stays as
+                        # the bridge until the other one is live (make-before-break)
+                        self._bg, self.bg_reason, self.bg_since = True, "handoff", now
+                        self.linger_until = now + HANDOFF_MAX_S
+                    elif PERSISTENT and POOL.running and not self.original:
                         # stays HOT for now as "recently viewed"; the pool decides
                         # (it is demoted only if a viewed camera needs the slot)
                         self._bg, self.bg_reason = True, "recent"
-                        self.bg_since = time.monotonic()
+                        self.bg_since = now
+                    elif self.original and ORIGINAL_LINGER_S > 0:
+                        # a page retry / reopen re-attaches without a new handshake
+                        self._bg, self.bg_reason, self.bg_since = True, "linger", now
+                        self.linger_until = now + ORIGINAL_LINGER_S
                     else:
                         self._running = False     # on-demand: stop now
+                        self._stop_reason = "VIEWERS_GONE (last viewer left)"
             n = self.viewers
         _POOL_WAKE.set()
         return n
@@ -497,27 +682,43 @@ class CamStream:
         if spawn:
             threading.Thread(target=self._run, args=spawn, daemon=True).start()
 
-    def stop_bg(self):
-        """Pool: no longer needed in the background. A viewed camera keeps running."""
+    def stop_bg(self, reason="POOL_DEMOTION"):
+        """No longer needed without a viewer. A viewed camera keeps running (a worker
+        with viewers is never preempted)."""
         with self._vlock:
-            self._bg, self.bg_reason = False, None
+            self._bg, self.bg_reason, self.linger_until = False, None, 0.0
             if self.viewers == 0 and self._running:
                 self._running = False
+                self._stop_reason = reason
 
     def slot_priority(self):
-        """Who gets a free NVR slot first: fullscreen > viewed > recent > background."""
+        """Who gets a free NVR slot first (PRIO_*): fullscreen > grid tiles > the 0-viewer
+        roles. Only 0-viewer workers can be preempted, whatever their number."""
         if self.viewers_full > 0:
-            return 3
+            return PRIO_FULLSCREEN_ORIGINAL if self.original else PRIO_FULLSCREEN_STANDARD
         if self.viewers > 0:
-            return 2
-        return 1 if self.bg_reason == "recent" else 0
+            return PRIO_GRID_ORIGINAL if self.original else PRIO_GRID_STANDARD
+        if self._running and self._bg:
+            return _BG_PRIO.get(self.bg_reason, PRIO_BACKGROUND)
+        return PRIO_IDLE
+
+    def priority_name(self):
+        return PRIO_NAMES.get(self.slot_priority(), str(self.slot_priority()))
+
+    @property
+    def pinned(self):
+        """Fullscreen viewer: keeps its slot while the viewer is connected and the
+        stream is healthy (nothing preempts a worker with viewers)."""
+        return self.viewers_full > 0
 
     def _current(self, gen):
         with self._vlock:
             return self._running and gen == self._gen
 
-    def force_stop(self):
+    def force_stop(self, reason="FORCED"):
         with self._vlock:
+            if self._running:
+                self._stop_reason = reason
             self._running = False
             self._bg, self.bg_reason = False, None
 
@@ -625,7 +826,9 @@ class CamStream:
             with _ACTIVE_LOCK:
                 PREFLIGHT_ACTIVE[nvr] += 1
             try:
-                pf = _new_preflight(nvr, ch, lambda: self._current(gen))
+                alive = lambda: self._current(gen)       # noqa: E731
+                pf = (_new_preflight(nvr, ch, alive) if self.subtype == 1
+                      else _new_preflight(nvr, ch, alive, subtype=self.subtype))
                 res = pf.run()
             finally:
                 with _ACTIVE_LOCK:
@@ -647,23 +850,28 @@ class CamStream:
         t_w = time.monotonic()
         last_report = 0.0
         waited = False
+        key = self.slot_key
         with _ACTIVE_LOCK:
-            NVR_WAITERS[nvr][self.index] = t_w
+            NVR_WAITERS[nvr][key] = t_w
         try:
             while self._current(gen):
                 with _ACTIVE_LOCK:
-                    _WAIT_PRIO[nvr][self.index] = (-self.slot_priority(), t_w)
-                    mine = min(_WAIT_PRIO[nvr], key=_WAIT_PRIO[nvr].get) == self.index
-                if mine and _slot_try_acquire(nvr, self.index, timeout=0.1):
+                    _WAIT_PRIO[nvr][key] = (-self.slot_priority(), t_w)
+                    mine = min(_WAIT_PRIO[nvr], key=_WAIT_PRIO[nvr].get) == key
+                if mine and _slot_try_acquire(nvr, key, timeout=0.1):
                     if waited:
                         ev(f"[{self.label}] got {nvr.upper()} slot after waiting {_ms(t_w)} ms")
                     return True
                 if not mine:
                     time.sleep(0.05)
+                elif not (PERSISTENT and POOL.running) and self.viewers > 0:
+                    _preempt_idle_holder(nvr, self)   # a bridge / lingering worker yields
                 _POOL_WAKE.set()                  # the pool may free a background slot
-                # persistent: a demotion frees a slot within a moment -- only say
+                # slot-first: a demotion frees a slot within a moment -- only say
                 # "Waiting for NVR slot" when it really takes a while
-                if not PERSISTENT or time.monotonic() - t_w >= 1.0:
+                if not self.slot_first or time.monotonic() - t_w >= 1.0:
+                    if not waited:
+                        self._trans("WAITING_SLOT", "NVR_FULL", _slot_report(nvr))
                     waited = True
                     self._state(gen, S_WAIT_SLOT, f"all {NVR_CAP[nvr]} {nvr.upper()} slots in use")
                     if time.monotonic() - last_report >= 10.0:
@@ -672,8 +880,8 @@ class CamStream:
             return False
         finally:
             with _ACTIVE_LOCK:
-                NVR_WAITERS[nvr].pop(self.index, None)
-                _WAIT_PRIO[nvr].pop(self.index, None)
+                NVR_WAITERS[nvr].pop(key, None)
+                _WAIT_PRIO[nvr].pop(key, None)
 
     # ── the worker ───────────────────────────────────────────────────────
     def _run(self, gen, prev_done, done):
@@ -684,18 +892,23 @@ class CamStream:
                     return
             fail = 0                       # consecutive failures -> backoff + status
             self.fail_streak = 0           # the pool judges THIS run's failures only
+            self._stop_reason = None
+            self._redial = False           # True after a drop in THIS run (-> "RECONNECTED")
             t_worker = time.monotonic()
             # Failed on a PREVIOUS visit (e.g. same page a minute ago)? Then say
             # "Camera offline" while re-checking, and let fresh cameras open first.
             # Evaluated once: failures in THIS session are counted by `fail`, so a
             # healthy camera with one sporadic NVR hang shows "Retrying...", not offline.
-            known_dead = _recently_failed(self.index)
+            known_dead = _recently_failed(self.slot_key)
             role = "" if self.viewers else f" [{self.bg_reason or 'background'}]"
             ev(f"[{self.label}] worker start ({nvr} ch{self.info['channel']}){role}")
             while self._current(gen):
                 # 1. NVR reachable? (cached by the background monitor; never blocks)
                 h = MONITOR.get(nvr)
                 if h is not None and h.checked and not h.reachable:
+                    if self.vstate != "NVR_UNREACHABLE":
+                        self._trans("NVR_UNREACHABLE", "NVR_UNREACHABLE",
+                                    f"network monitor: {h.label} (3 TCP checks in a row failed)")
                     self._state(gen, S_NVR_DOWN, h.label)
                     self._sleep(gen, 2.0)
                     continue
@@ -714,6 +927,7 @@ class CamStream:
                 except Exception as e:           # never let a camera's worker die silently
                     fail += 1
                     ev(f"[{self.label}] worker error: {e!r}")
+                    self._trans("RETRYING", "WORKER_ERROR", repr(e))
                     self._state(gen, self._fail_status(fail, known_dead), f"internal error ({type(e).__name__})")
                     outcome = (fail, known_dead, _backoff_s(fail))
                 if outcome is None or not self._current(gen):
@@ -727,6 +941,15 @@ class CamStream:
                 if gen == self._gen and not self._running and self.status != S_IDLE:
                     self.status = S_IDLE
                     self.status_since = time.monotonic()
+                reason = self._stop_reason or ("SUPERSEDED (new worker generation)" if gen != self._gen
+                                               else "STOPPED")
+            if self.vstate not in ("IDLE", "STOPPED", "WARM"):
+                self._trans("WARM" if reason.startswith("POOL") else "STOPPED", re.split(r"[ :]", reason)[0],
+                            reason + ("; last frame kept as the CACHED picture" if self.jpeg_bytes else ""))
+            if self.original:
+                with self._flock:                # full-size picture not needed any more
+                    if self.last_small is not None and self.last_small.shape[1] > STREAM_W:
+                        self.last_small = cv2.resize(self.last_small, (STREAM_W, STREAM_H))
             done.set()
             _POOL_WAKE.set()
             ev(f"[{self.label}] worker stopped")
@@ -740,6 +963,8 @@ class CamStream:
         timing = {}
         held = {"cap": None, "pf": None, "slot": False}
 
+        why = {"r": None}
+
         def release():
             if held["pf"] is not None:
                 held["pf"].close()
@@ -749,17 +974,20 @@ class CamStream:
                 held["cap"] = None
             if held["slot"]:
                 held["slot"] = False
-                _slot_release(nvr, self.index)
+                _slot_release(nvr, self.slot_key, why["r"] or self._stop_reason)
                 _POOL_WAKE.set()
             self.live_since = None
 
-        def failed(status, detail, pause):
+        def failed(status, detail, pause, reason, to=None):
+            why["r"] = reason
             release()                            # slot first, THEN report / back off
+            self._trans(to or {S_OFFLINE: "OFFLINE", S_NVR_DOWN: "NVR_UNREACHABLE",
+                               S_LOGIN: "LOGIN_FAILED"}.get(status, "RETRYING"), reason, detail)
             self._state(gen, status, detail)
             return fail, known_dead, pause
 
         try:
-            if PERSISTENT:                       # strict cap: the slot comes FIRST
+            if self.slot_first:                  # strict cap: the slot comes FIRST
                 t_slot = time.monotonic()
                 if not self._acquire_slot(gen, nvr):
                     return None
@@ -778,12 +1006,13 @@ class CamStream:
                 if res != rp.OK:
                     detail = pf.detail if pf else "NVR paused after a credential failure"
                     if res == rp.AUTH_FAIL:
-                        return failed(S_LOGIN, detail, 0.0)       # loop top shows the pause
+                        return failed(S_LOGIN, detail, 0.0, "PREFLIGHT_AUTH_FAIL")  # loop top shows the pause
                     fail += 1
-                    _note_open_fail(self.index)
+                    _note_open_fail(self.slot_key)
                     self._dbg(gen, f"pre-flight {res} after {timing['preflight_ms']} ms")
                     return failed(S_NVR_DOWN if res == rp.UNREACHABLE else
-                                  self._fail_status(fail, known_dead), detail, _backoff_s(fail))
+                                  self._fail_status(fail, known_dead), detail, _backoff_s(fail),
+                                  f"PREFLIGHT_{res}")
                 self._dbg(gen, f"pre-flight OK in {timing['preflight_ms']} ms (channel warm)")
 
             # 3. OpenCV open through the serialized gate (channel is warm now).
@@ -799,9 +1028,9 @@ class CamStream:
                 return None                      # no longer wanted while queued
             if not cap.isOpened():
                 fail += 1
-                _note_open_fail(self.index)
+                _note_open_fail(self.slot_key)
                 return failed(self._fail_status(fail, known_dead),
-                              f"RTSP open failed after {open_ms} ms", _backoff_s(fail))
+                              f"RTSP open failed after {open_ms} ms", _backoff_s(fail), "OPEN_FAILED")
             self.opens += 1
             _AUTH_OK[nvr] = True
 
@@ -814,18 +1043,23 @@ class CamStream:
                 held["slot"] = True
                 timing["slot_wait_ms"] = _ms(t_slot)
 
+            self._drop = None
             published = self._stream_frames(gen, cap, timing, t0, t_worker)
             if not self._current(gen):
+                why["r"] = self._stop_reason
                 return None
             # 5. Stream dropped (or opened but produced no frame): retry.
+            reason, detail = self._drop or ("STREAM_CLOSED", "stream ended")
             if published:
                 self.reconnects += 1
+                self._redial = True
+                self.drop_reasons[reason] += 1
                 fail, known_dead = 0, False
-                return failed(S_RETRYING, "stream dropped (no frame within read timeout)", 0.4)
+                return failed(S_RETRYING, f"stream dropped: {detail}", 0.4, reason, to="RECONNECTING")
             fail += 1
-            _note_open_fail(self.index)
-            return failed(self._fail_status(fail, known_dead), "opened but no frame arrived",
-                          _backoff_s(fail))
+            _note_open_fail(self.slot_key)
+            return failed(self._fail_status(fail, known_dead), f"opened but no frame arrived ({detail})",
+                          _backoff_s(fail), "NO_FIRST_FRAME")
         finally:
             release()
 
@@ -839,57 +1073,205 @@ class CamStream:
         published = False
         t_read = time.monotonic()
         next_pub = 0.0
-        while self._current(gen):
-            if not cap.grab():
-                break
-            now = time.monotonic()
-            boost = self._pub_now
-            if published and now < next_pub and not boost:
-                continue
-            ok, frame = cap.retrieve()
-            if not ok or frame is None:
-                break
-            fps = STREAM_FPS if (self.viewers > 0 or not PERSISTENT) else IDLE_FPS
-            interval = 1.0 / max(0.1, fps)
-            if boost:
-                self._pub_now = False
-                next_pub = now + interval
-            else:
-                # steady cadence (a plain "now - last >= 1/fps" check only managed
-                # ~6.25 fps from 25 fps input); the FIRST frame at once
-                next_pub = next_pub + interval if next_pub + interval > now else now + interval
-            small = cv2.resize(frame, (STREAM_W, STREAM_H))
-            okj, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-            if not okj:
-                continue
-            self._publish(gen, buf.tobytes(), small)
-            if not published:
-                published = True
-                self.fail_streak = 0
-                self.live_since = now
-                _clear_open_fail(self.index)
-                timing["first_read_ms"] = round((now - t_read) * 1000)
-                timing["jpeg_ms"] = _ms(now)
-                timing["total_ms"] = _ms(t0)
-                timing["since_worker_start_ms"] = _ms(t_worker)
-                self.startup = dict(timing)
-                self._state(gen, S_LIVE)
-                pre = f"preflight {timing['preflight_ms']} | " if "preflight_ms" in timing else ""
-                ev(f"[{self.label}] FIRST FRAME in {timing['total_ms']} ms  ({pre}gate wait "
-                   f"{timing.get('gate_wait_ms')} | open {timing.get('open_ms')} | slot wait "
-                   f"{timing.get('slot_wait_ms')} | first read {timing['first_read_ms']} | "
-                   f"jpeg {timing['jpeg_ms']} ms)")
+        self._last_grab = t_read
+        rt_ms = ORIGINAL_READ_TIMEOUT_MS if self.original else READ_TIMEOUT_MS
+        n_grab, t_rate = 0, t_read
+        lag0 = None                            # (wall, stream ms) at the first frame
+        enc = None
+        try:
+            while self._current(gen):
+                ok_g = cap.grab()
+                now = time.monotonic()
+                gap = now - self._last_grab
+                if not ok_g:
+                    if not self._current(gen):
+                        break
+                    gap_ms = round(gap * 1000)
+                    if gap_ms >= rt_ms * 0.9:
+                        self._drop = ("READ_TIMEOUT", f"no data from the NVR for {gap_ms} ms "
+                                                      f"(read timeout {rt_ms} ms)")
+                    else:
+                        self._drop = ("STREAM_CLOSED", f"the NVR / network ended the stream "
+                                                       f"{gap_ms} ms after the last frame")
+                    break
+                if published:
+                    gms = round(gap * 1000)
+                    if gms > self.max_gap_ms:
+                        self.max_gap_ms = gms
+                    if gms > 1000:
+                        self.gaps_over_1s += 1
+                self._last_grab = now
+                n_grab += 1
+                if now - t_rate >= 2.0:
+                    self.grab_fps = round(n_grab / (now - t_rate), 1)
+                    n_grab, t_rate = 0, now
+                    lag0 = self._measure_lag(cap, lag0)
+                boost = self._pub_now
+                if published and now < next_pub and not boost:
+                    continue
+                ok, frame = cap.retrieve()
+                if not ok or frame is None:
+                    self._drop = ("RETRIEVE_FAILED", "decoder returned no picture")
+                    break
+                if self.original:
+                    fps = self.pub_fps            # the fastest viewer's rate (grid 6, fullscreen 12)
+                else:
+                    fps = STREAM_FPS if (self.viewers > 0 or not PERSISTENT) else IDLE_FPS
+                interval = 1.0 / max(0.1, fps)
+                if boost:
+                    self._pub_now = False
+                    next_pub = now + interval
+                else:
+                    # steady cadence (a plain "now - last >= 1/fps" check only managed
+                    # ~6.25 fps from 25 fps input); the FIRST frame at once
+                    next_pub = next_pub + interval if next_pub + interval > now else now + interval
+                src_h, src_w = frame.shape[:2]
+                if self.original and published:
+                    # Original: encoding runs on its own thread -- this loop goes straight
+                    # back to reading the RTSP stream (a 4 MP JPEG takes ~10 ms)
+                    if enc is None:
+                        enc = _FrameEncoder(self, gen)
+                        enc.start()
+                    enc.put(frame)
+                    continue
+                res = self._encode_publish(gen, frame, published)
+                if res is None:
+                    continue
+                small, quality = res
+                if not published:
+                    self.source_size = (src_w, src_h)
+                    self.output_size = (small.shape[1], small.shape[0])
+                    ev(f"[{self.label}] {self.quality}: source {src_w}x{src_h} (subtype={self.subtype}) -> "
+                       f"output {self.output_size[0]}x{self.output_size[1]}, JPEG quality {quality}, "
+                       f"{self.pub_fps if self.original else STREAM_FPS} fps")
+                    published = True
+                    self.fail_streak = 0
+                    self.live_since = now
+                    _clear_open_fail(self.slot_key)
+                    timing["first_read_ms"] = round((now - t_read) * 1000)
+                    timing["jpeg_ms"] = _ms(now)
+                    timing["total_ms"] = _ms(t0)
+                    timing["since_worker_start_ms"] = _ms(t_worker)
+                    self.startup = dict(timing)
+                    self._state(gen, S_LIVE)
+                    self._trans("LIVE", "RECONNECTED" if getattr(self, "_redial", False) else "FIRST_FRAME",
+                                f"{timing['total_ms']} ms (open {timing.get('open_ms')} ms, slot wait "
+                                f"{timing.get('slot_wait_ms')} ms)")
+                    pre = f"preflight {timing['preflight_ms']} | " if "preflight_ms" in timing else ""
+                    ev(f"[{self.label}] FIRST FRAME in {timing['total_ms']} ms  ({pre}gate wait "
+                       f"{timing.get('gate_wait_ms')} | open {timing.get('open_ms')} | slot wait "
+                       f"{timing.get('slot_wait_ms')} | first read {timing['first_read_ms']} | "
+                       f"jpeg {timing['jpeg_ms']} ms)")
+        finally:
+            if enc is not None:
+                enc.stop = True
         return published
+
+    def _measure_lag(self, cap, lag0):
+        """How far decoding runs behind the stream: wall time elapsed minus stream time
+        elapsed (CAP_PROP_POS_MSEC). Growing = the reader cannot keep up (buffer grows)."""
+        try:
+            pos = cap.get(cv2.CAP_PROP_POS_MSEC)
+        except Exception:
+            return lag0
+        if not pos or pos <= 0:
+            return lag0
+        wall = time.monotonic()
+        if lag0 is None:
+            return (wall, pos)
+        self.lag_ms = round((wall - lag0[0]) * 1000 - (pos - lag0[1]))
+        return lag0
+
+    def _encode_publish(self, gen, frame, published=True):
+        """Resize + JPEG-encode one frame and publish it -> (small, quality) or None."""
+        t = time.perf_counter()
+        src_h, src_w = frame.shape[:2]
+        if self.original:
+            # the REAL main-stream picture, never scaled to STREAM_W x STREAM_H and never
+            # up: full source size for a fullscreen viewer, <= ORIGINAL_GRID_MAX_W wide
+            # while only grid tiles watch
+            max_w = ORIGINAL_MAX_W
+            if ORIGINAL_GRID_MAX_W and self.viewers_full == 0:
+                max_w = min(max_w, ORIGINAL_GRID_MAX_W) if max_w else ORIGINAL_GRID_MAX_W
+            if max_w and src_w > max_w:
+                small = cv2.resize(frame, (max_w, round(src_h * max_w / src_w)),
+                                   interpolation=cv2.INTER_AREA)
+            else:
+                small = frame
+            quality = ORIGINAL_JPEG_QUALITY
+            out_wh = (small.shape[1], small.shape[0])
+            if published and out_wh != self.output_size:
+                ev(f"[{self.label}] output now {out_wh[0]}x{out_wh[1]} "
+                   f"({'fullscreen viewer' if self.viewers_full else 'grid tiles only'})")
+                self.output_size = out_wh
+        else:
+            small = cv2.resize(frame, (STREAM_W, STREAM_H))
+            quality = JPEG_QUALITY
+        okj, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not okj:
+            return None
+        self._publish(gen, buf.tobytes(), small)
+        ms = (time.perf_counter() - t) * 1000
+        self.enc_ms = round(ms if self.enc_ms is None else self.enc_ms * 0.9 + ms * 0.1, 1)
+        return small, quality
 
     # ── frames ───────────────────────────────────────────────────────────
     def _publish(self, gen, data, small=None):
         with self._flock:
-            if gen == self._gen:
-                self.jpeg_bytes = data
-                self.last_small = small
-                self.frame_ts = time.monotonic()
-                self.frame_wall = time.time()
-                self.published += 1
+            if gen != self._gen:
+                return
+            prev = self.frame_ts
+            self.jpeg_bytes = data
+            self.last_small = small
+            self.frame_ts = time.monotonic()
+            self.frame_wall = time.time()
+            self.published += 1
+        if self.vstate == "STALLED":
+            self._trans("LIVE", "FRAME_RESUMED", f"frames again after {round((self.frame_ts - prev) * 1000)} ms "
+                                                 f"(same connection, no reconnect)")
+
+    def _check_stall(self, now):
+        """Housekeeping: a LIVE stream that delivered no frame for LIVE_MAX_AGE_S -- the
+        moment its viewers get the CACHED view -- is logged as STALLED with the cause:
+        still reading frames (CPU / encoder behind) or waiting for data (network / NVR)."""
+        if self.vstate != "LIVE" or not self._running or self.live_since is None:
+            return
+        with self._flock:
+            age = now - self.frame_ts
+        if age <= LIVE_MAX_AGE_S:
+            return
+        since_grab = round((now - self._last_grab) * 1000)
+        cause = ("waiting for data from the NVR/network -- last packet " if since_grab > 1000 else
+                 "frames still arriving but not published (CPU/encoder) -- last packet ")
+        self.stalls += 1
+        self._trans("STALLED", f"NO_FRAME_AGE_{round(age * 1000)}MS",
+                    f"connection open, {cause}{since_grab} ms ago")
+
+    def _check_linger(self, now):
+        """Housekeeping: end a quality-switch bridge once the other quality is live, and a
+        lingering Original after ORIGINAL_LINGER_S. Only ever a worker with 0 viewers."""
+        with self._vlock:
+            r, until, viewers, running = self.bg_reason, self.linger_until, self.viewers, self._running
+        if viewers or not running or r not in ("handoff", "linger"):
+            return
+        tw = self.twin()
+        if r == "handoff":
+            if tw.viewers > 0 and tw.is_live(now):
+                self.stop_bg("HANDOFF_DONE (the other quality is live; duplicate upstream released)")
+            elif tw.viewers == 0:                       # switched back before it finished
+                with self._vlock:
+                    if self.viewers == 0 and self.bg_reason == "handoff":
+                        if PERSISTENT and POOL.running and not self.original:
+                            self.bg_reason, self.bg_since = "recent", now
+                        elif self.original and ORIGINAL_LINGER_S > 0:
+                            self.bg_reason, self.linger_until = "linger", now + ORIGINAL_LINGER_S
+                        else:
+                            self._running, self._bg, self.bg_reason = False, False, None
+                            self._stop_reason = "VIEWERS_GONE (switch cancelled)"
+            elif now > until:
+                self.stop_bg("HANDOFF_TIMEOUT")
+        elif now > until:
+            self.stop_bg("LINGER_EXPIRED (no viewer came back)")
 
     def frame_age_ms(self):
         with self._flock:
@@ -914,15 +1296,92 @@ class CamStream:
         now = time.monotonic()
         with self._flock:
             data, ts, small, wall = self.jpeg_bytes, self.frame_ts, self.last_small, self.frame_wall
-        if data is not None:
-            if self._is_live(ts, now):
-                return data, "live"
-            age = now - ts
-            if small is not None and age <= CACHE_MAX_AGE_S:
-                ov = self._cached_view(ts, wall, small)
-                if ov:
-                    return ov, "cached"
+        if data is not None and self._is_live(ts, now):
+            self.cached_reason = None
+            return data, "live"
+        tw = self.twin()
+        if not self.original and tw.is_live(now):
+            # quality switch Original -> Standard: until this stream is live, Standard
+            # viewers get the LIVE Original picture at Standard size (make-before-break)
+            b = self._from_original(tw)
+            if b:
+                self.cached_reason = None
+                return b, "live"
+        self.cached_reason = self._why_not_live(now, ts, data is not None)
+        with tw._flock:                          # the freshest picture of either quality
+            if tw.last_small is not None and tw.frame_ts > ts:
+                ts, small, wall = tw.frame_ts, tw.last_small, tw.frame_wall
+        if small is not None and now - ts <= CACHE_MAX_AGE_S:
+            ov = self._cached_view(ts, wall, small)
+            if ov:
+                return ov, "cached"
         return self._placeholder(), "status"
+
+    def _from_original(self, o):
+        """Standard-size copy of the Original twin's live frame (encoded once per frame)."""
+        with o._flock:
+            key, small = o.frame_ts, o.last_small
+        if small is None:
+            return None
+        with self._flock:
+            if self._twin_key == key:
+                return self._twin_bytes
+        img = cv2.resize(small, (STREAM_W, STREAM_H), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        data = buf.tobytes() if ok else None
+        with self._flock:
+            self._twin_key, self._twin_bytes = key, data
+        return data
+
+    def _why_not_live(self, now, ts, has_frame):
+        """Why a viewer of this worker would get the CACHED / status view right now."""
+        st = self.status
+        if not self._running:
+            return "NOT_HOT (worker not running: " + (self._stop_reason or "not started") + ")"
+        if st == S_WAIT_SLOT:
+            return "WAITING_FOR_SLOT"
+        if st in (S_OFFLINE, S_LOGIN):
+            return "SOURCE_OFFLINE" if st == S_OFFLINE else "NVR_LOGIN_FAILED"
+        if st == S_NVR_DOWN:
+            return "NVR_UNREACHABLE"
+        if self.live_since is not None and has_frame:
+            return f"STALLED (no frame for {round((now - ts) * 1000)} ms, connection open)"
+        if st == S_RETRYING or self.reconnects:
+            return "RECONNECTING (" + (self._drop[0] if self._drop else "retry") + ")"
+        return "CONNECTING"
+
+    def labelled_view(self, title, detail):
+        """This (Standard) worker's LIVE frame with a small quality label burned in:
+        what an Original viewer sees while the main stream starts or is unavailable.
+        Encoded once per frame + label and shared. None if not live."""
+        now = time.monotonic()
+        with self._flock:
+            ts, small = self.frame_ts, self.last_small
+        if small is None or not self._is_live(ts, now):
+            return None
+        key = (ts, title, detail)
+        with self._flock:
+            if self._lab_key == key:
+                return self._lab_bytes
+        img = _labelled_look(small, title, detail)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        data = buf.tobytes() if ok else None
+        with self._flock:
+            self._lab_key, self._lab_bytes = key, data
+        return data
+
+    def unavailable(self, now=None):
+        """Original worker: should its viewers get the Standard stream instead? Only
+        when the main stream FAILED: an attempt failed (open / pre-flight / no frame),
+        camera offline, NVR down or login refused. Not while it waits for a slot or
+        for its turn to connect (a Standard stand-in would only compete for the same
+        NVR slots), and not for a live stream that dropped and is reconnecting."""
+        now = time.monotonic() if now is None else now
+        with self._flock:
+            live = self.jpeg_bytes is not None and self._is_live(self.frame_ts, now)
+        if live:
+            return False
+        return self.fail_streak >= 1 or self.status in (S_OFFLINE, S_NVR_DOWN, S_LOGIN)
 
     def _is_live(self, ts, now):
         """A frame counts as LIVE only if it came from the CURRENT upstream connection
@@ -933,9 +1392,11 @@ class CamStream:
     def _cache_label(self):
         st = self.status
         if st == S_LIVE:
-            return "Reconnecting..."             # stream stalled: the frame is getting old
+            return "Stalled - waiting for video"  # connection open, no new frame yet
         if st == S_IDLE:
             return "Connecting..."
+        if st == S_RETRYING and self.reconnects:
+            return "Reconnecting..."
         return st
 
     def _cached_view(self, ts, wall, small):
@@ -945,6 +1406,8 @@ class CamStream:
         with self._flock:
             if self._ov_key == key:
                 return self._ov_bytes
+        if small.shape[1] > STREAM_W and not self.original:     # an Original picture
+            small = cv2.resize(small, (STREAM_W, STREAM_H))
         img = _cached_look(small, "CACHED " + time.strftime("%H:%M:%S", time.localtime(wall)), label)
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         data = buf.tobytes() if ok else None
@@ -1044,11 +1507,48 @@ class CamStream:
             "slotHeldMs": round((now - owners[nvr][self.index]) * 1000) if held else None,
             "slotWaitMs": round((now - w) * 1000) if w else None,
             "slotPriority": self.slot_priority(),
+            **self._stability_info(now, held, owners[nvr].get(self.slot_key) if held else None),
             "lastErrorMasked": err or None,
             "startup": self.startup or None, "firstHttpFrameMs": self.first_http_ms,
             "attempts": self.attempts, "opens": self.opens, "reconnects": self.reconnects,
             "failStreak": self.fail_streak, "framesPublished": self.published,
+            "qualityMode": self.quality, "subtype": self.subtype,
+            "sourceSize": _size(self.source_size), "outputSize": _size(self.output_size),
         }
+
+    def quality_info(self, now, owners):
+        """Compact, credential-free state of this worker (used for the Original one)."""
+        with self._flock:
+            has = self.jpeg_bytes is not None
+            live = has and self._is_live(self.frame_ts, now)
+        return {"qualityMode": self.quality, "subtype": self.subtype, "status": self.status,
+                "tier": self.tier(now), "live": live, "viewers": self.viewers,
+                "viewersFull": self.viewers_full, "running": self._running,
+                "slotHeld": self.slot_key in owners.get(self.info["nvr"], {}),
+                "sourceSize": _size(self.source_size), "outputSize": _size(self.output_size),
+                "jpegQuality": ORIGINAL_JPEG_QUALITY if self.original else JPEG_QUALITY,
+                "fps": self.pub_fps if self.original else STREAM_FPS,
+                "lastFrameAgeMs": self.frame_age_ms(), "opens": self.opens,
+                "failStreak": self.fail_streak, "lastErrorMasked": self.last_error or None,
+                "fallbackViewers": self.fallback_viewers,
+                **self._stability_info(now, self.slot_key in owners.get(self.info["nvr"], {}),
+                                       owners.get(self.info["nvr"], {}).get(self.slot_key))}
+
+    def _stability_info(self, now, held, t_slot):
+        last = self.transitions_view(now, 1)
+        return {"priority": self.slot_priority(), "priorityName": self.priority_name(),
+                "pinned": self.pinned, "state": self.vstate,
+                "slotAgeMs": round((now - t_slot) * 1000) if held and t_slot else None,
+                "reconnectCount": self.reconnects, "dropReasons": dict(self.drop_reasons),
+                "stalls": self.stalls, "maxFrameGapMs": self.max_gap_ms, "gapsOver1s": self.gaps_over_1s,
+                "sourceFps": self.grab_fps, "lagMs": self.lag_ms, "encodeMs": self.enc_ms,
+                "encoderDrops": self.enc_drops if self.original else None,
+                "cachedReason": None if self.is_live(now) else (self.cached_reason
+                                                                or self._why_not_live(now, self.frame_ts,
+                                                                                      self.jpeg_bytes is not None)),
+                "lastTransitionReason": last[0]["reason"] if last else None,
+                "lastTransition": last[0] if last else None,
+                "transitions": self.transitions_view(now, 12)}
 
 
 # ── status image ("placeholder") look; colours are BGR ────────────────────────
@@ -1103,7 +1603,96 @@ def _cached_look(frame, title, detail):
     return img
 
 
-STREAMS = [CamStream(c, i) for i, c in enumerate(CAMERAS)]
+def _labelled_look(frame, title, detail):
+    """Copy of a live frame with a small pill in the top-right corner, e.g.
+    "STANDARD / Original unavailable" -- so a viewer who chose Original always knows
+    when they are looking at the Standard stream."""
+    img = frame.copy()
+    h, w = img.shape[:2]
+    k = w / 640.0
+    font, aa = cv2.FONT_HERSHEY_SIMPLEX, cv2.LINE_AA
+    s1, w1, h1 = _fit_text(title, font, 0.5 * k, 1, w * 0.45)
+    s2, w2, h2 = _fit_text(detail, font, 0.4 * k, 1, w * 0.45)
+    pw = int(max(w1 + 22 * k, w2) + 20 * k)
+    ph = int(h1 + h2 + 22 * k)
+    x0, y0 = max(0, w - pw - int(10 * k)), int(10 * k)
+    x1, y1 = min(w, x0 + pw), min(h, y0 + ph)
+    img[y0:y1, x0:x1] = (img[y0:y1, x0:x1].astype(np.uint16) * 70 // 256).astype(np.uint8)
+    r = max(2, round(4 * k))
+    cv2.circle(img, (x0 + int(10 * k) + r, y0 + int(8 * k) + h1 // 2), r, _PH_WAIT, -1, aa)
+    cv2.putText(img, title, (x0 + int(10 * k) + 2 * r + int(6 * k), y0 + int(8 * k) + h1), font, s1, _PH_TEXT, 1, aa)
+    cv2.putText(img, detail, (x0 + int(10 * k), y0 + int(14 * k) + h1 + h2), font, s2, _PH_MUTED, 1, aa)
+    return img
+
+
+def _size(wh):
+    return f"{wh[0]}x{wh[1]}" if wh else None
+
+
+class _FrameEncoder(threading.Thread):
+    """Original only: JPEG encoding off the capture thread. The capture loop keeps
+    reading the RTSP stream at the camera's rate; the encoder always takes the NEWEST
+    picture (one still waiting is replaced -- counted in encoderDrops)."""
+
+    def __init__(self, cam, gen):
+        super().__init__(daemon=True, name=f"enc-{cam.slot_key}")
+        self.cam, self.gen = cam, gen
+        self._box, self._ev, self._lock, self.stop = None, threading.Event(), threading.Lock(), False
+
+    def put(self, frame):
+        with self._lock:
+            if self._box is not None:
+                self.cam.enc_drops += 1
+            self._box = frame
+        self._ev.set()
+
+    def run(self):
+        while not self.stop:
+            if not self._ev.wait(0.5):
+                continue
+            self._ev.clear()
+            with self._lock:
+                frame, self._box = self._box, None
+            if frame is not None and not self.stop:
+                try:
+                    self.cam._encode_publish(self.gen, frame)
+                except Exception as e:
+                    ev(f"[{self.cam.label}] encoder error: {e!r}")
+
+
+_HK = {"started": False}
+_HK_LOCK = threading.Lock()
+
+
+def _ensure_housekeeping():
+    with _HK_LOCK:
+        if _HK["started"]:
+            return
+        _HK["started"] = True
+    threading.Thread(target=_housekeeping, name="housekeeping", daemon=True).start()
+
+
+def _housekeeping():
+    """Every 0.25 s: log LIVE -> STALLED the moment a connected stream's viewers would
+    get the CACHED view, end finished quality-switch bridges and expired lingers."""
+    while True:
+        time.sleep(0.25)
+        now = time.monotonic()
+        for w in STREAMS + ORIG_STREAMS:
+            try:
+                w._check_stall(now)
+                w._check_linger(now)
+            except Exception as e:
+                ev(f"[{w.label}] housekeeping error: {e!r}")
+
+
+ORIG_KEY_BASE = 1000        # slot key of camera i's Original worker = 1000 + i
+STREAMS = [CamStream(c, i) for i, c in enumerate(CAMERAS)]                         # Standard
+ORIG_STREAMS = [CamStream(c, i, quality="original") for i, c in enumerate(CAMERAS)]  # Original
+
+
+def _worker_by_key(key):
+    return ORIG_STREAMS[key - ORIG_KEY_BASE] if key >= ORIG_KEY_BASE else STREAMS[key]
 
 
 class PoolManager:
@@ -1111,7 +1700,11 @@ class PoolManager:
 
     Per NVR at most NVR_CAP upstream streams run. Cameras with viewers always get
     their worker; when slots are contended, fullscreen goes before grid (slot
-    priority). The rest of the cap -- the background budget = cap minus viewed
+    priority), Original before Standard. Original (main-stream) viewers take their
+    slots one at a time, each from the least useful background stream -- the
+    Standard stream of the camera whose Original is next only when nothing else is
+    left -- so a page switched to Original changes tile by tile, never to blank.
+    The rest of the cap -- the background budget = cap minus viewed
     cameras -- stays HOT with, in this order: recently viewed cameras (most recent
     first), then the cameras earliest in the grid order (page 1 first), so the page
     people open first is already live.
@@ -1173,7 +1766,7 @@ class PoolManager:
         self._note(f"{s.info['nvr']} HOT+ {s.label} ({reason})")
 
     def _demote(self, s, why):
-        s.stop_bg()
+        s.stop_bg(f"POOL_DEMOTION: {why}")
         self.demotions += 1
         self._note(f"{s.info['nvr']} HOT- {s.label} ({why})")
 
@@ -1202,11 +1795,37 @@ class PoolManager:
     def _tick_nvr(self, nvr, now, pos):
         cams = [s for s in STREAMS if s.info["nvr"] == nvr]
         viewed = [s for s in cams if s.viewers > 0]
-        if viewed:
+        viewed_orig = [o for o in ORIG_STREAMS if o.info["nvr"] == nvr and o.viewers > 0]
+        if viewed or viewed_orig:
             self.last_activity[nvr] = now
-        budget = max(0, NVR_CAP[nvr] - len(viewed))   # slots left for background streams
+        # Original viewers take over slots ONE AT A TIME (opens are serialized anyway):
+        # those holding a slot, plus the next one in the slot queue once no other
+        # Original is still connecting. Every other tile keeps the camera's live
+        # Standard picture ("switching to Original...") until its own turn.
+        with _ACTIVE_LOCK:
+            owned = set(NVR_OWNERS[nvr])
+            queued = dict(_WAIT_PRIO[nvr])
+        holding = [o for o in viewed_orig if o.slot_key in owned]
+        connecting = [o for o in holding if o.live_since is None]
+        waiting = sorted((o for o in viewed_orig if o.slot_key not in owned and o.slot_key in queued),
+                         key=lambda o: queued[o.slot_key])
+        nxt = waiting[0] if waiting and not connecting else None
+        orig_need = len(holding) + (1 if nxt is not None else 0)
+        # slots left for background streams
+        budget = max(0, NVR_CAP[nvr] - len(viewed) - orig_need)
         bg = [s for s in cams if s.viewers == 0 and s._bg and s._running]
+        # Original workers with 0 viewers (quality-switch bridge / linger) hold slots too:
+        # they are the first to go when a viewer needs one
+        orig_idle = [o for o in ORIG_STREAMS if o.info["nvr"] == nvr and o.viewers == 0 and o._running]
         rank = lambda s: self._rank(s, now, pos)       # noqa: E731
+        # no duplicate upstream: once a camera's Original is live for its viewers, its
+        # Standard stream without viewers is released (and not promoted back meanwhile)
+        live_orig = {o.index for o in holding if o.live_since is not None and now - o.live_since >= 1.0
+                     and o.is_live(now)}
+        for s in list(bg):
+            if s.index in live_orig and s.bg_reason not in ("refresh", "handoff"):
+                self._demote(s, "DUPLICATE: this camera's Original is live")
+                bg.remove(s)
 
         # 1. an offline camera gives its background slot back and is retried there
         #    only after DEAD_RETRY_S, doubling per consecutive failure (max 1 h), so a
@@ -1237,25 +1856,44 @@ class PoolManager:
 
         # 3. which cameras SHOULD be HOT in the background
         visiting = [s for s in bg if s.bg_reason == "refresh"]
+        orig_viewed = {o.index for o in viewed_orig}
         cands = sorted((s for s in cams if s.viewers == 0 and s.bg_reason != "refresh"
+                        and s.index not in orig_viewed
                         and self.block_until.get(s.index, 0.0) <= now), key=rank)
         want = cands[:max(0, budget - len(visiting))]
 
         # 4. demand: viewed cameras need slots -> demote the least useful background
         #    streams NOW (refresh visits first, then the lowest ranked)
-        excess = len(bg) - budget
+        excess = len(bg) + len(orig_idle) - budget
+        if excess > 0 and orig_idle:
+            for o in sorted(orig_idle, key=lambda o: o.slot_priority())[:excess]:
+                o.stop_bg("POOL_DEMOTION: slot needed by a viewed camera")
+                self._note(f"{nvr} {o.label} released (0 viewers; slot needed by a viewed camera)")
+            return
         if excess > 0:
-            # streams that are not live yet cost nothing to drop: they go before live ones
-            rest = [s for s in bg if s.bg_reason != "refresh"]
+            # streams that are not live yet cost nothing to drop: they go before live ones.
+            # The Standard stream of a camera watched in Original goes last (it is that
+            # tile's picture until its Original runs) -- the next Original's own first.
+            twins = {o.index for o in viewed_orig}
+            rest = [s for s in bg if s.bg_reason != "refresh" and s.index not in twins]
+            tw = [s for s in bg if s.bg_reason != "refresh" and s.index in twins]
             order = (visiting + sorted((s for s in rest if s.live_since is None), key=rank, reverse=True)
-                     + sorted((s for s in rest if s.live_since is not None), key=rank, reverse=True))
+                     + sorted((s for s in rest if s.live_since is not None), key=rank, reverse=True)
+                     + [s for s in tw if nxt is not None and s.index == nxt.index]
+                     + sorted((s for s in tw if nxt is None or s.index != nxt.index), key=rank, reverse=True))
             for s in order[:excess]:
                 self._demote(s, "slot needed by a viewed camera")
             return                                     # rebalance once the slots are free
 
+        # no background promotion or swap while Original viewers are still taking over
+        # slots: a slot freed for the background would go to the next Original in line
+        # (higher priority) and break the one-at-a-time order
+        if waiting or connecting:
+            return
+
         # 5. fill free background slots, paced (controlled warm-up)
         starting = sum(1 for s in bg if s.live_since is None)
-        free = budget - len(bg)
+        free = budget - len(bg) - len(orig_idle)
         missing = [s for s in want if not (s._bg and s._running)]
         if free > 0 and missing:
             if starting < WARM_CONCURRENCY and now - self.last_start[nvr] >= WARM_STEP_S:
@@ -1312,22 +1950,23 @@ def reaper():
     while True:
         time.sleep(5)
         now = time.time()
-        for s in STREAMS:
+        for s in STREAMS + ORIG_STREAMS:
             with s._vlock:
                 leaked = s._running and s.viewers <= 0 and not s._bg
                 stale  = now - s.last_use > IDLE_TIMEOUT
             if leaked and stale:
-                s.force_stop()
+                s.force_stop("REAPER (no viewer, handler gone)")
         with _ACTIVE_LOCK:
             owners = [(k, i) for k, o in NVR_OWNERS.items() for i in o]
         suspect = {key: n for key, n in suspect.items() if key in owners}
         for k, i in owners:
-            if STREAMS[i].viewers == 0 and not STREAMS[i]._bg:
+            w = _worker_by_key(i)
+            if w.viewers == 0 and not w._bg:
                 # 3 checks (10-15 s): a stalled read may legitimately hold a slot
                 # for up to READ_TIMEOUT after the viewer left before it notices.
                 suspect[(k, i)] = suspect.get((k, i), 0) + 1
                 if suspect[(k, i)] == 3:
-                    ev(f"[{k.upper()}] SLOT LEAK? cam{i + 1} holds a slot with 0 viewers. {_slot_report(k)}")
+                    ev(f"[{k.upper()}] SLOT LEAK? {w.label} holds a slot with 0 viewers. {_slot_report(k)}")
             else:
                 suspect.pop((k, i), None)
 
@@ -1349,17 +1988,27 @@ def system_status():
             "hot": sum(tiers[s.index] == "HOT" for s in mine),
             "background": sum(1 for s in mine if s.viewers == 0 and s._bg and s._running),
             "viewedCameras": sum(1 for s in mine if s.viewers > 0),
+            "originalViewed": sum(1 for o in ORIG_STREAMS if o.info["nvr"] == k and o.viewers > 0),
+            "slotsText": f"{active[k]}/{NVR_CAP[k]}",
+            "slots": [{"slot": n + 1, "index": w.index, "camera": SETTINGS.display_name(w.index),
+                       "quality": w.quality.upper(), "viewers": w.viewers, "priority": w.slot_priority(),
+                       "priorityName": w.priority_name(), "pinned": w.pinned, "preemptable": w.viewers == 0,
+                       "state": w.vstate, "status": w.status, "slotAgeMs": round((now - t) * 1000),
+                       "lastFrameAgeMs": w.frame_age_ms()}
+                      for n, (w, t) in enumerate(sorted(((_worker_by_key(key), t) for key, t in owners[k].items()),
+                                                        key=lambda wt: wt[1]))],
             "waiting": len(waiters[k]),
-            "waitingCameras": [{"index": i, "name": STREAMS[i].name,
-                                "displayName": SETTINGS.display_name(i), "waitMs": round((now - t) * 1000)}
-                               for i, t in sorted(waiters[k].items())],
-            "owners": [{"index": i, "name": STREAMS[i].name, "displayName": SETTINGS.display_name(i),
-                        "viewers": STREAMS[i].viewers,
-                        "status": STREAMS[i].status, "heldMs": round((now - t) * 1000),
-                        "lastFrameAgeMs": STREAMS[i].frame_age_ms(),
-                        "role": STREAMS[i].role(),
-                        "suspectLeak": STREAMS[i].viewers == 0 and not STREAMS[i]._bg}
-                       for i, t in sorted(owners[k].items())],
+            "waitingCameras": [{"index": w.index, "quality": w.quality, "name": w.name,
+                                "displayName": SETTINGS.display_name(w.index), "waitMs": round((now - t) * 1000)}
+                               for w, t in ((_worker_by_key(key), t) for key, t in sorted(waiters[k].items()))],
+            "owners": [{"index": w.index, "quality": w.quality, "name": w.name,
+                        "displayName": SETTINGS.display_name(w.index),
+                        "viewers": w.viewers,
+                        "status": w.status, "heldMs": round((now - t) * 1000),
+                        "lastFrameAgeMs": w.frame_age_ms(),
+                        "role": w.role(),
+                        "suspectLeak": w.viewers == 0 and not w._bg}
+                       for w, t in ((_worker_by_key(key), t) for key, t in sorted(owners[k].items()))],
             "preflightActive": pf_active[k], "preflightMax": PREFLIGHT_PER_NVR,
             "reachable": (h.reachable if h is not None and h.checked else None),
             "monitor": (h.label if h is not None else None),
@@ -1370,6 +2019,7 @@ def system_status():
     cams = [s.diag(now, owners, waiters, pos[s.index]) for s in STREAMS]
     for c in cams:
         c["backgroundRetryInS"] = round(POOL.blocked_for(c["index"], now)) or None
+        c["original"] = ORIG_STREAMS[c["index"]].quality_info(now, owners)
     config = {"nvrMaxConn": NVR_MAX_CONN, "nvrCaps": dict(NVR_CAP), "connectMax": CONNECT_MAX,
               "preflight": PREFLIGHT_ENABLED, "preflightTimeoutMs": PREFLIGHT_TIMEOUT_MS,
               "preflightPerNvr": PREFLIGHT_PER_NVR, "openTimeoutMs": OPEN_TIMEOUT_MS,
@@ -1379,10 +2029,28 @@ def system_status():
               "cacheMaxAgeS": CACHE_MAX_AGE_S, "recentS": RECENT_S,
               "warmConcurrency": WARM_CONCURRENCY, "warmStepS": WARM_STEP_S,
               "minBackgroundHotS": MIN_BG_HOT_S, "backgroundSwapS": BG_SWAP_S,
-              "deadRetryS": DEAD_RETRY_S, "refreshEveryS": REFRESH_EVERY_S, "refreshIdleS": REFRESH_IDLE_S}
+              "deadRetryS": DEAD_RETRY_S, "refreshEveryS": REFRESH_EVERY_S, "refreshIdleS": REFRESH_IDLE_S,
+              "standard": {"subtype": STANDARD_SUBTYPE, "output": f"{STREAM_W}x{STREAM_H}",
+                           "jpegQuality": JPEG_QUALITY, "fps": STREAM_FPS},
+              "original": {"subtype": ORIGINAL_SUBTYPE, "output": "source size" if not ORIGINAL_MAX_W
+                           else f"max width {ORIGINAL_MAX_W}",
+                           "gridOnlyMaxWidth": ORIGINAL_GRID_MAX_W or "source size",
+                           "jpegQuality": ORIGINAL_JPEG_QUALITY,
+                           "fps": ORIGINAL_FPS, "gridFps": "as asked by the page (6)",
+                           "fallback": "Standard, labelled, only while the main stream fails"}}
     pool = {"enabled": PERSISTENT, "running": POOL.running, "ticks": POOL.ticks,
             "recentDecisions": list(POOL.events)[-15:]}
     return {"nvrs": nvrs, "cameras": cams, "config": config, "pool": pool}
+
+
+def stream_info(i):
+    """Credential-free quality state of ONE camera (the fullscreen indicator polls it)."""
+    now = time.monotonic()
+    with _ACTIVE_LOCK:
+        owners = {k: dict(v) for k, v in NVR_OWNERS.items()}
+    std, orig = STREAMS[i], ORIG_STREAMS[i]
+    return {"index": i, "displayName": SETTINGS.display_name(i),
+            "standard": std.quality_info(now, owners), "original": orig.quality_info(now, owners)}
 
 
 def cameras_for_ui():
@@ -1433,6 +2101,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(SETTINGS.snapshot()).encode(), "application/json")
         elif path == "/api/status":
             self._send(200, json.dumps(system_status()).encode(), "application/json")
+        elif path.startswith("/api/stream-info/"):
+            i = self._index(path, "/api/stream-info/")
+            if i is None:
+                self._send(404, b"bad camera", "text/plain")
+            else:
+                self._send(200, json.dumps(stream_info(i)).encode(), "application/json")
         elif path.startswith("/snapshot/"):
             self._snapshot(path)
         elif path.startswith("/stream/"):
@@ -1531,10 +2205,18 @@ class Handler(BaseHTTPRequestHandler):
             fps = int((query or {}).get("fps", [STREAM_FPS])[0])
         except (TypeError, ValueError):
             fps = STREAM_FPS
-        fps = max(1, min(STREAM_FPS, fps))
         # ?prio=full: the single-camera (fullscreen) view -- first in line for an NVR slot
         full = (query or {}).get("prio", [""])[0] == "full"
+        # ?quality=original: the camera's MAIN stream (default / anything else: Standard)
+        if (query or {}).get("quality", [""])[0] == "original":
+            try:
+                ofps = int((query or {}).get("fps", [ORIGINAL_FPS])[0])
+            except (TypeError, ValueError):
+                ofps = ORIGINAL_FPS
+            return self._stream_original(i, max(1, min(ORIGINAL_FPS, ofps)), full)
+        fps = max(1, min(STREAM_FPS, fps))
         cam = STREAMS[i]
+        ORIG_STREAMS[i].hold_for_handoff()       # Original -> Standard: bridge until live
         n = cam.add_viewer(full=full)
         ev(f"[{cam.label}] HTTP viewer connected (viewers {n - 1} -> {n}){' [fullscreen]' if full else ''}")
         t_conn = time.monotonic()
@@ -1568,6 +2250,86 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             n = cam.remove_viewer(full=full)
             ev(f"[{cam.label}] HTTP viewer disconnected (viewers {n + 1} -> {n})")
+
+    def _part(self, jpg, state):
+        # X-Frame-State (live|standard|cached|status) lets tools measure what a viewer
+        # actually saw; browsers ignore unknown part headers
+        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n"
+                         b"Content-Length: " + str(len(jpg)).encode() +
+                         b"\r\nX-Frame-State: " + state.encode() +
+                         b"\r\n\r\n" + jpg + b"\r\n")
+
+    def _stream_original(self, i, fps, full):
+        """MJPEG of camera i's MAIN stream (Original mode). One Original worker per
+        camera, shared by every Original viewer. Until its first Original frame
+        arrives, the viewer keeps seeing the camera's Standard picture with a small
+        "STANDARD / switching to Original" label (never a blank tile). If the main
+        stream FAILS, the viewer is given the Standard stream -- labelled "Original
+        unavailable" -- and is switched to Original by itself as soon as the main
+        stream works. Waiting for an NVR slot is labelled as such (no fallback: the
+        Standard stream would need the same slot).
+        Only NEW pictures are written (a full-resolution JPEG is large): at most `fps`
+        per second, and the last one again after 1 s without a new one -- that write
+        is also how a closed connection is noticed."""
+        orig, std = ORIG_STREAMS[i], STREAMS[i]
+        std.hold_for_handoff()                   # Standard -> Original: bridge until live
+        n = orig.add_viewer(full=full, fps=fps)
+        ev(f"[{orig.label}] HTTP viewer connected (viewers {n - 1} -> {n}){' [fullscreen]' if full else ''}")
+        t_conn = time.monotonic()
+        sent_live = False
+        fallback = False                     # this viewer also holds a Standard viewer (main stream failed)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            gap = 0.85 / fps                     # min time between two parts (cap at ~fps)
+            last, t_last = None, 0.0
+            while True:
+                orig.last_use = std.last_use = time.time()
+                jpg, state = orig.frame_for_viewer()
+                if state == "live":
+                    if fallback:                 # Original works now: drop the Standard stand-in
+                        std.remove_viewer(full=full)
+                        fallback = False
+                        with orig._vlock:
+                            orig.fallback_viewers -= 1
+                        ev(f"[{orig.label}] Original is live again -- Standard fallback released")
+                    if not sent_live:
+                        sent_live = True
+                        orig.first_http_ms = _ms(t_conn)
+                        ev(f"[{orig.label}] first Original frame sent to viewer {orig.first_http_ms} ms after it connected")
+                else:
+                    unavailable = orig.unavailable()
+                    if unavailable and not fallback:
+                        std.add_viewer(full=full)
+                        fallback = True
+                        with orig._vlock:
+                            orig.fallback_viewers += 1
+                        ev(f"[{orig.label}] Original unavailable ({orig.status}) -- showing Standard")
+                    detail = ("Original unavailable" if unavailable else
+                              "Original waiting for NVR slot" if orig.status == S_WAIT_SLOT else
+                              "switching to Original...")
+                    lab = std.labelled_view("STANDARD", detail)
+                    if lab is not None:
+                        jpg, state = lab, "standard"
+                    # else: orig.frame_for_viewer() above already gave the freshest picture
+                    # of either quality, stamped CACHED with the ORIGINAL stream's own state
+                now = time.monotonic()
+                if jpg and ((jpg is not last and now - t_last >= gap) or now - t_last >= 1.0):
+                    self._part(jpg, state)
+                    last, t_last = jpg, now
+                time.sleep(0.02)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
+        finally:
+            n = orig.remove_viewer(full=full, fps=fps)
+            if fallback:
+                std.remove_viewer(full=full)
+                with orig._vlock:
+                    orig.fallback_viewers -= 1
+            ev(f"[{orig.label}] HTTP viewer disconnected (viewers {n + 1} -> {n})")
 
     def _send(self, code, body, ctype):
         self.send_response(code)
@@ -1624,6 +2386,7 @@ def main():
     resolve_nvr_ips()
     MONITOR.start()
     threading.Thread(target=reaper, daemon=True).start()
+    _ensure_housekeeping()                        # stall watchdog + switch bridges
     if PREFLIGHT_ENABLED:
         confirm_credentials()
     print(f"\n{len(CAMERAS)} cameras ready on port {PORT}. Open:")
@@ -1650,8 +2413,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        for s in STREAMS:
-            s.force_stop()
+        for s in STREAMS + ORIG_STREAMS:
+            s.force_stop("SHUTDOWN")
 
 
 if __name__ == "__main__":

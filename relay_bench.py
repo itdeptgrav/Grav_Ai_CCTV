@@ -30,12 +30,14 @@ import argparse
 import threading
 import subprocess
 import http.client
+import urllib.error
 import urllib.parse
 import urllib.request
 
 KNOWN_DEAD = {("nvr2", 7), ("nvr2", 12), ("nvr2", 13), ("nvr1", 10)}   # proven by diag_cctv.py
 PER = 6
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) relay-bench"
+ORIGIN_DOWN = {502, 503, 504, 521, 522, 523, 530}   # proxy/tunnel up, server behind it down
 
 
 class Api:
@@ -69,11 +71,16 @@ class Api:
 class Viewer(threading.Thread):
     """One MJPEG <img>: records every part's arrival time and X-Frame-State."""
 
-    def __init__(self, api, index, prio=None):
+    def __init__(self, api, index, prio=None, quality=None, fps=None, keep=False):
         super().__init__(daemon=True)
         self.api, self.index = api, index
-        self.path = f"/stream/{index}" + api.q("prio=full" if prio == "full" else "")
+        extra = (["prio=full"] if prio == "full" else []) + \
+                (["quality=original"] if quality == "original" else []) + ([f"fps={fps}"] if fps else [])
+        self.path = f"/stream/{index}" + api.q("&".join(extra))
         self.parts = []                     # (ms since request, state or None)
+        self.sizes = []                     # JPEG bytes of each part (bandwidth)
+        self.keep = keep
+        self.last = {}                      # state -> latest JPEG of that state (keep=True)
         self.sock = None
         self.stop = False
         self.error = None
@@ -106,7 +113,11 @@ class Viewer(threading.Thread):
                     if len(buf) < j + 4 + n:
                         break
                     st = re.search(r"X-Frame-State:\s*(\w+)", hdr, re.I)
-                    self.parts.append((round((time.monotonic() - self.t0) * 1000), st.group(1) if st else None))
+                    state = st.group(1) if st else None
+                    self.parts.append((round((time.monotonic() - self.t0) * 1000), state))
+                    self.sizes.append(n)
+                    if self.keep:
+                        self.last[state] = bytes(buf[j + 4:j + 4 + n])
                     buf = buf[j + 4 + n:]
                 chunk = s.recv(65536)
                 if not chunk:
@@ -133,6 +144,17 @@ class Viewer(threading.Thread):
 
     def has_states(self):
         return any(st is not None for _, st in self.parts)
+
+    def now_ms(self):
+        return (time.monotonic() - self.t0) * 1000 if self.t0 else 0.0
+
+    def window(self, t_from_ms, t_to_ms, state="live"):
+        """Parts of `state` received in [t_from, t_to) ms -> delivered fps, kbit/s, avg KB."""
+        sel = [n for (ms, st), n in zip(list(self.parts), list(self.sizes))
+               if st == state and t_from_ms <= ms < t_to_ms]
+        secs = max(1e-3, (t_to_ms - t_from_ms) / 1000)
+        return {"fps": round(len(sel) / secs, 1), "kbps": round(sum(sel) * 8 / secs / 1000),
+                "avgKB": round(sum(sel) / len(sel) / 1024, 1) if sel else None}
 
 
 BUSY = {"why": None}          # set when a guarded server gets busy DURING a scenario
@@ -177,6 +199,12 @@ def guard_check():
         try:
             req = urllib.request.Request(u, headers={"User-Agent": UA})
             d = json.load(urllib.request.urlopen(req, timeout=10))
+        except urllib.error.HTTPError as e:
+            # RELAY_GUARD_DOWN_OK=1: a proxy answering "origin down" (e.g. Cloudflare 502)
+            # means that server is not running -- it holds no NVR stream
+            if e.code in ORIGIN_DOWN and os.environ.get("RELAY_GUARD_DOWN_OK") == "1":
+                continue
+            return f"guard {host} unreadable (HTTP {e.code})"
         except Exception as e:
             return f"guard {host} unreadable ({type(e).__name__})"
         busy = {k: v["active"] for k, v in d["nvrs"].items() if v["active"]}

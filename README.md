@@ -19,8 +19,10 @@ It is independent of the CMS and of `D:\Ai_cctv` (the original dev copy).
 | `nvr_config.py` | Camera list + NVR endpoints (from env) |
 | `netcheck.py` | Reachability probes (cross-platform) |
 | `relay_bench.py` | Viewer-experience benchmark against a running server |
+| `quality_bench.py` | Standard vs Original benchmark (resolution, fps, bandwidth, CPU) |
+| `stability_bench.py` | Long viewing test: records every LIVE/CACHED change, client and server side |
 | `nvr_capacity_probe.py` | SUPERVISED NVR capacity / direct-camera test (see its .txt) |
-| `test_*.py` | Offline tests (no NVR needed): lifecycle, slots, settings, relay |
+| `test_*.py` | Offline tests (no NVR needed): lifecycle, slots, settings, relay, quality, live stability |
 | `requirements.txt` | `opencv-python`, `numpy`, `python-dotenv` |
 | `.env.example` | Copy to `.env` and edit |
 | `run.sh` / `run.bat` | One-command run (creates venv, installs, starts) |
@@ -62,6 +64,60 @@ camera's tier (HOT / CONNECTING / WARM / COLD / OFFLINE) and role.
 * `python relay_bench.py --port 8000 --key <CCTV_TOKEN>` measures what a viewer
   experiences (first image, first live frame, upstream connections).
 * Details and measurements: `FINAL_CCTV_RELAY_REPORT.txt`.
+
+## Video quality: Standard / Original
+The header has a `[ Standard | Original ]` switch (also in the fullscreen bar; key `Q`).
+
+* **Standard** (default -- also for every new browser): the NVR sub-stream
+  (`subtype=1`) resized to 640x360, JPEG 70, 8 fps. Light; this is what the
+  persistent pool keeps HOT.
+* **Original**: the camera's main stream (`subtype=0`; verified 2560x1440 on both
+  NVRs), never upscaled, JPEG 90. Fullscreen: the full source picture, up to 12 fps.
+  Grid tiles: 6 fps, at most 1280 px wide (`CCTV_ORIGINAL_GRID_MAX_W`; a tile is
+  never displayed larger).
+* The choice is remembered per browser (localStorage), not server-wide. Settings
+  page previews always stay Standard.
+* Only cameras on screen use Original: one Original worker per camera, shared by
+  every browser, stopped when the last Original viewer leaves (never kept in the
+  background). Original streams count toward the per-NVR cap; fullscreen Original
+  goes first, and nothing that is being watched is stopped to make room. A page
+  switched to Original changes tile by tile -- the other tiles keep their live
+  Standard picture until their turn.
+* While Original starts, a tile shows the Standard picture labelled `STANDARD -
+  switching to Original...`. If the main stream fails, it shows Standard labelled
+  `Original unavailable` (fullscreen: "Original unavailable -- showing Standard")
+  and switches to Original by itself when the main stream works. Waiting for an NVR
+  slot is shown as such. Standard is never passed off as Original.
+* Cost, measured 2026-09-25: a full-size Original tile (2560x1440, q90, 6 fps) is
+  400-720 KB per frame = 19-36 Mbps to the browser and about 0.9 CPU core (4 MP
+  decode), against 1.3-1.9 Mbps for Standard. Use Original mainly in fullscreen.
+* `GET /api/stream-info/<index>`: both qualities of one camera (subtype, source and
+  output size, fps, JPEG quality, slot, fallback) -- no credentials.
+* `python quality_bench.py --port 8000 --key <CCTV_TOKEN>` measures both modes.
+* Details: `FINAL_CCTV_QUALITY_MODE_REPORT.txt`.
+
+## Live-stream stability and diagnostics
+* A camera someone is watching is never taken off its NVR slot: only streams with no
+  viewer (background, recently viewed, cache refresh, a finished quality switch, a
+  lingering Original) can be preempted. Slot priorities: `FULLSCREEN_ORIGINAL` 100,
+  `FULLSCREEN_STANDARD` 90, `GRID_ORIGINAL` 82, `GRID_STANDARD` 80, then the 0-viewer
+  roles (`HANDOFF` 40, `RECENT` 30, `LINGER` 25, `BACKGROUND_WARM` 20,
+  `CACHE_REFRESH` 10). A fullscreen view is *pinned*.
+* Standard <-> Original switches are make-before-break: the old stream keeps running
+  until the new one is live, then it is released (no duplicate upstream).
+* Every state change of a stream is logged with its exact reason, e.g.
+  `[Cam 20 NVR1 Cam 9] LIVE -> STALLED reason=NO_FRAME_AGE_2515MS (connection open,
+  waiting for data from the NVR/network ...)`, `STALLED -> RECONNECTING
+  reason=READ_TIMEOUT`, `RECONNECTING -> LIVE reason=RECONNECTED`,
+  `LIVE -> WARM reason=POOL_DEMOTION`. Every slot taken / released is logged too.
+* `/api/status`: per NVR `slotsText` ("6/6") and a `slots` table (camera, quality,
+  viewers, priority, pinned, state, slot age); per camera and quality: `state`,
+  `priorityName`, `pinned`, `slotAgeMs`, `reconnectCount`, `dropReasons`, `stalls`,
+  `maxFrameGapMs`, `cachedReason`, `lastTransitionReason` and the last transitions.
+* `python stability_bench.py --base <url> --key <K> --page 1 --minutes 10` watches
+  like a browser and records every LIVE/CACHED change on both sides. When only the
+  client side shows gaps (server says LIVE, 0 reconnects), the network between the
+  server and that browser is the cause.
 
 ## Run it as a service (Linux, systemd)
 Create `/etc/systemd/system/grav-cctv.service`:

@@ -1,0 +1,366 @@
+FINAL CCTV VIDEO QUALITY MODE REPORT  (Standard / Original)
+Project : D:\GRAV_Project\grav-cctv          Date: 2026-09-25
+Legend  : PASS = verified   FAIL = verified broken   NOT TESTED = not verified (reason given)
+Each result says HOW it was verified: "real" = real cameras/NVRs, "offline" = automated
+tests with stubbed OpenCV, "synthetic" = a test server with synthetic video (no NVR).
+
+==========================================================================================
+SUMMARY
+==========================================================================================
+* Header switch [ Standard | Original ]; Standard is the default (also for any new
+  browser); the choice is remembered per browser (localStorage), never server-wide.
+* Original = the NVR MAIN stream (subtype=0). VERIFIED on the real cameras, not
+  guessed: every healthy camera opened in Original delivered 2560x1440 (4 MP) frames,
+  while Standard (subtype=1) is 1280x720 on NVR2 and only 352x288 on NVR1, sent as
+  640x360. That 352x288 is why NVR1 cameras (e.g. "Corridor office", NVR1 ch14)
+  looked soft in fullscreen: Original has 36x the pixels there.
+* Visual proof with real frames of the same camera, 1-6 s apart:
+    data\quality-test\COMPARISON_nvr1ch3_standard_vs_original.jpg
+    data\quality-test\COMPARISON_nvr1ch5_standard_vs_original.jpg
+  (data\ is gitignored -- these images never go to GitHub)
+* Cost, measured on real cameras: a full-size Original tile is 400-720 KB per frame
+  = 19-36 Mbps to the browser at 6 fps and ~0.9 CPU core; Standard is 19-30 KB per
+  frame = 1.3-1.9 Mbps and ~0.18-0.26 core. => Original is meant mainly for
+  fullscreen. Grid tiles in Original now get the main-stream picture scaled DOWN to
+  1280 px wide (never up); fullscreen always gets the full 2560x1440.
+* Automated tests: 281 checks, all PASS (5 suites). No worker/slot leak, per-NVR
+  cap never exceeded in any test.
+* Measurement safety: in this phase NO new NVR connection was opened by me. Real data
+  came from (a) the status APIs of the running servers and (b) extra viewers attached
+  to streams that were ALREADY running (shared workers -> zero extra NVR load).
+
+!! Operational findings you should read (details in 14 and 20):
+   - Production (cctv.grav.in) now runs the persistent relay and keeps 6 streams per
+     NVR open 24/7. It does NOT have this quality mode yet (needs deploy).
+   - Your laptop server (started 23:04) was tested in Original at the same time: its
+     main streams came ON TOP of production's 6 -> NVR2 had 11 streams from our two
+     servers at 23:06, NVR1 had 11 at 23:22. Each server only sees its own cap.
+   - The laptop reaches the NVRs via the office PUBLIC IP, so its main streams used the
+     office internet uplink; at 23:09 the laptop saw NVR2 as "unreachable" for ~20 s
+     while pulling 5-6 main streams. Production (on the LAN) was unaffected.
+
+==========================================================================================
+1. FILES CHANGED                                                          PASS
+==========================================================================================
+Uncommitted, on top of your commits c548d36 / 8d90740 (relay):
+  server.py        quality workers (one Original worker per camera, main-stream URL,
+                   slot key 1000+index, priorities), /stream/<i>?quality=original handler
+                   (stand-in, fallback, new-frames-only sending), per-viewer fps, grid
+                   width cap, pool: Original take-over one slot at a time, status fields,
+                   new GET /api/stream-info/<i>
+  grid_page.py     [Standard | Original] switch in the header + fullscreen bar, key Q,
+                   localStorage, Original URLs, fullscreen quality pill
+  test_quality.py  NEW - 60 offline checks (list in 19)
+  quality_bench.py NEW - benchmark against a running server (probe / single / share /
+                   toggle / grid6 / fallback), guarded like relay_bench
+  relay_bench.py   Viewer: quality / fps / frame capture / byte windows; guard option
+                   RELAY_GUARD_DOWN_OK
+  README.md, .env.example   quality settings documented (the SSO line in .env.example
+                   was not touched -- it still holds the leaked secret, see end)
+  data\quality-test\ (gitignored) real frames + 2 comparison sheets
+Not changed: settings_page.py (previews stay Standard), nvr_config.py (make_url already
+takes subtype), camera_settings.py, netcheck.py, rtsp_preflight.py, the older tests.
+py_compile OK: server.py nvr_config.py netcheck.py grid_page.py settings_page.py
+ui_theme.py relay_bench.py quality_bench.py
+
+==========================================================================================
+2. UI CONTROL ADDED                                                       PASS (synthetic)
+==========================================================================================
+* Compact segmented control [ Standard | Original ] in the top header, right of the
+  clock, just before the fullscreen icon and Settings. Same control in the fullscreen
+  top bar. Keyboard: Q toggles (grid and fullscreen).
+* Selected option is obvious: Standard selected = raised dark pill; Original selected =
+  the accent blue. Tooltips: "Standard - faster, lower bandwidth (Q)" and
+  "Original - full camera quality, higher bandwidth (Q)".
+* Phones: short labels "Std | Orig" (portrait: header control only).
+* Fullscreen quality pill (tiles stay uncluttered): "ORIGINAL - 2560x1440",
+  "ORIGINAL - starting...", "ORIGINAL - waiting for NVR slot" (amber),
+  "Original unavailable - showing Standard" (amber), "STANDARD - 1280x720".
+* Browser check (synthetic server): click Original -> both switches update, stored
+  'original', all 6 tile URLs became ?quality=original&fps=6; fullscreen used
+  ?quality=original&prio=full and showed the pill; Q in fullscreen -> Standard pill,
+  Q again -> Original; Esc -> tiles resumed in Original; no tile streamed the
+  fullscreen camera a second time.
+
+==========================================================================================
+3. DEFAULT MODE                                                           PASS (synthetic + offline)
+==========================================================================================
+Standard. The page starts with quality='standard' and only switches if this browser
+stored 'original' itself (localStorage key cctv-quality). Verified: fresh browser
+(nothing stored) -> Standard selected, plain /stream/<i> URLs. /stream/<i> without
+?quality -> the Standard worker (offline test). Settings page previews never ask for
+Original (offline test: no "quality" in the settings page).
+
+==========================================================================================
+4. STANDARD SOURCE STREAM                                                 PASS (real)
+==========================================================================================
+NVR sub-stream, subtype=1 (CCTV_STANDARD_SUBTYPE). Unchanged optimized path: resize to
+640x360, JPEG 70, 8 fps while watched / 1 fps for HOT background, encoded once and
+shared, cached last frame, persistent pool. Real: NVR2 = 1280x720 H.265, NVR1 =
+352x288 H.264 (from both servers' status; codec from the earlier diagnostics).
+
+==========================================================================================
+5. ORIGINAL SOURCE STREAM                                                 PASS (real)
+==========================================================================================
+NVR main stream, subtype=0 (CCTV_ORIGINAL_SUBTYPE), in its own worker per camera
+("Cam N <name> [Original]"), separate viewers, cache, status and NVR slot key
+(1000 + index). Only started for a camera someone watches in Original; stopped when the
+last Original viewer leaves (never kept in the background). Real: 2560x1440 (item 8).
+
+==========================================================================================
+6. EXACT SUBTYPE / PATH BEHAVIOR                                          PASS (real)
+==========================================================================================
+URL (nvr_config.make_url, credentials never logged or returned by any API):
+    rtsp://<user>:<pass>@<host>:<port>/cam/realmonitor?channel=<N>&subtype=<S>
+    S=1 -> Standard, S=0 -> Original. The RTSP pre-flight (DESCRIBE) uses the same S.
+Not guessed: the first decoded frame of every Original worker is logged
+    "[Cam N ... [Original]] original: source 2560x1440 (subtype=0) -> output ..."
+and reported in /api/status and /api/stream-info as subtype + sourceSize. On the same
+channels subtype=1 reported 1280x720 (NVR2) / 352x288 (NVR1), so subtype=0 is really
+the higher-quality main stream on BOTH NVRs.
+
+==========================================================================================
+7. STANDARD SOURCE RESOLUTION                                             PASS (real)
+==========================================================================================
+  NVR2 sub-stream: 1280x720  -> output 640x360
+  NVR1 sub-stream:  352x288  -> output 640x360 (4:3 CIF stretched to 16:9)
+
+==========================================================================================
+8. ORIGINAL SOURCE RESOLUTION                                             PASS (real)
+==========================================================================================
+  2560x1440 (4 MP) on every camera opened in Original:
+    NVR2 ch1, ch2, ch3, ch4, ch5, ch6, ch8, ch9, ch10, ch11  (all 10 healthy NVR2 cameras)
+    NVR1 ch3, ch4, ch5, ch6, ch7, ch8, ch9, ch11, ch12, ch14 (NVR1 ch13 not seen)
+  Dead channels (NVR2 ch7/12/13, NVR1 ch10) have no video in either stream.
+Output:
+  fullscreen viewer      -> 2560x1440, the untouched source picture (real: PASS)
+  grid tiles only        -> scaled DOWN to 1280x720 (CCTV_ORIGINAL_GRID_MAX_W=1280;
+                            0 = full size in the grid too). Never upscaled.
+                            (offline PASS; not yet seen on a real camera because your
+                            laptop server was started before this change)
+Nothing is ever upscaled; the Standard 640x360 picture is never passed off as Original.
+
+==========================================================================================
+9. JPEG QUALITY SETTINGS                                                  PASS (real + offline)
+==========================================================================================
+  Standard 70 (unchanged)     real: 19-30 KB per 640x360 frame
+  Original 90                 real: 376-812 KB per 2560x1440 frame (scene dependent)
+  CCTV_ORIGINAL_JPEG_QUALITY, clamped to 50..95 -- never 100.
+  (Grid tiles at 1280x720 q90: estimated ~100-200 KB per frame; not measured on real.)
+
+==========================================================================================
+10. FPS SETTINGS                                                          PASS (real grid) / fullscreen NOT TESTED on real
+==========================================================================================
+  Standard  8 fps watched, 1 fps HOT background (unchanged). Real delivered 7.7-8.3 fps.
+  Original  the worker publishes as fast as its fastest viewer asks:
+              fullscreen 12 fps (CCTV_ORIGINAL_FPS)   -> offline PASS, real NOT TESTED
+              grid tiles  6 fps (the page asks fps=6) -> real delivered 5.8-6.0 fps
+            Only NEW frames are sent (a 400-720 KB frame is never sent twice; one
+            repeat after 1 s without a new frame keeps dead connections detectable).
+  Why these values: at full size one frame is 400-720 KB, so 12 fps is already
+  38-69 Mbps; detail matters more than frame rate (your spec 18).
+
+==========================================================================================
+11. QUALITY SWITCH BEHAVIOR (tests A-F)
+==========================================================================================
+A. Start Standard -> fast normal video                          PASS (real)
+   Production, HOT cameras: live at once, 7.7-8.3 fps, 1.3-1.9 Mbps.
+B. Standard -> Original                                          PASS (offline + synthetic)
+   The page only swaps the image URL: the browser keeps showing the current picture;
+   the server sends the camera's LIVE Standard picture with a small label
+   "STANDARD - switching to Original..." (or its last cached frame, stamped CACHED,
+   if Standard is not running) until the first Original frame, then Original.
+   Browser check: the image never went blank (naturalWidth stayed > 0 during the switch).
+   Real time-to-first-Original-frame: NOT TESTED by me (your own session went live).
+C. Original -> Standard                                          PASS (offline + synthetic)
+   Persistent mode keeps the camera's Standard stream HOT meanwhile -> instant, no
+   reconnect. Original worker stops when its last viewer leaves.
+D. Toggle 10x                                                    PASS (offline + synthetic)
+   Offline: no worker left, no viewer left, no Original slot held, never two captures
+   of the same stream. Synthetic server: 5 switches to Original = 5 main-stream opens,
+   afterwards Original running=False, 0 viewers, all NVR slots back to Standard.
+   Real: NOT TESTED (would need repeated main-stream connections on a shared NVR).
+E. Fullscreen Standard -> Original, real quality improvement     PASS (real frames)
+   Same camera, 1-6 s apart: 352x288 sub-stream vs 2560x1440 main stream -- cabinet
+   sticker text, floor marks, the hook's thin rod, paving bricks, pipes and paper edges
+   are clearly visible only in Original (comparison sheets in the summary).
+F. Page switch in Original                                       PASS (offline) / observed real
+   Offline: a page of 6 switched to Original changes tile by tile -- never 2 main
+   streams connecting at once, the waiting tiles keep their live Standard picture,
+   no fallback while merely waiting, cap respected.
+   Real (your own session 23:06-23:22, observed via status only): leaving a page
+   stopped its Original workers (0 viewers, Idle), the next page's started; healthy
+   cameras went live at 2560x1440; dead channels showed "Camera offline".
+   Synthetic timing: a full NVR2 page took ~29 s until the 6th tile was Original
+   (opens are serialized, CCTV_CONNECT_MAX=1, ~4.3 s each on NVR2).
+
+==========================================================================================
+12. FULLSCREEN RESULT                                                     PASS (real frames + synthetic)
+==========================================================================================
+Fullscreen asks ?quality=original&prio=full: highest slot priority, full 2560x1440
+source picture, up to 12 fps, pill "ORIGINAL - 2560x1440". The grid tiles are stopped
+while in fullscreen (no second stream of the same camera). Real picture quality: see
+item 11E. A real fullscreen session (fps/latency at 12 fps) was NOT TESTED by me.
+
+==========================================================================================
+13. FALLBACK BEHAVIOR                                                     PASS (offline) / real: observed on dead channels
+==========================================================================================
+* Only when the main stream FAILS (failed open / pre-flight / no frame, camera
+  offline, NVR down, login refused): the viewer gets the Standard stream with a burned-in
+  label "STANDARD - Original unavailable"; fullscreen pill "Original unavailable -
+  showing Standard". It is never marked as live Original. When the main stream works
+  again the viewer switches to Original by itself and the Standard stand-in is released.
+* NOT a fallback: waiting for an NVR slot (labelled "Original waiting for NVR slot";
+  a Standard stream would need the same slot) and a live stream that dropped and is
+  reconnecting (no extra Standard connection for a sub-second gap).
+  Bug found + fixed during testing: an earlier version fell back after 8 s of
+  waiting, which made a queued tile hold its Standard stream and block its own
+  Original slot; and it fell back on every short reconnect. Both covered by tests
+  now (the reconnect test was run against the old rule and fails there).
+* Real: dead channels in your session (NVR2 ch7/12/13, NVR1 ch10): Original failed ->
+  Standard stand-in -> also offline -> honest "Camera offline" card. A HEALTHY camera
+  whose main stream fails could not be forced safely: NOT TESTED on real.
+
+==========================================================================================
+14. NVR SLOT EFFECT                                                       PASS (offline) / real warning
+==========================================================================================
+* An Original stream is a normal NVR connection: it counts toward the same per-NVR
+  cap (6), and its slot is taken BEFORE connecting (strict cap).
+* Slot priority: Original fullscreen 5 > Original grid 4 > Standard fullscreen 3 >
+  Standard grid 2 > recently viewed 1 > background 0. Nothing that is being watched is
+  stopped to make room; the pool frees BACKGROUND slots, one Original at a time.
+  Background workers are always Standard; Original is never kept in the background.
+* If watched streams hold every slot, the Original waits and says so (pill + label).
+* Offline: peak 6/6 per NVR, cap never exceeded in any test.
+* REAL WARNING: the cap is per server. Production's persistent pool holds 6 per NVR
+  permanently, so anything else on the same NVRs comes on top. Observed via both status
+  APIs: 23:06 NVR2 = 6 (production) + 5 Original (laptop) = 11; 23:22 NVR1 = 6 + 5 = 11.
+  It worked, but it is beyond the verified-safe 6. Test on ONE server at a time.
+
+==========================================================================================
+15. WORKER SHARING RESULT                                                 PASS (real + offline)
+==========================================================================================
+Real (NVR1 ch5, Original already live in your browser): I attached a second viewer:
+viewers 1 -> 2 -> 1 while the worker's upstream "opens" stayed 1 -> ONE main-stream
+connection for two viewers, zero extra NVR load. Offline: 3 viewers -> 1 connection;
+grid tile + fullscreen of the same camera -> 1 connection.
+
+==========================================================================================
+16. CPU STANDARD                                                          PASS (measured earlier, path unchanged)
+==========================================================================================
+Real NVRs, this 16-core laptop (FINAL_CCTV_RELAY_REPORT.txt / performance report):
+6 NVR2 cameras watched at 8 fps: 157 % of one core with the original code (~26 % per
+camera), ~18 % per camera after the grab/retrieve optimization; RAM ~180 MB.
+The Standard path was not changed by this feature, so it was not re-measured.
+
+==========================================================================================
+17. CPU ORIGINAL                                                          PASS (3 tiles, real) / 1 fullscreen + 6 tiles NOT TESTED
+==========================================================================================
+Measured on your laptop server (Windows process counters, 20 s), 3 Original grid tiles
+at full size (2560x1440, q90, 6 fps each): 275 % of one core = ~0.9 core per tile
+(17 % of this 16-core machine), server RAM 312 MB, 40 threads.
+Most of it is DECODING every 4 MP frame at the camera's full frame rate (needed to keep
+the H.264/H.265 stream decodable), so it barely depends on the output fps.
+  1 Original fullscreen (12 fps): NOT TESTED  (estimate ~1-1.2 cores)
+  6 Original tiles on one NVR  : NOT TESTED  (projected ~5-5.5 cores; not safe to run
+                                   while production holds 6 slots per NVR)
+Production (Alienware) CPU is unknown -- check it before using grid-wide Original.
+
+==========================================================================================
+18. BANDWIDTH COMPARISON                                                  PASS (real) / partly estimated
+==========================================================================================
+Server -> browser (measured by a viewer, real cameras):
+  camera             Standard (640x360 q70)          Original tile (2560x1440 q90, 6 fps)
+  NVR2 ch1           28 KB, 7.9 fps, 1.85 Mbps       -
+  NVR1 ch3           19 KB, 8.3 fps, 1.32 Mbps       399 KB, 5.9 fps, 19.2 Mbps
+  NVR1 ch5           30 KB, 7.7 fps, 1.87 Mbps       600 KB, 6.0 fps, 29.5 Mbps
+  NVR2 ch9           -                               721 KB, 6.0 fps, 35.7 Mbps
+  NVR2 ch10          -                               538 KB, 5.8 fps, 25.7 Mbps
+  => Original full size = ~14-25x the data of Standard per frame.
+  Estimates (NOT measured): fullscreen Original at 12 fps = 38-72 Mbps per viewer;
+  grid tile with the 1280 px cap = ~5-9 Mbps (a 6-tile page ~30-55 Mbps instead of
+  ~120-200 Mbps). A slow link gets fewer fps automatically (the server always sends the
+  newest frame), not a growing delay.
+NVR -> server (RTSP): sub-stream ~0.3-1 Mbps (earlier diagnostics); main stream
+  ~3.8 Mbps each (laptop Wi-Fi receive counter with 3 main streams: 11.3 Mbps; rough).
+Through Cloudflare for remote viewers, the office upload is the limit: one full-size
+Original fullscreen viewer can need more than a typical office uplink.
+
+==========================================================================================
+19. AUTOMATED TEST RESULTS                                                PASS
+==========================================================================================
+  python -m py_compile server.py nvr_config.py netcheck.py (+ grid_page, settings_page,
+      ui_theme, relay_bench, quality_bench)                          OK
+  test_lifecycle.py        11 / 11 PASS
+  test_slots.py            59 / 59 PASS
+  test_camera_settings.py  86 / 86 PASS
+  test_relay.py            65 / 65 PASS
+  test_quality.py          60 / 60 PASS   (NEW)
+  Total 281 checks. test_quality covers: Standard worker identity + default, Original
+  worker identity (main stream, source size, no resize, JPEG 90), separate slot keys,
+  sharing (3 viewers -> 1 connection), 10x toggle cleanup (no worker/slot leak, never a
+  duplicate capture), Standard stand-in while Original starts, fallback on failure +
+  automatic recovery, no fallback on a short reconnect, page switch tile by tile,
+  waiting for a slot is said (no fallback), cap + priority (fullscreen Original first,
+  nothing watched stopped), fps follows viewers + new-frames-only sending, grid 1280 cap
+  vs fullscreen full size, status/API fields without credentials, UI strings, settings
+  previews stay Standard.
+
+==========================================================================================
+20. REAL CAMERA TEST                                                      PASS (what was run) -- see 21 for the rest
+==========================================================================================
+Method (safe by construction): I did NOT open any NVR connection in this phase.
+  * read /api/status and /api/stream-info of your running servers;
+  * attached one extra viewer only to streams that were ALREADY running (Original on
+    your laptop server, Standard in production's HOT pool) -- the capture tool refused
+    whenever the stream was not live, twice, rather than start a connection.
+Results: items 4-10, 11A/E/F, 13, 15, 17, 18 and the two comparison sheets.
+Context observed:
+  * Production has been running the persistent relay since ~21:03 (pool HOT on 6+6,
+    no reconnects), without the quality mode. cctv.grav.in answered 502 at ~22:28-22:35
+    (tunnel reachable, origin not answering) and was fine again at 23:04.
+  * Your laptop server (PID 25840, started 23:04:09) runs an intermediate version of
+    this feature: before the grid 1280 px cap and the reconnect-fallback fix.
+  * The laptop pulled 5-6 main streams through the office public IP; at 23:09 it saw
+    NVR2 as unreachable for ~20 s and several healthy cameras went "Retrying..." first.
+    Production (LAN) saw nothing. Likely the office uplink/port-forward saturating.
+
+==========================================================================================
+21. NOT TESTED                                                            NOT TESTED
+==========================================================================================
+  * Real fullscreen Original at 12 fps: delivered fps, latency, CPU.
+  * Real time from clicking Original to the first Original frame (per NVR).
+  * Real 10x toggle and real Original -> Standard switch timing (done offline/synthetic).
+  * Real failure of a HEALTHY camera's main stream (fallback + recovery; offline only).
+  * 6 Original tiles on one NVR on real cameras (CPU / bandwidth): not safe while
+    production holds 6 slots per NVR; projected ~5.5 cores and ~120-200 Mbps full size.
+  * The grid 1280 px cap on real cameras (your laptop server predates it).
+  * CPU on the production Alienware PC.
+  * Phones/tablets on a real device (layout checked in the desktop browser pane only).
+  * quality_bench.py "probe" (raw RTSP bitrate of subtype 0 vs 1) -- it opens its own
+    NVR connections, so it was not run.
+
+==========================================================================================
+NEXT STEPS / RECOMMENDATIONS
+==========================================================================================
+1. Deploy: commit + push, then on the Alienware (C:\GravServer\apps\cctv): stop
+   python server.py (not cloudflared), git pull origin main, start it again.
+   Restart your laptop server too, to get the final version.
+2. Test Original on ONE server only. With production's pool running, stop the laptop
+   server (or run it with nobody watching) -- or test on production after deploying,
+   where the NVRs are on the LAN and the office uplink is not used for RTSP.
+3. Use Original mainly in fullscreen. Grid-wide Original costs ~0.9 core per tile on
+   the server and a lot of bandwidth for remote viewers.
+4. If Original is used a lot: hardware video decoding in OpenCV (GPU) would remove
+   most of the CPU; a Phase-2 WebRTC/H.264 pass-through (see
+   CCTV_RELAY_ARCHITECTURE_REPORT.txt) would send ~4 Mbps instead of 20-70 Mbps.
+5. Still open from before: the real CCTV_SSO_SECRET is in .env.example in git
+   (commit 52d9266) -- rotate it in the CCTV .env and the CMS backend, then replace it
+   in .env.example with a placeholder.
+
+Settings (all optional, .env):
+  CCTV_STANDARD_SUBTYPE=1   CCTV_ORIGINAL_SUBTYPE=0   CCTV_ORIGINAL_JPEG_QUALITY=90
+  CCTV_ORIGINAL_FPS=12      CCTV_ORIGINAL_GRID_MAX_W=1280 (0 = full size in the grid)
+  CCTV_ORIGINAL_MAX_W=0 (cap for fullscreen too; 0 = source size)
+Tools: python quality_bench.py --port 8000 --key <CCTV_TOKEN> [--pid <server pid>]
+       GET /api/stream-info/<index>  (both qualities of one camera, no credentials)

@@ -50,6 +50,17 @@ body.viewing{overflow:hidden}
 .clock .t{font-size:14px;font-weight:650}
 .clock .d{font-size:11.5px;color:var(--muted)}
 #layoutBtn{display:none}
+/* video quality switch: [ Standard | Original ] */
+.qseg{display:inline-flex;gap:2px;padding:3px;border-radius:12px;background:var(--surface-2);
+  border:1px solid var(--border);flex:none}
+.qseg button{height:30px;padding:0 11px;border:0;border-radius:9px;background:transparent;
+  color:var(--text-2);font-weight:600;font-size:12.5px}
+.qseg button:hover:not(:disabled){background:var(--surface-4);color:var(--text)}
+.qseg button[aria-checked=true],.qseg button[aria-checked=true]:hover:not(:disabled){
+  background:var(--surface-4);color:#fff;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+.qseg button[data-q=original][aria-checked=true],
+.qseg button[data-q=original][aria-checked=true]:hover:not(:disabled){background:var(--accent);box-shadow:0 2px 10px rgba(79,140,255,.35)}
+.qseg .qs{display:none}
 
 /* ── camera wall ─────────────────────────────────────────── */
 #wall{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;
@@ -133,6 +144,15 @@ body.viewing #view{display:block}
   background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:rgba(255,255,255,.82);
   font-size:12.5px;font-weight:600;font-variant-numeric:tabular-nums}
 .vpos:empty{display:none}
+/* fullscreen quality indicator */
+.qpill{flex:none;height:28px;padding:0 10px;display:inline-flex;align-items:center;gap:6px;border-radius:999px;
+  background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:rgba(255,255,255,.85);
+  font-size:11.5px;font-weight:700;letter-spacing:.03em;white-space:nowrap;font-variant-numeric:tabular-nums}
+.qpill:empty{display:none}
+.qpill.orig{background:rgba(79,140,255,.22);border-color:rgba(79,140,255,.55);color:#dbe7ff}
+.qpill.warn{background:rgba(245,158,11,.2);border-color:rgba(245,158,11,.55);color:#fde68a;letter-spacing:0}
+#bar .qseg{background:rgba(20,24,32,.62);border-color:rgba(255,255,255,.14)}
+#bar .qseg button{height:28px;color:rgba(255,255,255,.75)}
 .side{position:absolute;top:50%;z-index:2;width:52px;height:52px;margin-top:-26px;padding:0;border-radius:50%;
   transition:opacity .3s,background-color .15s,border-color .15s}
 .side .ic{width:24px;height:24px}
@@ -157,6 +177,11 @@ body.viewing #view{display:block}
   .appbar{gap:8px;padding-left:max(12px,var(--sal));padding-right:max(12px,var(--sar))}
   .appbar .pager{display:none}
   #layoutBtn{display:inline-flex}
+  .brand-txt{display:none}
+  .qseg .ql{display:none}
+  .qseg .qs{display:inline}
+  .qseg button{padding:0 9px}
+  #bar .qseg{display:none}
   #settingsLink{width:36px;padding:0}
   #settingsLink .lbl{display:none}
   body.large .grid{grid-template-columns:minmax(0,1fr)}
@@ -174,7 +199,7 @@ body.viewing #view{display:block}
   #range .rp{font-size:14px}
   #title{font-size:15px}
 }
-@media (max-width:419px){ .vpos{display:none} .brand-txt small{display:none} }
+@media (max-width:419px){ .vpos{display:none} .brand-txt small{display:none} .qpill{max-width:44vw;overflow:hidden} }
 
 /* whole wall on one screen: 3 x 2 tiles sized to fit the window (no scrolling) */
 @media (min-width:1000px),(orientation:landscape) and (min-width:560px){
@@ -190,6 +215,8 @@ body.viewing #view{display:block}
   .appbar .pager{display:flex}
   .brand-txt small{display:none}
   .logo{width:30px;height:30px}
+  .qseg .ql{display:none}
+  .qseg .qs{display:inline}
   #settingsLink{width:36px;padding:0}
   #settingsLink .lbl{display:none}
   :root{--cap:30px}
@@ -219,6 +246,7 @@ body.fs{--foot:0px}
   <div class=tools>
     <div class=clock id=clock aria-hidden=true><span class=t></span><span class=d></span></div>
     <button class="icon ghost" id=layoutBtn title="Show one camera per row" aria-label="Show one camera per row"><svg class=ic><use href="#i-rows"/></svg></button>
+    <div class=qseg role=radiogroup aria-label="Video quality"><button type=button role=radio data-q=standard aria-checked=true title="Standard &ndash; faster, lower bandwidth (Q)"><span class=ql>Standard</span><span class=qs>Std</span></button><button type=button role=radio data-q=original aria-checked=false title="Original &ndash; full camera quality, higher bandwidth (Q)"><span class=ql>Original</span><span class=qs>Orig</span></button></div>
     <button class="icon ghost fsb" title="Full screen (F)" aria-label="Full screen" hidden><svg class=ic><use href="#i-max"/></svg></button>
     <a class=btn id=settingsLink href="/settings" title="Rename and re-order cameras"><svg class=ic><use href="#i-sliders"/></svg><span class=lbl>Settings</span></a>
   </div>
@@ -244,6 +272,8 @@ body.fs{--foot:0px}
     <button class=icon onclick="close_()" title="Back to all cameras (Esc)" aria-label="Back to all cameras"><svg class=ic><use href="#i-back"/></svg></button>
     <div class=vt><span id=title></span><span id=tech></span></div>
     <span class=grow></span>
+    <span class=qpill id=qpill></span>
+    <div class=qseg role=radiogroup aria-label="Video quality"><button type=button role=radio data-q=standard aria-checked=true title="Standard &ndash; faster, lower bandwidth (Q)"><span class=ql>Standard</span><span class=qs>Std</span></button><button type=button role=radio data-q=original aria-checked=false title="Original &ndash; full camera quality, higher bandwidth (Q)"><span class=ql>Original</span><span class=qs>Orig</span></button></div>
     <span class=vpos id=vpos></span>
     <button class="icon tnav" onclick="step(-1)" title="Previous camera" aria-label="Previous camera"><svg class=ic><use href="#i-left"/></svg></button>
     <button class="icon tnav" onclick="step(1)" title="Next camera" aria-label="Next camera"><svg class=ic><use href="#i-right"/></svg></button>
@@ -275,14 +305,23 @@ function loadCameras(){
 document.getElementById('settingsLink').href = '/settings' + q;
 
 function pages(){ return Math.max(1, Math.ceil(cams.length/PER)); }
-function streamUrl(i){ return '/stream/'+i+q; }
+// Video quality, remembered per browser (default Standard -- also for a new browser).
+// Standard = the NVR sub-stream (light, kept HOT by the server); Original = the
+// camera's MAIN stream at its real resolution, only for the cameras on screen.
+const QKEY = 'cctv-quality';
+let quality = 'standard';
+try { if (localStorage.getItem(QKEY) === 'original') quality = 'original'; } catch (e) {}
+const ORIG_GRID_FPS = 6;        // grid tiles in Original: full detail, fewer frames (bandwidth)
+function addParam(u, kv){ return u + (u.indexOf('?') < 0 ? '?' : '&') + kv; }
+function streamUrl(i){ return '/stream/'+i+q + (quality === 'original' ? (q ? '&' : '?') + 'quality=original' : ''); }
+function cellUrl(i){ return quality === 'original' ? addParam(streamUrl(i), 'fps=' + ORIG_GRID_FPS) : streamUrl(i); }
 // Cache-busting retry URL. Must work with AND without ?key= (e.g. cookie/SSO access):
 // appending '&_r=' to '/stream/5' would give '/stream/5&_r=..', which the server
 // rejects as a bad camera id, so a retried tile would never recover.
-function retryUrl(i){ return streamUrl(i) + (q ? '&' : '?') + '_r=' + Date.now(); }
+function retryUrl(i){ return addParam(cellUrl(i), '_r=' + Date.now()); }
 // The single-camera view asks for priority: when the NVR's streams are all busy,
 // it gets the next free one before any grid tile (and before background warm-up).
-function liveUrl(i){ return streamUrl(i) + (q ? '&' : '?') + 'prio=full'; }
+function liveUrl(i){ return addParam(streamUrl(i), 'prio=full'); }
 
 /* FIXED CELLS. We create PER <img> cells ONCE and only change their src. Changing
    (or clearing) an <img>'s src reliably ABORTS its current MJPEG connection, so a
@@ -347,7 +386,7 @@ function showPage(){
       c.cell.setAttribute('aria-label', cam.displayName + ' (camera ' + (start + k + 1) + '). Open large view');
       c.cell.classList.remove('empty');
       c.cell.tabIndex = 0;
-      c.img.src = streamUrl(c.idx);
+      c.img.src = cellUrl(c.idx);
     } else {
       c.idx = null;
       c.cam = null;
@@ -440,8 +479,9 @@ function setLiveInfo(cam){
 }
 function startLive(cam){
   const live = document.getElementById('live'), i = cam.index;
-  live.onerror = () => setTimeout(() => { if (fullscreen && liveCam === cam) live.src = liveUrl(i) + '&_r=' + Date.now(); }, 2000);
+  live.onerror = () => setTimeout(() => { if (fullscreen && liveCam === cam) live.src = addParam(liveUrl(i), '_r=' + Date.now()); }, 2000);
   live.src = liveUrl(i);
+  pollQuality();
 }
 function open_(cam){
   // Handoff: keep this camera's grid cell streaming (same worker, slot and cached
@@ -485,6 +525,8 @@ function close_(fromHistory){
   clearTimeout(idleT);
   const cam = liveCam;
   liveCam = null;
+  clearTimeout(qpollT);
+  $('qpill').textContent = '';
   const live = document.getElementById('live');
   document.body.classList.remove('viewing');
   $('view').classList.remove('idle', 'ready');
@@ -497,7 +539,7 @@ function close_(fromHistory){
   const p = k < 0 ? pg : Math.floor(k / PER);
   if (p !== pg){ goPage(p, 300); return; }
   // restore every grid cell's stream (they were stopped for the large view)
-  cells.forEach((c) => { if (c.idx != null) c.img.src = streamUrl(c.idx); });
+  cells.forEach((c) => { if (c.idx != null) c.img.src = cellUrl(c.idx); });
   const tile = cells.find(c => cam && c.idx === cam.index);
   if (tile) tile.cell.focus({preventScroll: true});
 }
@@ -536,6 +578,60 @@ window.addEventListener('pageshow', (e) => {
   if (!e.persisted) return;
   if (fullscreen && liveCam) startLive(liveCam); else refresh(100);
 });
+
+// ── video quality switch ────────────────────────────────────────────────────
+function renderQuality(){
+  document.querySelectorAll('.qseg button').forEach(b => b.setAttribute('aria-checked', String(b.dataset.q === quality)));
+}
+function setQuality(v){
+  v = v === 'original' ? 'original' : 'standard';
+  if (v === quality) return;
+  quality = v;
+  try { localStorage.setItem(QKEY, v); } catch (e) {}
+  renderQuality();
+  // Only the src changes: the browser keeps showing the current picture until the
+  // new stream's first image arrives, and the server shows the camera's Standard
+  // picture (labelled) until its Original frames flow -- no blank tiles.
+  if (fullscreen && liveCam){
+    cells.forEach(c => c.img.removeAttribute('src'));   // no second stream of this camera
+    $('qpill').textContent = '';
+    startLive(liveCam);
+  } else {
+    cells.forEach(c => { if (c.idx != null) c.img.src = cellUrl(c.idx); });
+  }
+}
+document.querySelectorAll('.qseg button').forEach(b => { b.onclick = () => setQuality(b.dataset.q); });
+renderQuality();
+
+// fullscreen: what is actually on screen (the view has free connections to ask)
+let qpollT = 0;
+function pollQuality(){
+  clearTimeout(qpollT);
+  if (!fullscreen || !liveCam) return;
+  const i = liveCam.index;
+  fetch('/api/stream-info/' + i + q).then(r => r.ok ? r.json() : null).then(d => {
+    if (d && fullscreen && liveCam && liveCam.index === i) renderQPill(d);
+  }).catch(() => {}).finally(() => { if (fullscreen) qpollT = setTimeout(pollQuality, 2500); });
+}
+function renderQPill(d){
+  const el = $('qpill'), px = v => (v || '').replace('x', '×');
+  let text, cls = '';
+  if (quality === 'original'){
+    const o = d.original;
+    if (o.live){ text = 'ORIGINAL' + (o.sourceSize ? ' · ' + px(o.sourceSize) : ''); cls = 'orig'; }
+    else if (o.fallbackViewers > 0){ text = 'Original unavailable — showing Standard'; cls = 'warn'; }
+    else if (/slot/i.test(o.status || '')){ text = 'ORIGINAL · waiting for NVR slot'; cls = 'warn'; }
+    else { text = 'ORIGINAL · starting…'; cls = 'orig'; }
+  } else {
+    const st = d.standard;
+    text = 'STANDARD' + (st.sourceSize ? ' · ' + px(st.sourceSize) : '');
+  }
+  el.textContent = text;
+  el.className = 'qpill ' + cls;
+  el.title = quality === 'original'
+    ? 'Original: the camera\'s main stream at its own resolution'
+    : 'Standard: the camera\'s sub-stream (light). Switch to Original for full detail.';
+}
 
 // ── browser full screen (wall display) ─────────────────────────────────────
 const fsOK = !!(document.fullscreenEnabled || document.webkitFullscreenEnabled);
@@ -604,9 +700,11 @@ document.addEventListener('keydown', e=>{
     else if (k==='arrowright'||k==='n') step(1);
     else if (k==='arrowleft'||k==='p') step(-1);
     else if (k==='f') toggleFs();
+    else if (k==='q') setQuality(quality === 'original' ? 'standard' : 'original');
     else wake();
     return;
   }
+  if (k==='q'){ setQuality(quality === 'original' ? 'standard' : 'original'); return; }
   if (k==='n'||k==='arrowright'||k==='pagedown') page(1);
   else if (k==='p'||k==='arrowleft'||k==='pageup') page(-1);
   else if (k==='f') toggleFs();
