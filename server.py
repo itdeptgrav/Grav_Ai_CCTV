@@ -77,6 +77,7 @@ from netcheck import NetworkMonitor, sanitize_url
 import rtsp_preflight as rp
 from camera_settings import CameraSettings, camera_key
 from settings_page import SETTINGS_PAGE
+from grid_page import PAGE
 
 
 def _envint(name, default):
@@ -681,19 +682,33 @@ class CamStream:
         return None
 
     def _placeholder(self):
+        """Status card shown instead of video: coloured dot + state, display name below.
+        Kept clear of the corners and the bottom edge, where the web page overlays
+        the tile number and the camera name."""
         # user's display name; OpenCV's Hershey font is ASCII-only, so a non-ASCII
         # name (e.g. Hindi) falls back to the technical name on this image only
         name = SETTINGS.display_name(self.index)
         if not name.isascii():
             name = self.name
-        key = (self.status, name)
+        status = self.status
+        key = (status, name)
         with self._flock:
             if self._ph_key == key:
                 return self._ph_bytes
-        ph = np.zeros((STREAM_H, STREAM_W, 3), dtype=np.uint8)
-        ph[:] = (30, 30, 40)
-        cv2.putText(ph, self.status, (20, STREAM_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 170), 2)
-        cv2.putText(ph, name, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 220), 1)
+        ph = _ph_background().copy()
+        k = STREAM_W / 640.0                               # layout designed at 640x360
+        font, aa = cv2.FONT_HERSHEY_SIMPLEX, cv2.LINE_AA
+        # LIVE without a fresh frame = the feed stalled: say so instead of "LIVE"
+        text = "Waiting for video..." if status == S_LIVE else status
+        thick = max(1, round(2 * k))
+        scale, tw, th = _fit_text(text, font, 0.8 * k, thick, STREAM_W - 90 * k)
+        r, gap = max(3, round(6 * k)), round(12 * k)
+        x = STREAM_W // 2 - (2 * r + gap + tw) // 2
+        base = STREAM_H // 2 + th // 2 - round(10 * k)       # status line just above the centre
+        cv2.circle(ph, (x + r, base - th // 2), r, _PH_COLOURS.get(status, _PH_WAIT), -1, aa)
+        cv2.putText(ph, text, (x + 2 * r + gap, base), font, scale, _PH_TEXT, thick, aa)
+        nscale, nw, nh = _fit_text(name, font, 0.55 * k, 1, STREAM_W - 60 * k)
+        cv2.putText(ph, name, (STREAM_W // 2 - nw // 2, base + round(24 * k) + nh), font, nscale, _PH_MUTED, 1, aa)
         ok, buf = cv2.imencode(".jpg", ph)
         data = buf.tobytes() if ok else None
         with self._flock:
@@ -731,6 +746,34 @@ class CamStream:
             "startup": self.startup or None, "firstHttpFrameMs": self.first_http_ms,
             "attempts": self.attempts, "opens": self.opens, "framesPublished": self.published,
         }
+
+
+# ── status image ("placeholder") look; colours are BGR ────────────────────────
+_PH_TEXT  = (241, 236, 232)
+_PH_MUTED = (160, 150, 140)
+_PH_WAIT  = (11, 158, 245)                                  # amber: connecting / waiting / retrying
+_PH_BAD   = (68, 68, 239)                                   # red: offline / unreachable / login failed
+_PH_COLOURS = {S_OFFLINE: _PH_BAD, S_NVR_DOWN: _PH_BAD, S_LOGIN: _PH_BAD, S_IDLE: (150, 140, 125)}
+_PH_BG = None
+
+
+def _ph_background():
+    """Dark vertical gradient behind the status text (built once, then copied)."""
+    global _PH_BG
+    if _PH_BG is None:
+        t = np.linspace(0.0, 1.0, STREAM_H, dtype=np.float32)[:, None]
+        rows = np.array((23, 17, 13), np.float32) * (1 - t) + np.array((36, 28, 22), np.float32) * t
+        _PH_BG = np.ascontiguousarray(np.broadcast_to(rows.astype(np.uint8)[:, None, :], (STREAM_H, STREAM_W, 3)))
+    return _PH_BG
+
+
+def _fit_text(text, font, scale, thick, max_w):
+    """Shrink `scale` until `text` fits in max_w pixels -> (scale, width, height)."""
+    (w, h), _ = cv2.getTextSize(text, font, scale, thick)
+    while w > max_w and scale > 0.3:
+        scale -= 0.05
+        (w, h), _ = cv2.getTextSize(text, font, scale, thick)
+    return scale, w, h
 
 
 STREAMS = [CamStream(c, i) for i, c in enumerate(CAMERAS)]
@@ -810,207 +853,6 @@ def cameras_for_ui():
              "technicalName": c["technicalName"], "displayName": c["displayName"],
              "displayOrder": c["displayOrder"], "nvr": c["nvr"], "channel": c["channel"]}
             for c in SETTINGS.snapshot()["cameras"]]
-
-
-PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>CCTV</title>
-<style>
- body{background:#14141c;color:#ddd;font-family:system-ui,sans-serif;margin:0;padding:10px}
- #top{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
- #top b{font-size:15px}
- .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
- @media(max-width:700px){.grid{grid-template-columns:repeat(2,1fr)}}
- .cam{position:relative;background:#000;border:1px solid #333;border-radius:5px;overflow:hidden;cursor:pointer;aspect-ratio:16/9}
- .cam:hover{border-color:#0c8}
- .cam img{width:100%;height:100%;object-fit:cover;display:block}
- .cam span{position:absolute;top:0;left:0;right:0;background:rgba(0,0,0,.65);
-           font-size:12px;padding:3px 6px;white-space:nowrap;overflow:hidden}
- #view{position:fixed;inset:0;background:#000;display:none;flex-direction:column;z-index:9}
- #view img{flex:1;object-fit:contain;min-height:0}
- #bar{background:#1e1e28;padding:10px;display:flex;gap:12px;align-items:center}
- button,a.btn{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:6px 14px;cursor:pointer;font:inherit;font-size:13.3px;text-decoration:none}
- button:hover,a.btn:hover{border-color:#0c8}
- .hint{color:#888;font-size:12px}
- #top .grow{flex:1}
- #title{font-weight:600}
-</style>
-<div id=top>
-  <button onclick="page(-1)">&larr; Prev (P)</button>
-  <b id=pageinfo>-</b>
-  <button onclick="page(1)">Next (N) &rarr;</button>
-  <span class=hint>tap a camera for live video</span>
-  <span class=grow></span>
-  <a class=btn id=settingsLink href="/settings" title="Rename and re-order cameras">&#9881; Settings</a>
-</div>
-<div class=grid id=grid></div>
-<div id=view><div id=bar><button onclick="close_()">&larr; Back</button><span id=title></span><span id=tech class=hint></span></div><img id=live fetchpriority=high></div>
-<script>
-const PER  = 6;
-const KEY  = new URLSearchParams(location.search).get('key') || '';
-const q    = KEY ? '?key='+encodeURIComponent(KEY) : '';
-let cams = [], pg = 0;
-
-// Cameras in DISPLAY order (names/order come from the Settings page). Each camera
-// keeps its technical 'index', which is what /stream/<index> uses -- renaming or
-// re-ordering never changes which RTSP stream a tile opens. Pages are cut from
-// this sorted list, so displayOrder 1-6 = page 1, 7-12 = page 2, ...
-function loadCameras(){
-  return fetch('/api/cameras'+q).then(r=>r.json()).then(list=>{
-    cams = list.slice().sort((a, b) => (a.displayOrder - b.displayOrder) || (a.index - b.index));
-  });
-}
-loadCameras().then(draw);
-document.getElementById('settingsLink').href = '/settings' + q;
-
-function pages(){ return Math.max(1, Math.ceil(cams.length/PER)); }
-function streamUrl(i){ return '/stream/'+i+q; }
-// Cache-busting retry URL. Must work with AND without ?key= (e.g. cookie/SSO access):
-// appending '&_r=' to '/stream/5' would give '/stream/5&_r=..', which the server
-// rejects as a bad camera id, so a retried tile would never recover.
-function retryUrl(i){ return streamUrl(i) + (q ? '&' : '?') + '_r=' + Date.now(); }
-
-/* FIXED CELLS. We create PER <img> cells ONCE and only change their src. Changing
-   (or clearing) an <img>'s src reliably ABORTS its current MJPEG connection, so a
-   camera that scrolls off the page / is stopped for fullscreen releases its NVR
-   slot at once. (Rebuilding the grid via innerHTML used to destroy <img> elements
-   WITHOUT aborting their streams — the browser kept streaming to detached images,
-   leaking viewers and NVR slots. This is the fix.) */
-let cells = [];
-let fullscreen = false;
-
-/* fetchpriority=high: browsers throttle LOW-priority image loads while a page is
-   "still loading" or the network looks slow, and wait for in-flight images to
-   finish first. An MJPEG <img> never finishes, so throttled tiles could wait
-   forever (measured: only 3 of 6 streams were even requested, the rest held back
-   in the browser for 40 s to indefinitely). High priority exempts the streams. */
-function buildCells(){
-  const grid = document.getElementById('grid');
-  grid.innerHTML = Array.from({length: PER}, () =>
-    `<div class=cam><img fetchpriority=high><span></span></div>`).join('');
-  cells = [...grid.querySelectorAll('.cam')].map((cell) => {
-    const c = { cell, img: cell.querySelector('img'), span: cell.querySelector('span'), idx: null, cam: null };
-    cell.onclick = () => { if (c.cam) open_(c.cam); };
-    // server-restart / transient recovery: retry this cell's own camera
-    c.img.onerror = () => {
-      const i = c.idx;
-      setTimeout(() => {
-        if (!fullscreen && c.idx === i && i != null) c.img.src = retryUrl(i);
-      }, 2000);
-    };
-    return c;
-  });
-}
-
-// Abort every grid stream now, so their browser connection slots and NVR slots
-// are released. Returns nothing. (An MJPEG <img> holds one of the browser's ~6
-// per-host connections for its whole life; you MUST free them before opening a
-// new page's streams or the new ones can't connect.)
-function clearCells(){
-  cells.forEach(c => { c.idx = null; c.cam = null; c.span.textContent = ''; c.img.removeAttribute('src'); });
-}
-
-function showPage(){
-  if (pg >= pages()) pg = pages() - 1;
-  const start = pg*PER, shown = cams.slice(start, start+PER);
-  document.getElementById('pageinfo').textContent =
-     `Page ${pg+1}/${pages()}  (cameras ${start+1}-${start+shown.length} of ${cams.length})`;
-  cells.forEach((c, k) => {
-    if (k < shown.length){
-      const cam = shown[k];
-      c.cam = cam;
-      c.idx = cam.index;                   // technical index = the stream to open
-      c.span.textContent = cam.displayName;  // text only -- never parsed as HTML
-      c.cell.title = cam.displayName + ' \\u2014 ' + cam.technicalName + ' \\u00b7 CH' + cam.channel;
-      c.cell.style.display = '';
-      c.img.src = streamUrl(c.idx);
-    } else {
-      c.idx = null;
-      c.cam = null;
-      c.span.textContent = '';
-      c.cell.style.display = 'none';
-      c.img.removeAttribute('src');
-    }
-  });
-}
-
-// Initial render.
-function draw(){ showPage(); }
-
-// Page change: abort the current page's streams FIRST, let the browser/server
-// release those connections, THEN open the new page. Without this hand-off the
-// old MJPEG connections keep every browser connection slot and the new page's
-// streams deadlock (can't open). This ordered teardown is required for MJPEG
-// under the per-host connection limit, not a cosmetic delay.
-let pageSeq = 0;
-function page(d){
-  const my = ++pageSeq;
-  clearCells();
-  pg = (pg + d + pages()) % pages();
-  document.getElementById('pageinfo').textContent = 'Loading page ' + (pg+1) + '/' + pages() + '…';
-  // The streams were just aborted, so a connection is free: pick up names/order
-  // saved on the Settings page (from any browser) before showing the next page.
-  const fresh = loadCameras().catch(() => {});
-  setTimeout(() => fresh.then(() => { if (my === pageSeq && !fullscreen) showPage(); }), 500);
-}
-
-// Saved on the Settings page in another tab of this browser: reload names/order now.
-window.addEventListener('storage', (e) => {
-  if (e.key !== 'cctv-camera-settings-rev' || fullscreen) return;
-  const my = ++pageSeq;
-  clearCells();
-  const fresh = loadCameras().catch(() => {});
-  setTimeout(() => fresh.then(() => { if (my === pageSeq && !fullscreen) showPage(); }), 300);
-});
-
-function open_(cam){
-  // Handoff: keep this camera's grid cell streaming (same worker, slot and cached
-  // frame -- no restart) and stop the OTHER cells FIRST, so the fullscreen stream
-  // gets a browser connection at once instead of queuing behind the per-host limit.
-  const i = cam.index;
-  fullscreen = true;
-  cells.forEach((c) => { if (c.idx !== i) c.img.removeAttribute('src'); });
-  const live = document.getElementById('live');
-  live.onerror = () => setTimeout(() => { if (fullscreen) live.src = retryUrl(i); }, 2000);
-  live.src = streamUrl(i);
-  document.getElementById('title').textContent = cam.displayName;
-  document.getElementById('tech').textContent = (cam.displayName !== cam.technicalName
-      ? cam.technicalName : cam.nvr.toUpperCase()) + ' \\u00b7 CH' + cam.channel;
-  document.getElementById('view').style.display = 'flex';
-}
-function close_(){
-  fullscreen = false;
-  const live = document.getElementById('live');
-  document.getElementById('view').style.display = 'none';
-  live.onerror = null;
-  live.removeAttribute('src');       // abort fullscreen stream
-  // restore every grid cell's stream (they were stopped for fullscreen)
-  cells.forEach((c) => { if (c.idx != null) c.img.src = streamUrl(c.idx); });
-}
-
-// Refresh / close / navigate away: abort every MJPEG stream FIRST. Each open <img>
-// stream holds one of the browser's ~6 HTTP/1.1 connections to this host, and the
-// old page's streams are only torn down after the NEW page has loaded -- so a
-// reload needs a 7th connection that never frees up and hangs forever (measured:
-// a reload hung ~7 min until the tab was closed). 'beforeunload' runs before the
-// reload request is sent (no prompt is shown); 'pagehide' covers mobile Safari.
-function stopAllStreams(){
-  cells.forEach(c => c.img.removeAttribute('src'));
-  const live = document.getElementById('live');
-  if (live) { live.onerror = null; live.removeAttribute('src'); }
-}
-window.addEventListener('beforeunload', stopAllStreams);
-window.addEventListener('pagehide', stopAllStreams);
-
-document.addEventListener('keydown', e=>{
-  const k = e.key.toLowerCase();
-  if (fullscreen){ if(k==='escape'||k==='backspace'||k==='v') close_(); return; }
-  if(k==='n') page(1);
-  if(k==='p') page(-1);
-});
-
-buildCells();
-</script>
-"""
 
 
 class Handler(BaseHTTPRequestHandler):

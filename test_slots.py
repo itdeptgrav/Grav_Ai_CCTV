@@ -70,6 +70,9 @@ cv2.VideoCapture = _Cap
 cv2.resize = lambda frame, size: frame
 cv2.imencode = lambda ext, frame, *a: (True, memoryview(b"jpegbytes"))
 cv2.putText = lambda *a, **k: None
+cv2.LINE_AA = 16
+cv2.getTextSize = lambda text, font, scale, thick: ((int(len(text) * 20 * scale), int(22 * scale)), 5)
+cv2.circle = lambda *a, **k: None
 sys.modules["cv2"] = cv2
 
 import server                              # noqa: E402

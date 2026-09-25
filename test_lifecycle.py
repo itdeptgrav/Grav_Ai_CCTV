@@ -16,7 +16,7 @@ import sys
 import time
 import types
 
-# Offline unit tests: no real RTSP pre-flight to the NVRs, no event log noise.
+# Offline unit tests: no real RTSP pre-flight to the NVRs, no event log noise.https://cctv.grav.in/?key=grav-cctv-4821
 os.environ["CCTV_PREFLIGHT"] = "0"
 os.environ["CCTV_LOG_EVENTS"] = "0"
 
@@ -55,6 +55,9 @@ _fake.imencode = lambda ext, frame, *a: (True, memoryview(b"jpegbytes"))
 _fake.cvtColor = lambda frame, code: frame
 _fake.putText = lambda *a, **k: None
 _fake.rectangle = lambda *a, **k: None
+_fake.LINE_AA = 16
+_fake.getTextSize = lambda text, font, scale, thick: ((int(len(text) * 20 * scale), int(22 * scale)), 5)
+_fake.circle = lambda *a, **k: None
 sys.modules["cv2"] = _fake
 
 import server   # noqa: E402
