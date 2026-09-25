@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Run the CCTV server on a Linux/macOS host.
+
 set -e
 cd "$(dirname "$0")"
 if [ ! -d .venv ]; then python3 -m venv .venv; fi
