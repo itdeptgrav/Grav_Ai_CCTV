@@ -17,6 +17,7 @@ import random
 import threading
 
 os.environ["CCTV_PREFLIGHT"] = "1"          # pre-flight ON (stubbed below)
+os.environ["CCTV_PERSISTENT"] = "0"         # on-demand mode (the fallback); test_relay.py covers the pool
 os.environ["CCTV_LOG_EVENTS"] = "0"
 os.environ.setdefault("CCTV_NVR_MAX_CONN", "6")
 

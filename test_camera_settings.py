@@ -20,6 +20,7 @@ TMP = tempfile.mkdtemp(prefix="cctv-settings-test-")
 SERVER_FILE = os.path.join(TMP, "server", "data", "camera-settings.json")
 os.environ["CCTV_SETTINGS_FILE"] = SERVER_FILE
 os.environ["CCTV_PREFLIGHT"] = "0"
+os.environ["CCTV_PERSISTENT"] = "0"          # on-demand mode; test_relay.py covers the pool
 os.environ["CCTV_LOG_EVENTS"] = "0"
 
 import numpy as np                                   # noqa: E402

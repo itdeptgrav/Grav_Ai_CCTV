@@ -12,9 +12,15 @@ It is independent of the CMS and of `D:\Ai_cctv` (the original dev copy).
 ## Files
 | File | Purpose |
 |---|---|
-| `server.py` | The web server (grid page + `/stream`, `/snapshot`, `/api/cameras`) |
+| `server.py` | The web server + persistent relay pool (`/stream`, `/snapshot`, `/api/*`) |
+| `grid_page.py`, `settings_page.py`, `ui_theme.py` | The live grid, the camera settings page, shared look |
+| `camera_settings.py` | Display names / grid order (stored in `data/`, never in git) |
+| `rtsp_preflight.py` | Fast RTSP check before OpenCV opens a camera |
 | `nvr_config.py` | Camera list + NVR endpoints (from env) |
 | `netcheck.py` | Reachability probes (cross-platform) |
+| `relay_bench.py` | Viewer-experience benchmark against a running server |
+| `nvr_capacity_probe.py` | SUPERVISED NVR capacity / direct-camera test (see its .txt) |
+| `test_*.py` | Offline tests (no NVR needed): lifecycle, slots, settings, relay |
 | `requirements.txt` | `opencv-python`, `numpy`, `python-dotenv` |
 | `.env.example` | Copy to `.env` and edit |
 | `run.sh` / `run.bat` | One-command run (creates venv, installs, starts) |
@@ -36,6 +42,26 @@ It is independent of the CMS and of `D:\Ai_cctv` (the original dev copy).
 private NVR IPs; otherwise (a hosted/cloud server) it uses `CCTV_PUBLIC_IP` and the
 forwarded ports (`NVR*_PUBLIC_PORT`). The router forwards
 `PUBLIC_IP:10554 -> NVR1:554` and `:20554 -> NVR2:554`.
+
+## Persistent relay (default, `CCTV_PERSISTENT=1`)
+The server runs 24/7, so it keeps up to the per-NVR cap (6) of camera streams
+HOT even when nobody is watching: cameras being viewed first (fullscreen before
+the grid), then recently viewed ones, then the grid order (page 1 first). A
+browser subscribes to frames that are already flowing -- no RTSP handshake --
+and however many browsers watch a camera, there is one upstream connection.
+A camera outside the HOT pool is shown at once from its last frame in RAM,
+darkened and stamped `CACHED hh:mm:ss · Connecting...`, never passed off as live,
+while it is promoted. Nothing is recorded to disk. `/api/status` shows every
+camera's tier (HOT / CONNECTING / WARM / COLD / OFFLINE) and role.
+
+* Run the pool on **one** server only (production). Any other machine that runs
+  `server.py` against the same NVRs must set `CCTV_PERSISTENT=0`.
+* The cap stays at the verified-safe 6 per NVR. Raise it per NVR
+  (`CCTV_NVR1_MAX_CONN`, `CCTV_NVR2_MAX_CONN`) only after the supervised test in
+  `SUPERVISED_NVR_CAPACITY_TEST.txt`.
+* `python relay_bench.py --port 8000 --key <CCTV_TOKEN>` measures what a viewer
+  experiences (first image, first live frame, upstream connections).
+* Details and measurements: `FINAL_CCTV_RELAY_REPORT.txt`.
 
 ## Run it as a service (Linux, systemd)
 Create `/etc/systemd/system/grav-cctv.service`:

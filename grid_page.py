@@ -280,6 +280,9 @@ function streamUrl(i){ return '/stream/'+i+q; }
 // appending '&_r=' to '/stream/5' would give '/stream/5&_r=..', which the server
 // rejects as a bad camera id, so a retried tile would never recover.
 function retryUrl(i){ return streamUrl(i) + (q ? '&' : '?') + '_r=' + Date.now(); }
+// The single-camera view asks for priority: when the NVR's streams are all busy,
+// it gets the next free one before any grid tile (and before background warm-up).
+function liveUrl(i){ return streamUrl(i) + (q ? '&' : '?') + 'prio=full'; }
 
 /* FIXED CELLS. We create PER <img> cells ONCE and only change their src. Changing
    (or clearing) an <img>'s src reliably ABORTS its current MJPEG connection, so a
@@ -437,8 +440,8 @@ function setLiveInfo(cam){
 }
 function startLive(cam){
   const live = document.getElementById('live'), i = cam.index;
-  live.onerror = () => setTimeout(() => { if (fullscreen && liveCam === cam) live.src = retryUrl(i); }, 2000);
-  live.src = streamUrl(i);
+  live.onerror = () => setTimeout(() => { if (fullscreen && liveCam === cam) live.src = liveUrl(i) + '&_r=' + Date.now(); }, 2000);
+  live.src = liveUrl(i);
 }
 function open_(cam){
   // Handoff: keep this camera's grid cell streaming (same worker, slot and cached

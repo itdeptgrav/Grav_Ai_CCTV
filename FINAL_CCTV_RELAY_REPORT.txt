@@ -1,0 +1,222 @@
+GRAV CCTV -- PERSISTENT RELAY (PHASE 1) -- FINAL REPORT
+=======================================================
+Project: D:\GRAV_Project\grav-cctv        Date: 2026-09-25
+Result legend: PASS / FAIL / NOT TESTED. Nothing below is estimated unless it says so.
+
+Ground rules followed
+  * No NVR limit / stress test was run. Never more than 6 upstream streams per NVR.
+  * Real-NVR measurements ran on a separate test server (127.0.0.1:8010, one-time
+    key) ONLY while production (cctv.grav.in) and the local server were idle; a
+    guard re-checked both every 2 s and closed every test stream (and killed the
+    persistent test server) the moment either had a viewer.
+  * No video is written to disk. No credentials are printed or stored anywhere new.
+
+------------------------------------------------------------------------------
+1. CURRENT ARCHITECTURE FOUND
+------------------------------------------------------------------------------
+One OpenCV/FFmpeg RTSP connection per camera, shared by all its viewers, but
+ON-DEMAND: started by the first viewer, stopped the moment the last viewer leaves.
+Start = RTSP pre-flight (auth DESCRIBE, ~3 s on a "cold" NVR2 channel) -> serialized
+OpenCV open (~1.3 s) -> NVR slot (max 6 per NVR, taken after the open) -> frames.
+Every page change, fullscreen return or reload paid the full handshake again. The
+last JPEG was re-served for up to 5 s WITHOUT any marking (a 5-s-old picture looked
+live). See CCTV_RELAY_ARCHITECTURE_REPORT.txt for the full analysis.
+
+------------------------------------------------------------------------------
+2. FINAL ARCHITECTURE IMPLEMENTED  (option C: HOT/WARM pool within the safe cap)
+------------------------------------------------------------------------------
+Browser A ─┐
+Browser B ─┼─ MJPEG ── camera worker (1 per camera) ── ONE upstream RTSP ── NVR
+Browser C ─┘                 │
+                             └─ latest frame in RAM (JPEG + resized picture)
+
+* PoolManager (server.py) runs 24/7 and decides which cameras are HOT, per NVR, up
+  to NVR_CAP (6):  1. fullscreen viewers  2. grid / settings viewers (every viewed
+  camera always keeps its worker)  3. recently viewed (15 min, newest first)
+  4. background warming in grid order (page 1 first).
+* A browser subscribes to a HOT camera's running stream: no RTSP handshake at all.
+* Promotion: a viewed camera that is not HOT demotes the LEAST useful background
+  stream (never a viewed one) and gets its slot; meanwhile the viewer sees the
+  camera's cached frame at once, darkened and stamped "CACHED hh:mm:ss ·
+  Connecting..." -- never passed off as live.
+* Strict cap: in persistent mode the NVR slot is taken BEFORE connecting, so even
+  during promotions/demotions a NVR never sees more than 6 streams from us.
+  One worker thread per camera, always (a new one waits for the old one to end).
+* Anti-thrash: immediate demotion only for a viewed camera's demand; otherwise at
+  most one background swap per NVR per 30 s and never of a stream HOT < 2 min;
+  warm-up 2 starts at a time per NVR (1 s apart); offline cameras leave the pool
+  and are retried after 60 s, doubling up to once an hour; an unreachable NVR
+  (reboot) is not treated as dead cameras -- its workers reconnect by themselves.
+* Idle time: cameras outside the pool get their cached frame refreshed by a short
+  visit (one per NVR per 5 min, only after 60 s without viewers on that NVR, and it
+  only borrows a plain background slot, never a recently viewed camera's).
+* Viewer arrival on an idle HOT camera switches it from 1 fps to 8 fps publishing
+  immediately. JPEG is encoded once per published frame for all viewers.
+* Fallback: CCTV_PERSISTENT=0 = the original on-demand behaviour (still covered by
+  the original test suites). A worker that hits an unexpected error retries instead
+  of dying.
+
+------------------------------------------------------------------------------
+3. FILES CHANGED
+------------------------------------------------------------------------------
+server.py            persistent pool (PoolManager), worker rewrite (slot-first in
+                     persistent mode, release-before-report, one worker per camera,
+                     idle fps, viewer boost), live/cached/status frame serving,
+                     per-NVR caps (CCTV_NVR1_MAX_CONN/CCTV_NVR2_MAX_CONN), priority
+                     slot queue, ?prio=full, X-Frame-State part header, /api/status
+                     (tier, role, pool, config), CCTV_BIND, start-up messages.
+grid_page.py         fullscreen view requests ?prio=full.
+test_relay.py        NEW: 65 offline checks of the relay (section 20).
+test_lifecycle.py, test_slots.py, test_camera_settings.py
+                     one line each: pinned to CCTV_PERSISTENT=0 (they keep testing
+                     the on-demand fallback exactly as before).
+relay_bench.py       NEW: viewer-experience benchmark against a running server.
+nvr_capacity_probe.py, SUPERVISED_NVR_CAPACITY_TEST.txt
+                     NEW: supervised NVR capacity / direct-camera test -- PREPARED,
+                     NOT RUN (refuses to run without --i-am-supervising).
+CCTV_RELAY_ARCHITECTURE_REPORT.txt  NEW: architecture decision report.
+README.md, .env.example             documentation of the relay settings.
+.env (this laptop only, not in git) CCTV_PERSISTENT=0 -- this laptop is a dev
+                     machine; the pool belongs on production (see section 21).
+
+------------------------------------------------------------------------------
+4-8. CAPACITY / DIRECT CAMERAS / POOL
+------------------------------------------------------------------------------
+ 4. NVR1 real max streams discovered ......... NOT TESTED (instructed not to).
+    Verified-safe cap 6 kept. Procedure ready: SUPERVISED_NVR_CAPACITY_TEST.txt.
+ 5. NVR2 real max streams discovered ......... NOT TESTED (same).
+ 6. Direct camera RTSP availability .......... NOT TESTED. No camera IPs/logins are
+    in this project; NVR-stored camera passwords were deliberately not read.
+ 7. Can all 25 stay HOT? ..................... NO, not within the safe cap:
+    4 channels have no video (NVR1 ch10, NVR2 ch7/12/13); 21 healthy cameras
+    (NVR1 11, NVR2 10) vs 6 + 6 = 12 HOT slots. If the supervised test proves
+    NVR1 >= 11 and NVR2 >= 10 sub-streams, set the two caps and ALL healthy
+    cameras stay HOT (config only, no code change).
+ 8. HOT/WARM pool required? .................. YES (because of 7).
+
+------------------------------------------------------------------------------
+9-11. DESIGN DETAILS
+------------------------------------------------------------------------------
+ 9. RAM cache: per camera the latest JPEG (shared by all viewers), the resized
+    picture, its monotonic + wall-clock time, and the time live video started on
+    the current connection. Served as:
+      LIVE    frame from the CURRENT connection and <= 2.5 s old
+      CACHED  older frame (<= 30 min): darkened to ~40 % and stamped
+              "CACHED hh:mm:ss" + state (Connecting / Waiting for NVR slot /
+              Reconnecting / Camera offline); encoded once per frame+state
+      STATUS  nothing usable: the status card
+    RAM: ~0.7 MB per camera for the picture + ~30-60 KB JPEG (~20 MB for 25).
+10. Stream reuse: one upstream per camera for any number of viewers; page changes
+    and fullscreen only change subscriptions -- HOT workers keep running.
+11. Main/sub stream: the pool uses the NVR SUB-stream (NVR2 H.265 1280x720
+    ~1 Mbps, NVR1 H.264 352x288 0.3-1 Mbps). Main stream for fullscreen is NOT
+    implemented in Phase 1 (it would cost a second slot per fullscreen camera).
+
+------------------------------------------------------------------------------
+12-19. MEASUREMENTS
+------------------------------------------------------------------------------
+BEFORE = original code (git a4824f3), real NVRs, same laptop, same benchmark.
+AFTER  = this code. Test servers bound to 127.0.0.1 only.
+
+12. Browser viewer sharing (5 viewers, same camera)
+      BEFORE real NVR: 5 viewers -> 1 upstream connection ..................... PASS
+      AFTER offline test: 5 viewers -> 1 upstream, 1 slot, all LIVE at once ..... PASS
+      AFTER real NVR ........................................ see REAL-NVR AFTER below
+13. Start-up time BEFORE (real NVRs)
+      production /api/status, per camera: 4.35 - 6.99 s (pre-flight 2.9-3.2 s +
+      open 1.26-1.35 s + first frame)
+      grid page 1 (6 NVR2 cameras), first LIVE frame per camera: 4.6 - 11.4 s
+14. Start-up time AFTER
+      HOT camera (already running): first frame is LIVE, 1-8 ms after the request
+      (fake-NVR server + offline tests; the server does no RTSP work for it).
+      Server start -> first camera HOT / all 12 HOT: see REAL-NVR AFTER below.
+15. Page switch
+      BEFORE: every page re-connects -> same 4.6-11.4 s staircase.
+      AFTER, page whose cameras are HOT (e.g. back to page 1 after page 4 on the
+      other NVR): all 6 tiles LIVE in 1-7 ms, 0 reconnects (fake-NVR + offline test).
+      AFTER, cameras not HOT: cached frame in 70-90 ms, LIVE after the camera's
+      normal connect time (NVR2 ~4.3 s, NVR1 ~1.4 s; opens still serialized).
+16. Fullscreen
+      BEFORE: instant only thanks to the old hand-off; returning to the grid
+      re-connected the 5 other tiles (up to ~18 s measured in the first BEFORE run).
+      AFTER: fullscreen of a HOT camera LIVE in 2 ms; back to grid 2-5 ms, no
+      reconnect (fake-NVR). Fullscreen has slot priority over grid and background.
+17. CPU (real NVRs, measured with Windows process counters, 16-core laptop)
+      BEFORE idle: 1.1 % of one core, 64 MB.  BEFORE, 6 NVR2 cameras watched:
+      157 % of one core (9.8 % of the machine), 181 MB  => ~26 % of a core per
+      NVR2 720p H.265 sub-stream, almost all of it decoding.
+      AFTER: see REAL-NVR AFTER below.
+18. RAM: BEFORE 64 MB idle / 181 MB with 6 streams. AFTER: see below.
+19. Reconnect
+      offline tests: dropped HOT stream reconnects by itself, slot released
+      before the back-off ..................................................... PASS
+      offline: NVR outage (unreachable) -> workers report it, hold no slot, are
+      NOT dropped as dead, pool back 1.9 s after the NVR returned .............. PASS
+      offline: offline camera leaves the pool, is retried later, recovers ....... PASS
+      offline: unexpected worker error -> retry, recovery, no slot leak ......... PASS
+      real camera disconnect / real NVR restart ................................ NOT TESTED
+      (would mean unplugging a camera or rebooting an NVR that records)
+
+REAL-NVR AFTER (persistent test server, <= 6 streams per NVR, idle windows only)
+      PENDING -- see the end of this file.
+
+------------------------------------------------------------------------------
+20. AUTOMATED TESTS
+------------------------------------------------------------------------------
+python -m py_compile server.py nvr_config.py netcheck.py ... ................. PASS
+test_lifecycle.py        11/11 (on-demand fallback) ........................... PASS
+test_slots.py            59/59 (on-demand fallback) ........................... PASS
+test_camera_settings.py  86/86 ................................................ PASS
+test_relay.py (NEW)      65/65: pool warm-up in grid order with <= 2 starts in
+  parallel, 5 viewers -> 1 upstream, idle 1 fps / viewed 8 fps, cached frame never
+  live, tiers, promotion demotes background never viewers, fullscreen first in
+  line, strict cap (peak 6/6) through every transition, slot released before
+  back-off, offline camera gives its slot back and recovers, NVR outage recovery,
+  worker error recovery, page switch keeps the other NVR HOT with 0 reconnects,
+  no churn while idle, refresh visits (idle only, never a recent camera's slot),
+  worker uniqueness under random churn, /api/status fields without credentials,
+  HTTP first part LIVE for HOT / CACHED then LIVE for WARM .................... PASS
+
+------------------------------------------------------------------------------
+21. LIMITATIONS
+------------------------------------------------------------------------------
+* 12 of 21 healthy cameras can be HOT at a time (cap 6 per NVR). Opening a non-HOT
+  camera still costs its connect time (cached frame shown meanwhile).
+* OpenCV opens are serialized process-wide (measured earlier: parallel opens are no
+  faster), so several promotions at once still fill in one by one.
+* The pool decodes its HOT streams continuously: steady CPU (section 17).
+* Network: ~10 Mbps continuous NVR -> server for 12 HOT sub-streams. Fine on the
+  LAN; if the production PC is NOT on the office LAN this is continuous upload --
+  check the tunnel connector's origin IP (CCTV_RELAY_ARCHITECTURE_REPORT.txt).
+* Run the pool on ONE server: production. Every other server.py against the same
+  NVRs needs CCTV_PERSISTENT=0 (set on this laptop).
+* A stalled (not closed) stream holds its slot until the 8 s read timeout.
+* Refresh visits briefly (seconds) take one plain background camera out of the
+  pool every 5 min per NVR; if someone opens exactly that camera then, it shows
+  its cached frame and connects.
+
+------------------------------------------------------------------------------
+22. NOT TESTED
+------------------------------------------------------------------------------
+NVR capacity (instructed), direct camera RTSP, real camera unplug, real NVR
+restart, main-stream fullscreen, multi-hour soak test on production, and anything
+listed as PENDING below.
+
+------------------------------------------------------------------------------
+23. MEDIAMTX / GO2RTC / WEBRTC (PHASE 2/3 RECOMMENDATION)
+------------------------------------------------------------------------------
+Not needed to make HOT cameras instant (Phase 1 does that). Worth it when CPU on
+the production PC or latency matters: go2rtc (single binary) or MediaMTX relays
+RTSP WITHOUT decoding (removes most of the ~26 %-of-a-core per NVR2 stream) and
+offers WebRTC (sub-second start, low latency) and MJPEG. It does not raise the NVR
+session limit. Plan: run it next to server.py, keep MJPEG as the fallback, switch
+tiles to WebRTC only after it proves stable through the Cloudflare tunnel.
+Cheaper first step: lower NVR2's sub-stream from 1280x720 H.265 to D1/CIF in the
+NVR settings (your decision) -- decode cost drops several-fold.
+
+------------------------------------------------------------------------------
+DEPLOYMENT (production = the Alienware behind cctv.grav.in)
+------------------------------------------------------------------------------
+git pull, then restart python server.py. The pool starts by itself (default
+CCTV_PERSISTENT=1). Watch /api/status: "pool" + each camera's "tier".
+To go back to the old behaviour instantly: CCTV_PERSISTENT=0 in its .env + restart.

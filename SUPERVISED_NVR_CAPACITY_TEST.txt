@@ -1,0 +1,94 @@
+SUPERVISED NVR CAPACITY + DIRECT-CAMERA TEST  (prepared -- NOT executed)
+=========================================================================
+
+Purpose
+-------
+Find out, with a person watching, whether the per-NVR cap of 6 upstream streams
+(CCTV_NVR_MAX_CONN) is a real NVR limit or only our conservative setting, and
+whether the IP cameras can be streamed directly (bypassing the NVR). Until this
+test has been done and signed off, the CCTV server stays at the verified-safe cap
+of 6 streams per NVR.
+
+Tool: nvr_capacity_probe.py (refuses to run without --i-am-supervising, refuses if
+a guarded CCTV server is in use, 10-second countdown, Ctrl+C aborts and tears
+everything down, never retries a rejected login, never reads passwords stored in
+the NVR, hard ceiling of 24 sessions).
+
+
+WHEN
+----
+* A quiet time (e.g. after office hours), when nobody needs live CCTV.
+* One person at the NVR's own monitor / web page, watching recording.
+* Allow ~20 minutes per NVR.
+
+
+BEFORE YOU START
+----------------
+1. Stop EVERY CCTV server that uses these NVRs:
+     - production (the Alienware, cctv.grav.in): Ctrl+C in its window
+       (or stop its service);
+     - any server.py on a laptop.
+   Close the NVR mobile apps / other viewers if possible.
+2. In the NVR web page, note: recording status of every channel, and the NVR model
+   + firmware (Main Menu > Info). Take a screenshot.
+3. Optional extra safety net -- let the tool double-check that production is idle:
+     PowerShell:  $env:RELAY_GUARDS = "https://cctv.grav.in/api/status?key=<CCTV_TOKEN>"
+   (the tool then refuses to start while production shows viewers).
+
+
+A. NVR CAPACITY (one NVR at a time)
+-----------------------------------
+   python nvr_capacity_probe.py capacity --nvr nvr1 --max 12 --i-am-supervising --out nvr1_capacity.json
+
+What it does: opens live SUB-stream sessions one by one (the same stream the relay
+uses), keeps all of them flowing (video is only counted, not decoded), and after
+each new session checks for 10 s that EVERY open session still receives video.
+It stops at the first refusal (e.g. "453 Not Enough Bandwidth", "503"), timeout or
+stalled stream -- or at --max -- then tears everything down.
+
+Start with --max equal to the number of healthy channels (NVR1: 11, NVR2: 10).
+Only if everything still flows, you MAY repeat with --allow-repeat --max 16 to learn
+the NVR's total session limit (sessions beyond the channel count reuse channels).
+While it runs, watch the NVR: recording indicators must stay on. If anything looks
+wrong -> Ctrl+C.
+
+Then the same for NVR2:
+   python nvr_capacity_probe.py capacity --nvr nvr2 --max 10 --i-am-supervising --out nvr2_capacity.json
+
+
+B. DIRECT CAMERA RTSP (optional)
+--------------------------------
+1. In each NVR's web page, open the camera list ("Remote Device" / "IP Channels")
+   and write down every camera's IP address. If you know the cameras' own login
+   (it is usually NOT the NVR login), note it too.
+2. Create a file OUTSIDE the project folder, e.g. D:\private\cameras.json:
+     [
+       {"name": "HR Office", "ip": "192.168.1.101"},
+       {"name": "Reception", "ip": "192.168.1.102", "user": "admin", "password": "..."}
+     ]
+   (Without user/password only reachability + "is there an RTSP server" is checked.)
+3. Run:
+   python nvr_capacity_probe.py direct --cameras D:\private\cameras.json --i-am-supervising --out direct.json
+   Per camera it reports: TCP 554 open?  RTSP server answering?  main stream
+   (subtype=0) and sub-stream (subtype=1) codec, if you gave credentials.
+   One DESCRIBE per stream; a rejected login is NOT retried (no account lockout).
+4. Delete cameras.json afterwards if it contains passwords.
+
+
+AFTER THE TEST
+--------------
+1. Check in the NVR (playback) that recording continued during the test window.
+2. Restart production.
+3. Decide the cap: new cap = (highest count where everything flowed) minus 2 for
+   headroom (NVR apps, a second viewer), and never more than you need
+   (NVR1: 11 healthy channels, NVR2: 10). Example: flowed up to 16 -> cap 14 -> use 11.
+4. Set it ONLY on the production server's .env:
+       CCTV_NVR1_MAX_CONN=<new cap>
+       CCTV_NVR2_MAX_CONN=<new cap>
+   and restart it. The server prints a warning for any cap above 6 as a reminder
+   that it relies on this test. With cap >= the number of healthy channels, every
+   camera stays HOT permanently (no WARM/COLD cameras at all).
+5. Direct cameras: only switch a camera to its own RTSP URL after it proved
+   reachable AND stable (run the capacity mode against it for a while, or watch it
+   in the relay for a day). This needs a small config change (per-camera URL) that
+   is NOT implemented yet on purpose -- the NVR path stays the default.

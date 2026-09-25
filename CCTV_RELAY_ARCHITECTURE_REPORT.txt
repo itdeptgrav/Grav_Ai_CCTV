@@ -1,0 +1,131 @@
+GRAV CCTV -- RELAY ARCHITECTURE DECISION REPORT
+==============================================
+Project: D:\GRAV_Project\grav-cctv          Date: 2026-09-25
+Scope:   Phase 1 = persistent / warm camera workers + RAM frame cache, inside the
+         existing Python (OpenCV + MJPEG) server, with the verified-safe limit of
+         6 upstream streams per NVR. No NVR limit / stress test was run (as
+         instructed); the supervised test is PREPARED only.
+Measurements with real NVRs were taken ONLY while production (cctv.grav.in) and
+the local server were idle (a guard polled both and aborted the moment either had
+a viewer), never with more than 6 streams per NVR from the test server.
+
+
+1. CURRENT ARCHITECTURE (found, before this change)
+---------------------------------------------------
+* server.py: one CamStream per camera, one OpenCV/FFmpeg RTSP connection per
+  camera shared by all its viewers (already one upstream per camera -- verified
+  again: 5 viewers -> 1 upstream connection).
+* ON-DEMAND lifecycle: the worker starts with the FIRST viewer (HTTP /stream
+  connection) and stops the moment the LAST viewer leaves.
+* Start-up path per camera: RTSP pre-flight (authenticated DESCRIBE, parallel,
+  outside OpenCV) -> OpenCV open (serialized process-wide, 1 at a time) -> NVR slot
+  (BoundedSemaphore 6 per NVR, taken only AFTER a successful open) -> frames
+  (grab() every frame, retrieve()+resize+JPEG only at 8 fps, encoded once, shared).
+* Frame cache: the latest JPEG in RAM, re-served for up to 5 s (FRAME_MAX_AGE_S),
+  WITHOUT any marking -- a 5-s-old picture looked exactly like live video.
+* Reused unchanged: pre-flight, credential-lockout protection, fresh-first open
+  ordering, back-off (1,2,4,8,16,30 s), slot release before back-off, NVR
+  reachability monitor, camera settings (stable keys, display names/order), UI.
+
+2. MEASURED START-UP BOTTLENECK
+-------------------------------
+Production's own /api/status (old code, real NVRs, earlier today), per camera:
+   pre-flight (NVR2 "cold" DESCRIBE)  2.9-3.2 s
+   OpenCV open                        1.26-1.35 s
+   total to first frame               4.35-6.99 s
+Benchmark of the ORIGINAL code (git a4824f3) on this laptop, real NVRs:
+   grid page 1 (6 NVR2 cameras), first LIVE frame per camera: 4.6 - 11.4 s
+   (the NVR2 cold handshake is ~3 s per camera and OpenCV opens are serialized,
+   so a page fills in as a staircase; every page change / fullscreen return
+   repeats it because the workers were stopped).
+=> The cost is the RTSP negotiation itself, paid again on EVERY page view.
+   Keeping upstream connections alive removes it for every HOT camera.
+
+3. NVR CONNECTION CAPABILITY
+----------------------------
+NVR1 real maximum simultaneous RTSP streams:  NOT TESTED (instructed not to)
+NVR2 real maximum simultaneous RTSP streams:  NOT TESTED (instructed not to)
+Known: 6 per NVR is the verified-safe value (used for weeks); 6 parallel cold
+handshakes on NVR2 took the same time as one (earlier measurement), i.e. no sign
+of a limit at 6 -- but that is NOT proof of a higher limit.
+Healthy channels: NVR1 11 (ch3-9, ch11-14; ch10 no video), NVR2 10 (ch1-6, 8-11;
+ch7, 12, 13 no video). To keep EVERY healthy camera HOT the NVRs would need to
+allow 11 and 10 simultaneous sub-streams (plus headroom).
+Prepared: SUPERVISED_NVR_CAPACITY_TEST.txt + nvr_capacity_probe.py (refuses to run
+without --i-am-supervising; one session at a time; stops at the first refusal or
+stalled stream; tears everything down).
+
+4. DIRECT CAMERA RTSP AVAILABILITY
+----------------------------------
+NOT TESTED. The configuration only knows the NVRs (no camera IPs); camera IPs and
+camera logins are not in this project, and reading the camera passwords stored in
+the NVR was deliberately NOT done. The supervised procedure (part B) checks
+reachability / RTSP server / main + sub stream for cameras the operator lists.
+
+5. MAIN / SUB STREAM
+--------------------
+The relay uses the NVR SUB-stream (subtype=1), measured earlier:
+   NVR2 sub-stream: H.265 1280x720, ~1.0 Mbps, GOP 2 s  (heavy to decode)
+   NVR1 sub-stream: H.264 352x288,  0.3-1.0 Mbps, GOP 2 s (cheap)
+Main streams (subtype=0) exist on both NVRs (same URL, subtype=0); not used for
+the always-on pool. "Fullscreen = main stream on demand" is NOT implemented in
+Phase 1 (it would add a second upstream connection per fullscreen camera, i.e.
+cost a slot); recommended together with the capacity test.
+
+6. CPU IMPLICATIONS (measured)
+------------------------------
+Original code, 6 NVR2 cameras watched (8 fps JPEG): 157 % of one CPU core
+(9.8 % of this 16-core laptop), 181 MB RSS; idle: ~1 % CPU, 64 MB.
+=> ~26 % of a core per NVR2 720p H.265 sub-stream. Almost all of it is DECODING
+   (every frame must be decoded to keep the stream current); NVR1's 352x288
+   streams cost a small fraction. A persistent pool decodes its HOT streams all
+   the time, so it costs roughly a steady 1-1.5 cores with 6 NVR2 + 6 NVR1
+   streams (see FINAL_CCTV_RELAY_REPORT.txt for the measured figure). To limit it,
+   HOT cameras nobody watches publish JPEG at only 1 fps (CCTV_IDLE_FPS).
+   Biggest lever if CPU matters: lower NVR2's sub-stream to D1/CIF in the NVR
+   (NVR setting, your decision), or GPU decoding (Phase 2 evaluation).
+
+7. NETWORK IMPLICATIONS
+-----------------------
+Always-on pool = 6 x ~1.0 Mbps (NVR2) + 6 x ~0.6 Mbps (NVR1) ~ 10 Mbps continuous
+from the NVRs to the server, ~108 GB/day.
+* Server on the office LAN: negligible.
+* Server OFF the LAN (NVRs reached via the public IP): this becomes continuous
+  office UPLOAD. CHECK where the Alienware sits: Cloudflare Zero Trust > Tunnels >
+  grav-alienware-host shows the connector's origin IP. If it is not the office,
+  reduce the pool (CCTV_NVR1_MAX_CONN/CCTV_NVR2_MAX_CONN) or run with
+  CCTV_PERSISTENT=0.
+Browser side is unchanged: ~0.3-0.5 Mbps per watched tile (MJPEG 640x360).
+
+8. OPTIONS
+----------
+A. All persistent NVR streams (every healthy camera HOT 24/7)
+   Needs NVR1 >= 11 and NVR2 >= 10 simultaneous sub-streams. UNPROVEN -> not now.
+   Becomes a CONFIG change (CCTV_NVR1_MAX_CONN=11, CCTV_NVR2_MAX_CONN=10) the day
+   the supervised test proves it; no code change needed.
+B. Direct-camera persistent streams (bypass the NVR)
+   Would remove the NVR session limit, but camera IPs/credentials/stability are
+   unknown (NOT TESTED). Needs per-camera URLs (small change) -- only after the
+   supervised direct-camera check.
+C. HOT / WARM pool within the safe cap (6 per NVR)             <-- CHOSEN (Phase 1)
+   Safe by construction, no new dependency, reuses all existing fixes. Viewed
+   cameras first (fullscreen > grid), then recently viewed, then page-1-first grid
+   order; everything else keeps a RAM-cached frame shown as "CACHED hh:mm:ss".
+   Automatically becomes option A when the cap is raised.
+D. MediaMTX / go2rtc relay (+ WebRTC to the browser)
+   Real benefits: relays the RTSP stream WITHOUT decoding (removes most of the
+   CPU cost above), sub-second start with WebRTC, low latency, browser-native
+   video, efficient for many viewers. Costs: a new service to install/operate on
+   the production PC, a new player path in the UI (MJPEG kept as fallback),
+   WebRTC through the Cloudflare tunnel needs TURN/TCP care. It does NOT remove
+   the NVR session limit (it still needs one upstream per camera).
+   => Recommended as Phase 2/3 IF CPU or latency become the issue -- not needed
+      to make HOT cameras instant (Phase 1 already does that).
+
+9. DECISION
+-----------
+Implement option C now (done -- see FINAL_CCTV_RELAY_REPORT.txt for design,
+measurements, tests). Keep the cap at 6. Run the supervised capacity test in a
+quiet window; if the NVRs sustain >= 11 / 10 sub-streams, raise the per-NVR caps
+(= option A, config only). Evaluate D (go2rtc preferred: single binary, RTSP in,
+WebRTC/MJPEG out) when CPU on the production PC or WebRTC latency matters.
