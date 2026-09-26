@@ -1,4 +1,4 @@
-"""User-editable camera display settings (name + order), persisted server-side.
+"""User-editable camera display settings (name + order + audio), persisted server-side.
 
 Only PRESENTATION metadata lives here. A camera's technical identity -- NVR key,
 channel, RTSP path, credentials -- comes from nvr_config.CAMERAS and is never
@@ -8,9 +8,11 @@ never by its position in a list, so settings survive changes to CAMERAS order.
 File (default data/camera-settings.json, override with CCTV_SETTINGS_FILE):
 
     {"version": 1, "revision": 3, "updatedAt": "2026-09-25T12:00:00+05:30",
-     "cameras": {"nvr1:8": {"displayName": "HR Office", "displayOrder": 1}}}
+     "cameras": {"nvr1:8": {"displayName": "HR Office", "displayOrder": 1, "audio": "off"}}}
 
 Only customised cameras are stored. No custom name -> the technical name is shown.
+"audio" overrides the automatic audio detection: "on" (offer audio even if no track
+was detected) or "off" (never offer it); absent = automatic.
 
 ORDER MODEL. A custom displayOrder is a POSITION (1..N). A camera with a custom
 order sits exactly at that position; every other camera fills the remaining
@@ -32,6 +34,7 @@ import threading
 
 SCHEMA_VERSION = 1
 NAME_MAX = 60
+AUDIO_VALUES = ("on", "off")
 # control characters and angle brackets are rejected in names (defence in depth:
 # the UI renders names as text anyway)
 _BAD_NAME = re.compile(r"[\x00-\x1f\x7f<>]")
@@ -54,7 +57,7 @@ class CameraSettings:
         self._pos = {k: i for i, k in enumerate(self.keys)}
         self._lock = threading.RLock()
         self._log = log or (lambda msg: None)
-        self._data = {}            # key -> {"displayName": str, "displayOrder": int}
+        self._data = {}            # key -> {"displayName": str, "displayOrder": int, "audio": "on"|"off"}
         self.revision = 0
         self.updated_at = None
         self.warnings = []
@@ -83,6 +86,8 @@ class CameraSettings:
                         o = v.get("displayOrder")
                         if isinstance(o, int) and not isinstance(o, bool) and o >= 1:
                             e["displayOrder"] = o
+                        if v.get("audio") in AUDIO_VALUES:
+                            e["audio"] = v["audio"]
                         if e:
                             data[k] = e
                     rev = doc.get("revision", 0)
@@ -146,6 +151,11 @@ class CameraSettings:
         with self._lock:
             return self._ordered(self._data)
 
+    def audio_override(self, index):
+        """None (automatic), "on" or "off"."""
+        with self._lock:
+            return self._data.get(self.keys[index], {}).get("audio")
+
     def display_name(self, index):
         with self._lock:
             return self._data.get(self.keys[index], {}).get("displayName") or self.cameras[index]["name"]
@@ -186,6 +196,7 @@ class CameraSettings:
                     "displayName": e.get("displayName") or cam["name"],
                     "customName": e.get("displayName"),
                     "displayOrder": pos[i], "customOrder": custom.get(i), "defaultOrder": i + 1,
+                    "audio": e.get("audio") or "auto",
                 })
             return {"version": SCHEMA_VERSION, "revision": self.revision, "updatedAt": self.updated_at,
                     "limits": {"nameMax": NAME_MAX, "orderMin": 1, "orderMax": len(self.keys)},
@@ -193,7 +204,7 @@ class CameraSettings:
 
     # ── updates ────────────────────────────────────────────────────────────
     def update(self, changes, base_revision=None):
-        """Apply {key: {"displayName": str|None, "displayOrder": int|None}}.
+        """Apply {key: {"displayName": str|None, "displayOrder": int|None, "audio": "auto"|"on"|"off"|None}}.
         A missing field is left unchanged; None resets it to the default. All
         changes are validated together and written atomically, or nothing is.
         -> (http_status, payload dict)."""
@@ -216,13 +227,13 @@ class CameraSettings:
                 if not isinstance(ch, dict):
                     errors.append(err(k, None, "Invalid change."))
                     continue
-                extra = set(ch) - {"displayName", "displayOrder"}
+                extra = set(ch) - {"displayName", "displayOrder", "audio"}
                 if extra:
                     errors.append(err(k, None, f"Unknown field(s): {', '.join(sorted(extra))}."))
                     continue
                 tech = self.cameras[self._pos[k]]["name"]
                 e = new.get(k, {})
-                old_name, old_order = e.get("displayName"), e.get("displayOrder")
+                old_name, old_order, old_audio = e.get("displayName"), e.get("displayOrder"), e.get("audio")
                 if "displayName" in ch:
                     v = ch["displayName"]
                     if v is None:
@@ -249,6 +260,14 @@ class CameraSettings:
                         errors.append(err(k, "displayOrder", f"Display order must be between 1 and {n}."))
                     else:
                         e["displayOrder"] = v
+                if "audio" in ch:
+                    v = ch["audio"]
+                    if v is None or v == "auto":
+                        e.pop("audio", None)
+                    elif v in AUDIO_VALUES:
+                        e["audio"] = v
+                    else:
+                        errors.append(err(k, "audio", "Audio must be auto, on or off."))
                 if e:
                     new[k] = e
                 else:
@@ -257,6 +276,8 @@ class CameraSettings:
                     changed.append(f"{k} name {old_name or tech!r} -> {e.get('displayName') or tech!r}")
                 if e.get("displayOrder") != old_order:
                     changed.append(f"{k} order {old_order or 'auto'} -> {e.get('displayOrder') or 'auto'}")
+                if e.get("audio") != old_audio:
+                    changed.append(f"{k} audio {old_audio or 'auto'} -> {e.get('audio') or 'auto'}")
             if not errors:
                 claims = {}
                 for k in self.keys:                          # order must be unique

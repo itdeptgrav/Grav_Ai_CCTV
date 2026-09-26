@@ -1,0 +1,459 @@
+FINAL CCTV CAMERA AUDIO REPORT
+Project : D:\GRAV_Project\grav-cctv          Date: 2026-09-26
+Legend  : PASS = verified   FAIL = verified broken   NOT TESTED = not verified (reason given)
+"real" = real NVRs; "offline" = automated tests against a fake NVR speaking real RTSP;
+"browser" = a real browser (Chromium) against a test server with synthetic video and a
+fake NVR sending a 1 kHz G.711 tone. Sections 1-20 were written before the first real
+audio session; the REAL PRODUCTION section right below is the real-NVR result and
+supersedes anything older that contradicts it.
+
+==========================================================================================
+REAL PRODUCTION AUDIO FIX (2026-09-26) -- "Audio reconnecting..." and no sound
+==========================================================================================
+Real = the real NVRs through the office public IP, from this laptop. First ONE camera
+(HR office = NVR2 channel 8), then the cameras you clicked yourself on your laptop
+server, which you restarted at 14:28 with the fix (read-only watch of its /api/status).
+No username / password / RTSP URL appears in any log, status or this report.
+
+ 1. EXACT REASON                                                           FOUND, FIXED
+    The NVR does NOT use the RTP channel the client asks for. The audio-only SETUP asked
+    "interleaved=0-1"; the NVR answered
+        Transport: RTP/AVP/TCP;unicast;interleaved=2-3;ssrc=...
+    (it numbers the channels by track: audio = track 1 -> 2-3). The audio RTP then
+    arrived on channel 2 (RTCP on 3), while the client kept reading channel 0 -- the
+    channel it had ASKED for. So it counted 0 audio packets, hit its read timeout
+    ("READ_TIMEOUT: no audio packet for ~5 s"), reconnected, and did that forever:
+    "Audio reconnecting..." with no sound (your server had 43 such sessions on corridor
+    office, all with 0 packets). Both NVRs behave this way (NVR1 also answers 2-3).
+    The offline tests passed because the fake NVR echoed the requested channel.
+    Fix: rtsp_audio.py reads interleaved= from every SETUP reply and uses THOSE channels
+    (audio RTP, RTCP, and the video track's in the fallback). The fake NVR now assigns
+    its own channels like the real one, and a test reproduces the old failure.
+ 2. DESCRIBE RESULT                                                        PASS (real)
+    200 OK. Content-Base: rtsp://<nvr>/cam/realmonitor?channel=8&subtype=1/
+    SDP: video H265 pt 98 "a=control:trackID=0"; audio PCMA/8000 pt 8 "a=control:trackID=1".
+ 3. AUDIO CONTROL URI                                                      PASS (real)
+    Content-Base + control = rtsp://<nvr>/cam/realmonitor?channel=8&subtype=1/trackID=1
+    (_join() correct). PLAY is sent to the Content-Base (aggregate) URI -- accepted.
+ 4. AUDIO-ONLY SETUP RESPONSE                                              PASS (real)
+    200 OK, "Transport: RTP/AVP/TCP;unicast;interleaved=2-3;ssrc=1FD0E820",
+    "Session: 244973111165;timeout=60". That Session is sent on PLAY, on the
+    GET_PARAMETER keep-alive (every 20 s) and on TEARDOWN.
+ 5. FALLBACK RESULT                                     NOT NEEDED (real) / PASS (offline)
+    The real NVRs accept an audio-only SETUP (videoTrackSetUp: null), so no video is
+    sent for audio. The video+audio fallback also follows the NVR-assigned channels
+    (offline: an NVR that refuses audio-only and assigns video 4-5 / audio 6-7).
+ 6. PLAY RESULT                                                            PASS (real)
+    200 OK, "RTP-Info: url=trackID=1;seq=38463;rtptime=912278951"; first audio RTP
+    packet 248 ms after PLAY (HR office on your server; 138 ms in the first test).
+ 7. REAL INTERLEAVED CHANNEL                                               PASS (real)
+    Audio RTP = channel 2, RTCP = channel 3, on NVR1 and NVR2, exactly as the SETUP
+    reply said. /api/status: cameras[i].audio.rtsp.nvrInterleaved = {"rtp": 2, "rtcp": 3}.
+ 8. AUDIO RTP RECEIVED                                                     YES (real)
+    HR office on your server: 1520 audio RTP packets in 3 min 15 s, 0 reconnects,
+    frames per channel {"2": 1520, "3": 39 (RTCP)}, 1.58 MB over TCP. Payload type 8
+    (taken from the SDP -- no fixed PT assumed; RTCP never taken as audio). 1024 bytes =
+    128 ms per packet on NVR2, 320 bytes = 40 ms on NVR1. Six cameras played on your
+    server after the fix: HR office, PM office, NVR2 Cam 2, NVR2 Cam 6, Meeting office,
+    CEO office -- 14 sessions, 6167 packets.
+ 9. CODEC                                                                  PASS (real)
+    NVR2: PCMA (G.711 A-law), NVR1: PCMU (G.711 mu-law), 8000 Hz mono.
+10. levelDb                                                    REAL SOUND (real)
+    HR office -29.5 dBFS (peak -15.5); PM office -30.0 (-14.7); NVR2 Cam 6 -13.9 (-2.7);
+    Meeting office -46.5, peaks up to -4.4 (loud sound at the mic); CEO office -55.4.
+    It changes second by second (first HR office test: -23 ... -42 dBFS per second) --
+    live microphones, not silence (digital silence would be about -72 dBFS).
+    A 10 s decoded WAV of the first HR office test was saved locally (scratchpad).
+11. WEBSOCKET PACKETS RECEIVED                                             PASS (real)
+    Test client on the real HR office stream: HTTP 101, states CONNECTING -> PLAYING,
+    79 binary packets, codec byte 8, 1024-byte payloads, 0 sequence gaps. Your browser:
+    the server shows 1 listener, PLAYING, packets flowing.
+12. AudioContext STATE                                     RUNNING (browser, offline stream)
+    Built-in browser, real click on the fullscreen speaker: AudioContext "running"
+    (created inside the click; a rejected resume() would be logged), 48 kHz output.
+    Console "[AUDIO UI]" lines: WebSocket open (101), first packet (codec byte 8,
+    1024 samples), 10 s summaries (packets, scheduled seconds, gaps, drops). Decoded
+    samples scheduled 0.25-0.45 s ahead, 0 sequence gaps. That run used the fake NVR
+    with the real packet format, so as not to open another NVR session while you were
+    testing; the real stream was verified up to the WebSocket (11).
+13. SOUND HEARD                                                  NOT CONFIRMED BY ME
+    The server delivered live microphone audio (8, 10) to your browser's audio socket.
+    Whether you HEARD it is the one thing only you can confirm: please tell me.
+14. FILES CHANGED (this fix)
+    rtsp_audio.py   uses the NVR-assigned interleaved channels; handshake log (NVR
+                    address masked); per-channel frame counters; RTCP never taken as
+                    audio; TCP connect timeout 3 -> 5 s (one lost SYN is retried at 3 s:
+                    3 s failed twice in a row on the public-IP path, then worked)
+    server.py       /api/status audio: rtsp {handshake, nvrInterleaved, tcpBytes,
+                    framesByChannel, audioRtpPackets}, peakDb, silent, uiCause;
+                    "NO_AUDIO_PACKETS" reason (PLAY accepted, no RTP -- with the channel
+                    and the per-channel frame counts); silence detection (never a
+                    reconnect); audio read timeout = the video's (8 s); precise viewer
+                    causes; pool: a listened audio between two attempts keeps its slot
+                    (see 16)
+    grid_page.py    statuses (see below), "[AUDIO UI]" console diagnostics, resume()
+                    rejection logged, stale-audio handling (see 16), ±2 % playback rate
+    fake_nvr.py     assigns its own channels like the real NVR, 1024-byte packets,
+                    RTCP sender reports, silence / no-RTP behaviours
+    test_audio.py   +30 checks (84): real channel assignment (4 NVR variants + the old
+                    bug reproduced), silence, no-RTP diagnosis, stall ride-through,
+                    no background churn during audio retries
+    README.md, .env.example
+    Viewer statuses: "Audio connecting…", "Waiting for NVR capacity", "Audio RTSP setup
+    failed — retrying", "Audio stream unavailable — retrying", "NVR not reachable —
+    audio retrying", "Audio reconnecting…", "Audio connected — no sound detected",
+    "Audio interrupted — waiting for the NVR…", "Muted". No technical detail is sent to
+    the browser; /api/status has the precise reason, detail and handshake.
+15. NVR SLOT PEAK                                                          PASS (real)
+    First test (check server, synthetic video in the other slots so only the audio
+    touched the NVR): NVR2 6/6 = 5 background + HR office AUDIO_FULLSCREEN -- the audio
+    took a BACKGROUND slot. Your server, 10 min watch: NVR2 peak 6/6 = 5 watched grid
+    tiles + 1 AUDIO; switching audio to another camera made it wait ~1 s (NVR_FULL)
+    until the lingering one yielded (PREEMPTED). Never 7. NVR1 peak 3/6.
+16. VIDEO STABLE                                                           PASS (real)
+    Audio never restarted, switched or stopped a video worker; the listened camera's
+    video stayed LIVE (HR office: video LIVE while its audio played, no reconnect).
+    Found and fixed on the way:
+    * While audio retried, the slot it releases during the back-off was given to a
+      background video stream, which was stopped again at the retry (churn on the NVR;
+      with the old bug this happened on every retry). A listened audio now counts as
+      slot demand between attempts (test: old rule = the same background stream
+      demoted twice in 3 retries; new rule = one yield at most).
+    * Network: at 14:30:21 and 14:32:59 EVERY video stream on BOTH NVRs and the audio
+      stopped receiving data at the same instant (laptop <-> office public-IP path;
+      TCP connects to both NVRs timed out meanwhile). Video waited on its open
+      connections and resumed after 4-8 s; audio gave up at 5 s and reconnected
+      (it recovered in 1 s, 629 ms to the first packet). Audio now waits as long as
+      video (8 s) and shows "Audio interrupted — waiting for the NVR…" meanwhile.
+    * Browser: audio that fell > 0.8 s behind live used to be fixed by dropping the
+      NEWEST packets, which could keep it 0.8 s late; now the stale QUEUE is dropped
+      and playback re-anchored at 0.25 s; mute/unmute and stop flush the queue; ±2 %
+      playback rate absorbs the camera-vs-browser clock difference.
+    Standard -> Original -> Standard while listening (browser): video switched both
+    ways, audio untouched (same WebSocket, same NVR session, 0 gaps).
+17. NOT TESTED
+    * Sound physically heard (13) -- needs you.
+    * Production (cctv.grav.in, Alienware on the office LAN): not deployed (the code is
+      uncommitted); remote listening through Cloudflare (WebSocket) not tested.
+    * Standard/Original switching with REAL audio in a browser (done with the fake NVR
+      in the browser, and offline); mute / volume with real audio in a browser.
+    * Long sessions (> 5 min) and camera-vs-browser clock drift on real streams.
+    * Phones / Safari.
+
+==========================================================================================
+SUMMARY
+==========================================================================================
+* Every healthy camera's NVR stream carries a microphone track: G.711 A-law (NVR2) /
+  mu-law (NVR1), 8000 Hz mono, in BOTH Standard and Original (verified by RTSP DESCRIBE
+  only -- no media session was opened). Whether each camera has a microphone actually
+  connected (vs. silence) can only be heard / measured live -- see 19.
+* OpenCV (the video path) CANNOT deliver audio: its FFmpeg backend rejects the audio
+  parameters ("unsupported parameters in .open()", tested offline with the cameras'
+  exact codec). So audio cannot share the video session without replacing OpenCV.
+* Built: audio ON DEMAND as its own audio-only RTSP session per LISTENED camera (the NVR
+  sends ~64 kbit/s, no video), shared by every listener, inside the NVR slot limit,
+  never taking a slot from watched video. Browser: WebSocket + Web Audio. Off by default,
+  one camera at a time, instant mute, volume memory.
+* Offline + browser: all behaviour verified (409 automated checks pass after the
+  real-production fix -- audio 84, slots 59, relay 65, quality 60, lifecycle 11,
+  settings 86, stability 44; in a real
+  browser the tone arrived at the audio output at the expected level and pitch, mute /
+  unmute / volume / switching / page change / no-audio camera all behaved as specified).
+* Real test: see REAL PRODUCTION above -- the first real session exposed the channel
+  bug (fixed); since then six cameras have played live microphone audio on your
+  laptop server. Hearing it: to be confirmed by you. Production: not deployed yet.
+
+==========================================================================================
+1. WHICH CAMERAS HAVE AUDIO                                               PASS (real, SDP)
+==========================================================================================
+Method: authenticated RTSP DESCRIBE per camera and stream (the same request the video
+pre-flight sends before every connection) -- the SDP answer lists the tracks. No SETUP /
+PLAY, so no media session; one request at a time, closed at once. Names from production.
+
+   #  Camera                     NVR   CH  Standard  Original  Codec                  Sample rate
+   1  Floor 19 - Storage         NVR2   1  YES       YES       PCMA (G.711 A-law)     8000 Hz mono
+   2  Cutting Section 1          NVR2   2  YES       YES       PCMA (G.711 A-law)     8000 Hz mono
+   3  Cutting Section 2          NVR2   3  YES       YES       PCMA (G.711 A-law)     8000 Hz mono
+   4  Accoutant Office           NVR2   4  YES       YES       PCMA (G.711 A-law)     8000 Hz mono
+   5  Ironing Section            NVR2   5  no answer* YES       PCMA (G.711 A-law)     8000 Hz mono
+   6  NVR2 Cam 6                 NVR2   6  YES       YES       PCMA (G.711 A-law)     8000 Hz mono
+   7  NVR2 Cam 7                 NVR2   7  dead channel (no video), not probed
+   8  HR office                  NVR2   8  YES       YES       PCMA (G.711 A-law)     8000 Hz mono
+   9  NVR2 Cam 9                 NVR2   9  YES       YES       PCMA (G.711 A-law)     8000 Hz mono
+  10  NVR2 Cam 10                NVR2  10  YES       YES       PCMA (G.711 A-law)     8000 Hz mono
+  11  Production Manager Chamber NVR2  11  YES       YES       PCMA (G.711 A-law)     8000 Hz mono
+  12  NVR2 Cam 12                NVR2  12  dead channel (no video), not probed
+  13  NVR2 Cam 13                NVR2  13  dead channel (no video), not probed
+  14  NVR1 Cam 3                 NVR1   3  YES       YES       PCMU (G.711 mu-law)    8000 Hz mono
+  15  CEO Chamber                NVR1   4  YES       YES       PCMU (G.711 mu-law)    8000 Hz mono
+  16  Grav Office Outside view 2 NVR1   5  YES       YES       PCMU (G.711 mu-law)    8000 Hz mono
+  17  Grav Office Outside View   NVR1   6  YES       YES       PCMU (G.711 mu-law)    8000 Hz mono
+  18  Packaging & Dispatch Secti NVR1   7  YES       YES       PCMU (G.711 mu-law)    8000 Hz mono
+  19  Sampling Section           NVR1   8  YES       YES       PCMU (G.711 mu-law)    8000 Hz mono
+  20  Reception Area             NVR1   9  YES       YES       PCMU (G.711 mu-law)    8000 Hz mono
+  21  NVR1 Cam 10                NVR1  10  dead channel (no video), not probed
+  22  Conference Room            NVR1  11  YES       YES       PCMU (G.711 mu-law)    8000 Hz mono
+  23  Production Floor 1         NVR1  12  YES       YES       PCMU (G.711 mu-law)    8000 Hz mono
+  24  Sampling Section Footage 2 NVR1  13  YES       YES       PCMU (G.711 mu-law)    8000 Hz mono
+  25  Corridor office            NVR1  14  YES       YES       PCMU (G.711 mu-law)    8000 Hz mono
+  * Ironing Section's Standard stream did not answer DESCRIBE at that moment (like a
+    channel with no live video); its Original stream has audio. The server then uses
+    the Original stream for that camera's audio automatically.
+  "YES" = the NVR sends an audio track. Many NVRs send one even with no microphone
+  (silence); /api/status "levelDb" shows the real level once someone listens.
+
+==========================================================================================
+2. AUDIO CODECS                                                           PASS (real, SDP)
+==========================================================================================
+  NVR1: PCMU = G.711 mu-law, 8000 Hz, mono, 64 kbit/s
+  NVR2: PCMA = G.711 A-law,  8000 Hz, mono, 64 kbit/s
+Browsers cannot play raw G.711 through <audio>, but it is trivial to decode (256-entry
+table), so the server passes it through untouched and the page decodes it in
+JavaScript and plays it with Web Audio -- no transcoding, no FFmpeg needed.
+(The decoder tables were checked against independent G.711 encoders: <= 4 % error,
+which is G.711's own quantisation.)
+
+==========================================================================================
+3. ARCHITECTURE CHOSEN                                                    PASS (offline + browser)
+==========================================================================================
+  CURRENT : OpenCV receives each camera's RTSP session. FFmpeg inside it even receives
+            the audio track, but OpenCV cannot hand audio out (proven, see summary).
+  OPTION A: separate audio RTSP connection per camera          <- chosen, ON DEMAND ONLY
+  OPTION B: one ingest (own RTSP client / FFmpeg) for video+audio, fanned out
+            -> the better long-term design IF audio is used a lot, but it means
+               replacing OpenCV as the video receiver for every camera: a video
+               rewrite you asked not to do unless necessary. Not needed for on-demand
+               audio of one camera at a time.
+  OPTION C: go2rtc / MediaMTX -> new service; its low-latency audio path (WebRTC)
+            does not pass through the Cloudflare Tunnel without a TURN server.
+Chosen, exactly as your point 20 allows: audio ON DEMAND for the camera(s) someone
+listens to -- never "video + audio connection for every camera":
+  * one AudioWorker per camera, started by the first listener, shared by all
+    listeners, kept 10 s after the last one (quick re-listen / mute grace), then closed;
+    never kept in the background;
+  * its RTSP session SETs UP ONLY THE AUDIO TRACK (the NVR sends audio, no video); if an
+    NVR refuses that, it sets up video+audio on the same session and ignores the video;
+  * it holds a normal NVR slot (key 2000 + camera), priority AUDIO (60) /
+    AUDIO_FULLSCREEN (65) -- below every watched video (80-100): it can take a
+    BACKGROUND stream's slot (the pool yields one at once) but NEVER a watched stream's;
+    with no free slot the listener sees "Audio waiting for available NVR capacity";
+  * at most CCTV_AUDIO_MAX_PER_NVR (2) audio sessions per NVR;
+  * completely independent of the video workers (own thread, own reconnects).
+
+==========================================================================================
+4. DOES AUDIO REUSE THE VIDEO RTSP CONNECTION?                            NO (proven)
+==========================================================================================
+Not possible with OpenCV (rejects audio). Audio uses its own session -- but only for a
+camera that someone is actually listening to, and only one per camera however many
+browsers listen. Audio does not depend on the video quality: it always reads the
+Standard stream's audio track (the same microphone as Original).
+
+==========================================================================================
+5. ADDITIONAL NVR SLOTS REQUIRED                                          PASS (offline)
+==========================================================================================
+  +1 slot per LISTENED camera (normally 1 in total), 0 when nobody listens.
+  It never exceeds the per-NVR cap (6): the slot comes from a free or background slot.
+  Tests: 6 watched tiles fill NVR1 -> audio WAITS, the fake NVR never sees a 7th
+  session, video untouched; one viewer leaves -> audio gets the slot. NVR2 full of
+  background streams -> one yields, audio plays in 0.37 s. Peak slots in every test:
+  6/6, never above. Visible in /api/status (NVR slot table: AUDIO entries).
+  Practical effect: a grid page whose 6 tiles are ALL on one NVR leaves no slot for
+  audio of that NVR while it is on screen (the speaker says so); the fullscreen view
+  (1 video) always leaves room. Mixed pages (e.g. production page 1: 5 NVR2 + 1 NVR1)
+  have room.
+
+==========================================================================================
+6. BROWSER DELIVERY PROTOCOL                                              PASS (browser)
+==========================================================================================
+WebSocket  ws(s)://<host>/audio/<index>?key=...  -- same access check as video (401
+without the key, tested). Why not an HTTP stream: a grid page already uses all 6
+HTTP/1.1 connections a browser allows per host (LAN / direct access); WebSockets do not
+count against that limit. Cloudflare Tunnel supports WebSockets.
+Messages: binary = [1, codec, packet number] + G.711 bytes as they arrive (real: 40 ms
+= 320 bytes on NVR1, 128 ms = 1024 bytes on NVR2); text = {"state", "cause", "silent",
+"codec", "rate"} on every change (no technical detail). Only NEW audio is sent.
+Browser: decodes, plays through Web Audio with a ~0.25 s jitter buffer (held at
+0.25-0.45 s by a ±2 % playback rate); audio more than 0.8 s behind live is dropped from
+the QUEUE and playback re-anchored (never stale audio); pings every 15 s keep proxies
+awake and detect dead connections.
+Latency: server forwards each packet immediately (first packet 12 ms after connecting to
+the fake NVR). Expected end-to-end: NVR packetising + network + ~0.25 s buffer, i.e.
+roughly 0.3-0.6 s -- similar to or slightly ahead of the MJPEG video. NOT measured on
+the real NVR (see 20).
+
+==========================================================================================
+7. FILES CHANGED                                                          PASS
+==========================================================================================
+  rtsp_audio.py      NEW  audio-only RTSP client (digest auth, SDP, SETUP audio track,
+                          TCP-interleaved RTP, keep-alive, TEARDOWN, fallback) + G.711 tables
+  server.py          AudioWorker, WebSocket /audio/<i>, audio detection from every
+                     pre-flight SDP (persisted in data/audio-detected.json), slot/pool
+                     integration, status fields; plus one stability fix found while testing
+                     (a finished quality-switch bridge and a pool demotion could free two
+                     slots at once, letting two Originals connect together -- fixed)
+  rtsp_preflight.py  keeps the DESCRIBE answer (SDP) for the audio detection
+  camera_settings.py per-camera "audio": auto / on / off (validated, atomic save)
+  grid_page.py       speakers (tiles, fullscreen), volume slider, header audio pill,
+                     AudioManager (Web Audio), key M
+  settings_page.py   Audio field per camera (Automatic / On / Off + what was detected)
+  ui_theme.py        two icons (speaker, muted speaker) in the existing icon style
+  test_audio.py      NEW (84 checks after the real-production fix);  fake_nvr.py NEW (tests only)
+  test_live_stability.py  encoder test now compares with a same-run baseline (it
+                     depended on the Windows timer resolution -- not a code issue)
+  README.md, .env.example  audio documented (the .env.example SSO line untouched)
+
+==========================================================================================
+8. UI CONTROLS                                                            PASS (browser)
+==========================================================================================
+  * Tile: a small speaker in the bottom info bar (right of "NVR2 · CH 8"), muted icon by
+    default. The tile that owns audio gets an accent speaker and an accent line on its
+    info bar. Clicking it never opens the fullscreen view.
+  * Fullscreen bar: speaker button + volume slider (shown while audio is on) + a short
+    status (see REAL PRODUCTION 14 for the full list, e.g. "Audio connecting…",
+    "Waiting for NVR capacity", "Audio connected — no sound detected", "Muted").
+    Key M = listen / mute.
+  * Header: a compact pill with a speaker icon and the camera name while audio plays
+    (amber while connecting/waiting); click = stop. Hidden when audio is off (no clutter).
+  * Camera without audio: speaker disabled, tooltip "No audio available" (browser: a
+    camera whose stream has no audio track -> after the first check the button is
+    disabled, no broken control). Settings "Off": tooltip "Audio is turned off for this
+    camera (Settings)".
+  * Settings page: "Audio" per camera: Automatic (use what the NVR stream offers) / On /
+    Off, with "detected: PCMA 8 kHz" / "detected: no audio track" / "not checked yet".
+    Browser: Off -> saved -> the grid's list says disabled; back to Automatic -> available.
+  * States: OFF, CONNECTING, WAITING (NVR capacity), PLAYING, RECONNECTING, ERROR,
+    UNAVAILABLE -- separate from the video state (video can be LIVE while audio is not).
+
+==========================================================================================
+9. MUTE BEHAVIOR                                                          PASS (browser)
+==========================================================================================
+Default: audio OFF for every camera, on every page load (only a click starts it --
+browser autoplay rules are respected: the audio engine is created inside the click).
+Mute (click the lit speaker, or M): instant -- gain 0 (browser: output went to digital
+silence at once), status "Muted"; the WebSocket and the NVR session stay 10 s, so
+unmuting within that time is instant and reuses the same connection (browser: same
+WebSocket, output back at -18.2 dBFS). After 10 s muted the audio is released.
+
+==========================================================================================
+10. VOLUME BEHAVIOR                                                       PASS (browser)
+==========================================================================================
+Slider 0-100 % in the fullscreen bar, default 50 % (= the camera's own level; 100 % =
+twice as loud), remembered per browser (localStorage "cctv-volume"). Audio stays OFF
+until clicked regardless of the volume. Browser: 7 % -> gain 0.14 -> output -35.3 dBFS
+(= -18.2 dB + 20*log10(0.14), exact), value saved.
+
+==========================================================================================
+11. AUDIO SWITCHING                                                       PASS (offline + browser)
+==========================================================================================
+Only one camera per browser: starting audio on camera B stops A first. Browser: A
+playing -> click B: A's WebSocket closed, B plays, only B's tile highlighted, header
+shows B. Leaving the fullscreen view stops audio started there; opening / stepping to
+another camera in fullscreen stops the previous camera's audio; changing the grid page
+stops audio of a camera that is no longer on screen (browser: verified).
+Offline: A -> B -> A: only the intended camera's session stays; A's ends after the
+linger; nothing left running afterwards.
+
+==========================================================================================
+12. STANDARD / ORIGINAL SWITCHING BEHAVIOR                                PASS (offline)
+==========================================================================================
+Audio is independent of the video quality. While listening, Standard -> Original ->
+Standard: the audio session is untouched (no new NVR session, no audio transition, one
+audio session only). In the page, a quality switch only changes the video URL.
+
+==========================================================================================
+13. MULTIPLE VIEWERS RESULT                                               PASS (offline)
+==========================================================================================
+Browser A + browser B on the same camera: ONE NVR audio session, 2 listeners, both get
+the same packets. B leaves: A continues on the same session (no new PLAY). 6 listeners
+on 2 cameras = 2 NVR sessions.
+
+==========================================================================================
+14. RECONNECT RESULT                                                      PASS (offline)
+==========================================================================================
+NVR ends the audio stream: "RECONNECTING reason=STREAM_CLOSED" -> "PLAYING
+reason=RECONNECTED"; no audio RTP PACKET for 8 s (= the video's read timeout; a silent
+microphone still sends packets and never reconnects; a shorter stall shows "Audio
+interrupted" and resumes on the same session): "RECONNECTING reason=READ_TIMEOUT" ->
+PLAYING; PLAY accepted but no audio RTP at all: "NO_AUDIO_PACKETS" (with channel and
+per-channel frame counts); the audio session cannot be opened: RECONNECTING / ERROR, retries with back-off,
+recovers by itself. In all cases the listener's WebSocket stays open and the camera's
+VIDEO was not touched (still LIVE, no transition, no reconnect). If the NVR is
+unreachable, audio waits and reconnects with it (never plays stale audio: the browser
+only plays packets as they arrive and drops late ones).
+
+==========================================================================================
+15. CPU                                                                   PASS (offline)
+==========================================================================================
+Server code + fake NVR + test clients in one process (so these are upper bounds):
+  no listener                    0 %      (nothing runs)
+  1 listener                     3.3 % of one core
+  5 listeners, same camera      10.6 %    (1 NVR session)
+  6 listeners, 2 cameras        13.5 %    (2 NVR sessions)
+RAM: ~80 KB audio buffer per listened camera + one thread per listener. For comparison:
+one Standard video stream ~18-26 % of a core, one Original ~90 % (earlier measurements).
+
+==========================================================================================
+16. BANDWIDTH                                                             PASS (offline)
+==========================================================================================
+  NVR -> server : G.711 64 kbit/s (+ RTP/RTSP framing, ~67 kbit/s), audio track only
+  server -> browser: 63.8 kbit/s measured per listener (+ WebSocket framing)
+  vs. Standard video ~1.3-1.9 Mbit/s and Original 19-36 Mbit/s per tile.
+
+==========================================================================================
+17. LAN TEST                                                              PASS (browser, synthetic) / real NOT TESTED
+==========================================================================================
+Browser on the same machine as a test server (http://127.0.0.1, synthetic video, fake
+NVR with a 1 kHz G.711 tone): speaker click -> PLAYING, 25 packets/s, jitter buffer
+210 ms, output level -18.2 dBFS with the peak at 1008 Hz (= the tone), mute / unmute /
+volume / switching / page change / no-audio camera / settings override all as specified.
+The grid on a page with 6 tiles of one NVR showed "Audio waiting for available NVR
+capacity" -- no 7th session -- exactly as designed.
+Real NVRs (via the office public IP, from this laptop): see REAL PRODUCTION above.
+A real NVR on the LAN (production): NOT TESTED (not deployed).
+
+==========================================================================================
+18. REMOTE TEST (cctv.grav.in / Cloudflare)                               NOT TESTED
+==========================================================================================
+Production does not run this code yet. The transport is a WebSocket, which Cloudflare
+Tunnel supports; the endpoint uses the same key as video. To verify after deploying,
+open cctv.grav.in from outside the office and listen to one camera.
+
+==========================================================================================
+19. REAL AUDIBLE-CAMERA RESULT                 real stream PASS / heard: TO BE CONFIRMED
+==========================================================================================
+Superseded by REAL PRODUCTION above (live microphone audio delivered from six cameras
+on your laptop server; whether it was heard is for you to confirm). Production (not
+deployed yet) holds 6 connections per NVR; there the pool gives the audio session a
+background slot. After deploying:
+  1. open cctv.grav.in, open HR office (NVR2 ch8) fullscreen, click the speaker;
+  2. you should hear the room; /api/status -> cameras[7].audio shows state PLAYING,
+     codec PCMA, rtsp.nvrInterleaved {"rtp": 2}, levelDb (about -72 = G.711 digital
+     silence / no microphone -> "no sound detected"; -60..-10 = sound);
+  3. mute, change the volume, try another camera, switch Standard/Original.
+If a camera plays but is silent (levelDb ~ -90), that camera has no microphone
+connected or its audio is off in the NVR -- the NVR still sends a silent track.
+
+==========================================================================================
+20. NOT TESTED
+==========================================================================================
+  * Now tested for real (see REAL PRODUCTION): real packet size (1024 / 320 bytes),
+    audio-only SETUP accepted (yes), channel assignment (2-3). Still open: sound heard
+    (you), real latency vs. video, and whether the NVR counts an audio-only session
+    like a video one -- assumed yes, so it is counted as a full slot.
+  * Remote access through Cloudflare (WebSocket).
+  * Phones / Safari (an old-Safari fallback for 8 kHz audio buffers is implemented).
+  * Which cameras have a microphone actually connected (SDP says every stream has an
+    audio track; the level tells after listening).
+
+==========================================================================================
+DEPLOY / NEXT STEPS
+==========================================================================================
+1. Commit + push; on the Alienware: stop python server.py, git pull, start it again.
+2. Real test as in 19 (one camera first, then switch, then Standard/Original).
+3. If audio will be used a lot (many cameras, many people), Option B (one ingest for
+   video + audio, replacing OpenCV's RTSP input) would remove the extra connection --
+   a larger project; this on-demand design keeps the video path unchanged.
+4. Settings: CCTV_AUDIO (1), CCTV_AUDIO_LINGER_S (10), CCTV_AUDIO_MAX_PER_NVR (2),
+   CCTV_AUDIO_READ_TIMEOUT_S (= CCTV_READ_TIMEOUT_MS, 8 s), CCTV_AUDIO_OPEN_TIMEOUT_S (8),
+   CCTV_AUDIO_SILENCE_DBFS (-60), CCTV_AUDIO_SILENCE_S (3).
+5. Still open: rotate CCTV_SSO_SECRET (it is in .env.example in git).

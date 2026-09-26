@@ -144,6 +144,32 @@ body.viewing #view{display:block}
   background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:rgba(255,255,255,.82);
   font-size:12.5px;font-weight:600;font-variant-numeric:tabular-nums}
 .vpos:empty{display:none}
+/* ── camera audio ─────────────────────────────────────────── */
+.cam .aud{flex:none;width:28px;height:28px;margin-right:-6px;padding:0;border:0;border-radius:7px;background:transparent;
+  color:var(--muted);display:inline-flex;align-items:center;justify-content:center}
+.cam .aud .ic{width:16px;height:16px}
+.cam .aud:hover:not(:disabled){background:var(--surface-4);color:var(--text)}
+.cam .aud:disabled{opacity:.3;cursor:not-allowed}
+.cam.aon .aud,.cam.aon .aud:hover:not(:disabled){background:var(--accent);color:#fff}
+.cam.aon .cap{box-shadow:inset 0 2px 0 var(--accent)}
+.aud.wait .ic,#abtn.wait .ic{animation:apulse 1.2s ease-in-out infinite}
+.aud.err{color:#f87171}
+@keyframes apulse{50%{opacity:.35}}
+.apill{height:32px;padding:0 11px;display:inline-flex;align-items:center;gap:7px;border-radius:999px;flex:none;
+  border:1px solid rgba(79,140,255,.55);background:rgba(79,140,255,.16);color:#dbe7ff;font-size:12px;font-weight:650;max-width:190px}
+.apill .ic{width:16px;height:16px}
+.apill .an{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.apill.wait{border-color:rgba(245,158,11,.55);background:rgba(245,158,11,.14);color:#fde68a}
+.apill[hidden]{display:none}
+.abox{display:inline-flex;align-items:center;gap:8px;flex:none}
+#abtn.on,#abtn.on:hover:not(:disabled){background:var(--accent);border-color:var(--accent)}
+#abtn:disabled{opacity:.35}
+#avol{width:100px;display:none;accent-color:var(--accent);margin:0}
+.abox.on #avol{display:block}
+.astat{font-size:12px;color:rgba(255,255,255,.78);white-space:nowrap;max-width:280px;overflow:hidden;text-overflow:ellipsis}
+.astat:empty{display:none}
+.astat.warn{color:#fde68a}
+.astat.bad{color:#fca5a5}
 /* fullscreen quality indicator */
 .qpill{flex:none;height:28px;padding:0 10px;display:inline-flex;align-items:center;gap:6px;border-radius:999px;
   background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:rgba(255,255,255,.85);
@@ -182,6 +208,10 @@ body.viewing #view{display:block}
   .qseg .qs{display:inline}
   .qseg button{padding:0 9px}
   #bar .qseg{display:none}
+  .apill .an{display:none}
+  .apill{padding:0 8px}
+  .astat{display:none}
+  #avol{width:76px}
   #settingsLink{width:36px;padding:0}
   #settingsLink .lbl{display:none}
   body.large .grid{grid-template-columns:minmax(0,1fr)}
@@ -246,6 +276,7 @@ body.fs{--foot:0px}
   <div class=tools>
     <div class=clock id=clock aria-hidden=true><span class=t></span><span class=d></span></div>
     <button class="icon ghost" id=layoutBtn title="Show one camera per row" aria-label="Show one camera per row"><svg class=ic><use href="#i-rows"/></svg></button>
+    <button type=button class=apill id=apill hidden><svg class=ic><use href="#i-vol"/></svg><span class=an></span></button>
     <div class=qseg role=radiogroup aria-label="Video quality"><button type=button role=radio data-q=standard aria-checked=true title="Standard &ndash; faster, lower bandwidth (Q)"><span class=ql>Standard</span><span class=qs>Std</span></button><button type=button role=radio data-q=original aria-checked=false title="Original &ndash; full camera quality, higher bandwidth (Q)"><span class=ql>Original</span><span class=qs>Orig</span></button></div>
     <button class="icon ghost fsb" title="Full screen (F)" aria-label="Full screen" hidden><svg class=ic><use href="#i-max"/></svg></button>
     <a class=btn id=settingsLink href="/settings" title="Rename and re-order cameras"><svg class=ic><use href="#i-sliders"/></svg><span class=lbl>Settings</span></a>
@@ -272,6 +303,7 @@ body.fs{--foot:0px}
     <button class=icon onclick="close_()" title="Back to all cameras (Esc)" aria-label="Back to all cameras"><svg class=ic><use href="#i-back"/></svg></button>
     <div class=vt><span id=title></span><span id=tech></span></div>
     <span class=grow></span>
+    <div class=abox id=abox><span class=astat id=astat></span><input id=avol type=range min=0 max=100 step=1 aria-label="Volume" title="Volume"><button class=icon id=abtn title="Listen to this camera (M)" aria-label="Listen to this camera"><svg class=ic><use href="#i-mute"/></svg></button></div>
     <span class=qpill id=qpill></span>
     <div class=qseg role=radiogroup aria-label="Video quality"><button type=button role=radio data-q=standard aria-checked=true title="Standard &ndash; faster, lower bandwidth (Q)"><span class=ql>Standard</span><span class=qs>Std</span></button><button type=button role=radio data-q=original aria-checked=false title="Original &ndash; full camera quality, higher bandwidth (Q)"><span class=ql>Original</span><span class=qs>Orig</span></button></div>
     <span class=vpos id=vpos></span>
@@ -283,7 +315,7 @@ body.fs{--foot:0px}
   <button class="side r" onclick="step(1)" title="Next camera (&rarr;)" aria-label="Next camera"><svg class=ic><use href="#i-right"/></svg></button>
 </div>
 
-<template id=cellTpl><div class=cam tabindex=0 role=button><div class=vid><img fetchpriority=high><svg class="ic ex"><use href="#i-expand"/></svg></div><div class=cap><b class=num></b><span class=name></span><span class=meta></span></div><div class=nocam><svg class=ic><use href="#i-off"/></svg><span>No camera</span></div></div></template>
+<template id=cellTpl><div class=cam tabindex=0 role=button><div class=vid><img fetchpriority=high><svg class="ic ex"><use href="#i-expand"/></svg></div><div class=cap><b class=num></b><span class=name></span><span class=meta></span><button type=button class=aud aria-label="Listen to this camera"><svg class=ic><use href="#i-mute"/></svg></button></div><div class=nocam><svg class=ic><use href="#i-off"/></svg><span>No camera</span></div></div></template>
 
 <script>
 const PER  = 6;
@@ -345,8 +377,12 @@ function buildCells(){
     const cell = tpl.content.firstElementChild.cloneNode(true);
     grid.appendChild(cell);
     const c = { cell, img: cell.querySelector('img'), span: cell.querySelector('.name'),
-                meta: cell.querySelector('.meta'), num: cell.querySelector('.num'), idx: null, cam: null };
+                meta: cell.querySelector('.meta'), num: cell.querySelector('.num'), aud: cell.querySelector('.aud'),
+                idx: null, cam: null };
     c.img.alt = '';
+    // speaker: listen to THIS camera (does not open the large view)
+    c.aud.onclick = (e) => { e.stopPropagation(); if (c.cam) audioToggle(c.cam, 'grid'); };
+    c.aud.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') e.stopPropagation(); };  // not the tile's open
     cell.onclick = () => { if (c.cam) open_(c.cam); };
     cell.onkeydown = (e) => { if ((e.key === 'Enter' || e.key === ' ') && c.cam){ e.preventDefault(); open_(c.cam); } };
     // server-restart / transient recovery: retry this cell's own camera
@@ -398,6 +434,8 @@ function showPage(){
       c.img.removeAttribute('src');
     }
   });
+  if (AUD.cam != null && !fullscreen && !cells.some(c => c.idx === AUD.cam)) audioStop();
+  renderAudio();
 }
 
 function renderPager(loading){
@@ -496,6 +534,8 @@ function open_(cam){
   try { if (!(history.state && history.state.cctvView)) history.pushState({cctvView: 1}, ''); } catch (e) {}
   setLiveInfo(cam);
   startLive(cam);
+  if (AUD.cam != null && AUD.cam !== i) audioStop();
+  renderAudio();
   document.body.classList.add('viewing');
   $('view').focus({preventScroll: true});
   wake();
@@ -513,6 +553,8 @@ function step(d){
   live.removeAttribute('src');
   liveCam = cam;
   setLiveInfo(cam);
+  if (AUD.cam != null && AUD.cam !== cam.index) audioStop();
+  renderAudio();
   wake();
   clearTimeout(stepT);
   // flicking through several cameras only opens the one you stop on
@@ -527,6 +569,7 @@ function close_(fromHistory){
   liveCam = null;
   clearTimeout(qpollT);
   $('qpill').textContent = '';
+  if (AUD.cam != null && AUD.origin === 'fullscreen') audioStop();
   const live = document.getElementById('live');
   document.body.classList.remove('viewing');
   $('view').classList.remove('idle', 'ready');
@@ -566,6 +609,7 @@ $('stage').addEventListener('dblclick', () => toggleFs());
 // a reload hung ~7 min until the tab was closed). 'beforeunload' runs before the
 // reload request is sent (no prompt is shown); 'pagehide' covers mobile Safari.
 function stopAllStreams(){
+  audioStop();
   cells.forEach(c => c.img.removeAttribute('src'));
   const live = document.getElementById('live');
   if (live) { live.onerror = null; live.removeAttribute('src'); }
@@ -632,6 +676,208 @@ function renderQPill(d){
     ? 'Original: the camera\'s main stream at its own resolution'
     : 'Standard: the camera\'s sub-stream (light). Switch to Original for full detail.';
 }
+
+// ── camera audio ───────────────────────────────────────────────────────────
+// One camera's microphone at a time, OFF until the user clicks a speaker (browsers
+// only allow sound after a click). The server relays the NVR's G.711 packets over a
+// WebSocket (not an HTTP stream: a grid page already uses the browser's 6 connections
+// per host); they are decoded here with 256-entry tables and played through Web Audio
+// behind a ~0.25 s jitter buffer. Audio is independent of video: switching Standard /
+// Original or a video reconnect never touches it.
+const VKEY = 'cctv-volume';
+const AUD = { cam: null, name: '', origin: null, ws: null, ctx: null, gain: null, state: 'OFF', cause: '',
+              muted: false, next: 0, graceT: 0, retryT: 0, volume: 50, up: 1, srcs: [],
+              st: {pk: 0, by: 0, gap: 0, late: 0, seq: -1, sched: 0, t: 0} };
+// "[AUDIO UI]" console lines: socket open/close, first packet, a summary every 10 s
+function alog(m){ try { console.info('[AUDIO UI] ' + m); } catch (e) {} }
+try { const v = parseInt(localStorage.getItem(VKEY), 10); if (v >= 0 && v <= 100) AUD.volume = v; } catch (e) {}
+const ULAW = new Float32Array(256), ALAW = new Float32Array(256);
+for (let i = 0; i < 256; i++){
+  const u = ~i & 0xFF, s = ((((u & 0x0F) << 3) + 0x84) << ((u >> 4) & 7)) - 0x84;
+  ULAW[i] = ((u & 0x80) ? -s : s) / 32768;
+  const a = i ^ 0x55, e = (a >> 4) & 7, m = a & 0x0F, t = e ? (((m << 4) + 0x108) << (e - 1)) : ((m << 4) + 8);
+  ALAW[i] = ((a & 0x80) ? t : -t) / 32768;
+}
+function hasAudio(cam){ return !!cam && cam.audio !== 'unavailable' && cam.audio !== 'disabled'; }
+function audioCtx(){             // called inside the click: the browser allows sound only then
+  if (!AUD.ctx){
+    const C = window.AudioContext || window.webkitAudioContext;
+    AUD.ctx = new C();
+    AUD.gain = AUD.ctx.createGain();
+    AUD.gain.connect(AUD.ctx.destination);
+    try { AUD.ctx.createBuffer(1, 8, 8000); AUD.up = 1; } catch (e) { AUD.up = 3; }   // old Safari: >= 22.05 kHz
+    alog('AudioContext created: ' + AUD.ctx.state + ', ' + AUD.ctx.sampleRate + ' Hz output');
+  }
+  if (AUD.ctx.state !== 'running'){
+    const p = AUD.ctx.resume();
+    if (p && p.then) p.then(() => alog('AudioContext resumed: ' + AUD.ctx.state),
+                            (e) => alog('AudioContext resume REJECTED: ' + e));
+  }
+  return AUD.ctx;
+}
+function applyGain(){          // 50 % = the camera's own level, 100 % = twice as loud
+  if (AUD.gain) AUD.gain.gain.setTargetAtTime(AUD.muted ? 0 : AUD.volume / 50, AUD.ctx.currentTime, 0.01);
+}
+function audioUrl(i){
+  let u = '/audio/' + i + q;
+  if (fullscreen && liveCam && liveCam.index === i) u = addParam(u, 'prio=full');
+  return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + u;
+}
+function audioStart(cam, origin){          // runs inside the click: the browser allows sound
+  audioCtx();
+  if (AUD.cam === cam.index && AUD.ws){     // unmute: same session, instant, back at live (no backlog)
+    audioFlush(); AUD.next = 0;
+    AUD.muted = false; AUD.origin = origin; clearTimeout(AUD.graceT); applyGain(); renderAudio(); return;
+  }
+  audioStop();                              // only one camera at a time
+  Object.assign(AUD, {cam: cam.index, name: cam.displayName, origin, muted: false, state: 'CONNECTING', cause: ''});
+  applyGain();
+  openAudio();
+  renderAudio();
+}
+function openAudio(){
+  const i = AUD.cam, ws = new WebSocket(audioUrl(i));
+  ws.binaryType = 'arraybuffer';
+  AUD.ws = ws; AUD.next = 0;
+  Object.assign(AUD.st, {pk: 0, by: 0, gap: 0, late: 0, seq: -1, sched: 0, t: Date.now()});
+  ws.onopen = () => alog('camera ' + i + ': WebSocket open (HTTP 101), AudioContext ' + (AUD.ctx && AUD.ctx.state));
+  ws.onmessage = (ev) => {
+    if (AUD.ws !== ws) return;
+    if (typeof ev.data === 'string'){
+      let m = {}; try { m = JSON.parse(ev.data); } catch (e) {}
+      alog('camera ' + i + ': state ' + m.state + (m.cause ? ' (' + m.cause + ')' : '') + (m.codec ? ' ' + m.codec : ''));
+      if (m.state === 'UNAVAILABLE'){
+        const c = cams.find(x => x.index === i); if (c) c.audio = 'unavailable';
+        audioStop(); return;
+      }
+      AUD.state = m.state || AUD.state; AUD.cause = m.cause || '';
+      renderAudio(); return;
+    }
+    playPacket(new Uint8Array(ev.data));
+  };
+  ws.onclose = (e) => {
+    alog('camera ' + i + ': WebSocket closed (code ' + e.code + ') after ' + AUD.st.pk + ' packets');
+    if (AUD.ws !== ws) return;
+    AUD.ws = null;
+    if (AUD.cam !== i) return;
+    AUD.state = 'RECONNECTING'; AUD.cause = ''; renderAudio();
+    clearTimeout(AUD.retryT);
+    AUD.retryT = setTimeout(() => { if (AUD.cam === i && !AUD.ws) openAudio(); }, 2000);
+  };
+}
+function playPacket(b){
+  if (b.length < 7 || b[0] !== 1 || !AUD.ctx) return;
+  const ctx = AUD.ctx, tab = b[1] === 8 ? ALAW : ULAW, n = b.length - 6, up = AUD.up, s = AUD.st;
+  const seq = ((b[2] << 24) | (b[3] << 16) | (b[4] << 8) | b[5]) >>> 0;
+  if (s.seq >= 0 && seq !== s.seq + 1) s.gap++;
+  s.seq = seq; s.pk++; s.by += n;
+  if (s.pk === 1) alog('first audio packet: codec byte ' + b[1] + (b[1] === 8 ? ' (A-law)' : ' (mu-law)') + ', '
+                       + n + ' samples, packet #' + seq + ', AudioContext ' + ctx.state);
+  const buf = ctx.createBuffer(1, n * up, 8000 * up), ch = buf.getChannelData(0);
+  for (let k = 0; k < n; k++){ const v = tab[b[6 + k]]; for (let r = 0; r < up; r++) ch[k * up + r] = v; }
+  const now = ctx.currentTime;
+  if (AUD.next < now + 0.02) AUD.next = now + 0.25;        // start / after a gap: small jitter buffer
+  else if (AUD.next > now + 0.8){                          // behind live (burst after a network stall, or the
+    s.late += audioFlush(); AUD.next = now + 0.25;         // browser's clock slowed while muted): drop the
+  }                                                        // QUEUED audio, never play stale audio
+  // the camera's clock and this browser's never run at exactly the same speed: play 2 %
+  // faster / slower (inaudible for speech) to hold the buffer near 0.25-0.45 s instead
+  // of running empty (gaps) or full (dropped audio) every minute or so
+  const ahead = AUD.next - now, rate = ahead > 0.45 ? 1.02 : ahead < 0.18 ? 0.98 : 1;
+  const src = ctx.createBufferSource();
+  src.buffer = buf; src.playbackRate.value = rate; src.connect(AUD.gain); src.start(AUD.next);
+  AUD.srcs.push(src);
+  src.onended = () => { const k = AUD.srcs.indexOf(src); if (k >= 0) AUD.srcs.splice(k, 1); };
+  AUD.next += n / 8000 / rate; s.sched += n / 8000;
+  if (AUD.state !== 'PLAYING'){ AUD.state = 'PLAYING'; renderAudio(); }
+  if (Date.now() - s.t >= 10000){
+    s.t = Date.now();
+    alog(s.pk + ' packets, ' + s.sched.toFixed(1) + ' s scheduled, ' + s.gap + ' gaps, ' + s.late
+         + ' dropped late, AudioContext ' + ctx.state + ', gain ' + (AUD.gain ? AUD.gain.gain.value.toFixed(2) : '-'));
+  }
+}
+function audioFlush(){          // stop everything queued in the browser -> number of buffers dropped
+  const n = AUD.srcs.length;
+  AUD.srcs.forEach(x => { try { x.stop(); } catch (e) {} });
+  AUD.srcs = [];
+  return n;
+}
+function audioStop(){
+  clearTimeout(AUD.graceT); clearTimeout(AUD.retryT);
+  const ws = AUD.ws; AUD.ws = null;
+  if (ws) try { ws.close(); } catch (e) {}
+  audioFlush();
+  Object.assign(AUD, {cam: null, name: '', origin: null, state: 'OFF', cause: '', muted: false, next: 0});
+  renderAudio();
+}
+function audioMute(){          // instant; the session stays 10 s so unmuting is instant too
+  AUD.muted = true; applyGain(); renderAudio();
+  clearTimeout(AUD.graceT);
+  AUD.graceT = setTimeout(() => { if (AUD.muted) audioStop(); }, 10000);
+}
+function audioToggle(cam, origin){
+  if (!hasAudio(cam)) return;
+  if (AUD.cam === cam.index && !AUD.muted) audioMute(); else audioStart(cam, origin);
+}
+function audioText(){
+  if (AUD.muted) return {t: 'Muted', k: ''};
+  const c = AUD.cause, st = AUD.state;
+  if (st === 'PLAYING'){
+    if (c === 'silent') return {t: 'Audio connected — no sound detected', k: 'warn'};
+    if (c === 'stalled') return {t: 'Audio interrupted — waiting for the NVR…', k: 'warn'};
+    return {t: '', k: ''};
+  }
+  if (st === 'RECONNECTING' || st === 'ERROR'){
+    if (c === 'setup') return {t: 'Audio RTSP setup failed — retrying', k: 'bad'};
+    if (c === 'nostream') return {t: 'Audio stream unavailable — retrying', k: 'bad'};
+    if (c === 'nvr') return {t: 'NVR not reachable — audio retrying', k: 'bad'};
+  }
+  return ({CONNECTING: {t: 'Audio connecting…', k: 'warn'}, WAITING: {t: 'Waiting for NVR capacity', k: 'warn'},
+           RECONNECTING: {t: 'Audio reconnecting…', k: 'warn'}, ERROR: {t: 'Audio error — retrying', k: 'bad'}})[st]
+         || {t: '', k: ''};
+}
+function speaker(btn, cam, isNow){
+  const use = btn.querySelector('use');
+  const on = isNow && !AUD.muted, busy = on && AUD.state !== 'PLAYING';
+  btn.disabled = !hasAudio(cam);
+  use.setAttribute('href', on ? '#i-vol' : '#i-mute');
+  btn.classList.toggle('on', on);
+  btn.classList.toggle('wait', busy && AUD.state !== 'ERROR');
+  btn.classList.toggle('err', on && AUD.state === 'ERROR');
+  const t = !cam ? '' : cam.audio === 'disabled' ? 'Audio is turned off for this camera (Settings)'
+          : cam.audio === 'unavailable' ? 'No audio available'
+          : on ? 'Mute ' + cam.displayName + (audioText().t ? ' — ' + audioText().t : '') : 'Listen to ' + cam.displayName;
+  btn.title = t; btn.setAttribute('aria-label', t || 'Listen'); btn.setAttribute('aria-pressed', String(on));
+}
+function renderAudio(){
+  cells.forEach(c => {
+    const mine = c.cam && AUD.cam === c.idx;
+    c.aud.hidden = !c.cam;
+    if (c.cam) speaker(c.aud, c.cam, mine);
+    c.cell.classList.toggle('aon', !!mine && !AUD.muted);
+  });
+  const lv = fullscreen && liveCam, mine = lv && AUD.cam === liveCam.index;
+  if (lv) speaker($('abtn'), liveCam, mine);
+  $('abox').classList.toggle('on', !!mine && !AUD.muted);
+  const at = mine ? audioText() : {t: '', k: ''};
+  $('astat').textContent = at.t; $('astat').className = 'astat ' + at.k;
+  const pill = $('apill'), playing = AUD.cam != null && !AUD.muted;
+  pill.hidden = !playing;
+  if (playing){
+    pill.querySelector('.an').textContent = AUD.name;
+    pill.classList.toggle('wait', AUD.state !== 'PLAYING');
+    pill.title = 'Audio: ' + AUD.name + (audioText().t ? ' — ' + audioText().t : '') + ' (click to stop)';
+    pill.setAttribute('aria-label', pill.title);
+  }
+}
+$('abtn').onclick = () => { if (liveCam) audioToggle(liveCam, 'fullscreen'); };
+$('apill').onclick = () => audioStop();
+$('avol').value = String(AUD.volume);
+$('avol').oninput = (e) => {
+  AUD.volume = +e.target.value;
+  try { localStorage.setItem(VKEY, String(AUD.volume)); } catch (err) {}
+  applyGain();
+};
 
 // ── browser full screen (wall display) ─────────────────────────────────────
 const fsOK = !!(document.fullscreenEnabled || document.webkitFullscreenEnabled);
@@ -701,10 +947,12 @@ document.addEventListener('keydown', e=>{
     else if (k==='arrowleft'||k==='p') step(-1);
     else if (k==='f') toggleFs();
     else if (k==='q') setQuality(quality === 'original' ? 'standard' : 'original');
+    else if (k==='m') audioToggle(liveCam, 'fullscreen');
     else wake();
     return;
   }
   if (k==='q'){ setQuality(quality === 'original' ? 'standard' : 'original'); return; }
+  if (k==='m'){ if (AUD.cam != null) audioToggle(cams.find(c => c.index === AUD.cam), 'grid'); return; }
   if (k==='n'||k==='arrowright'||k==='pagedown') page(1);
   else if (k==='p'||k==='arrowleft'||k==='pageup') page(-1);
   else if (k==='f') toggleFs();

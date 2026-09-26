@@ -85,6 +85,7 @@ class Preflight:
         self.sock = None
         self.cseq = 0
         self.result, self.code, self.ms, self.detail = None, None, None, ""
+        self.sdp = None                               # the DESCRIBE answer (audio detection)
 
     # -- public ------------------------------------------------------------
     def run(self):
@@ -171,7 +172,9 @@ class Preflight:
                         hdrs[k] = (hdrs[k] + "\n" + v.strip()) if k in hdrs else v.strip()
                 need = int(hdrs.get("content-length", "0") or 0)
             if code is not None and len(buf) >= need:
-                return code, hdrs                    # body (SDP) fully read; not needed
+                if code == 200:                      # kept: tells whether the stream has audio
+                    self.sdp = buf[:need].decode("latin-1", "replace")
+                return code, hdrs
             if not self.alive():
                 return None, "aborted"
             if time.monotonic() >= deadline:

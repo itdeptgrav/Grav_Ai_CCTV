@@ -16,13 +16,15 @@ It is independent of the CMS and of `D:\Ai_cctv` (the original dev copy).
 | `grid_page.py`, `settings_page.py`, `ui_theme.py` | The live grid, the camera settings page, shared look |
 | `camera_settings.py` | Display names / grid order (stored in `data/`, never in git) |
 | `rtsp_preflight.py` | Fast RTSP check before OpenCV opens a camera |
+| `rtsp_audio.py` | Audio-only RTSP client for a camera's G.711 microphone track |
 | `nvr_config.py` | Camera list + NVR endpoints (from env) |
 | `netcheck.py` | Reachability probes (cross-platform) |
 | `relay_bench.py` | Viewer-experience benchmark against a running server |
 | `quality_bench.py` | Standard vs Original benchmark (resolution, fps, bandwidth, CPU) |
 | `stability_bench.py` | Long viewing test: records every LIVE/CACHED change, client and server side |
 | `nvr_capacity_probe.py` | SUPERVISED NVR capacity / direct-camera test (see its .txt) |
-| `test_*.py` | Offline tests (no NVR needed): lifecycle, slots, settings, relay, quality, live stability |
+| `test_*.py` | Offline tests (no NVR needed): lifecycle, slots, settings, relay, quality, live stability, audio |
+| `fake_nvr.py` | Fake NVR (RTSP + G.711) used only by `test_audio.py` |
 | `requirements.txt` | `opencv-python`, `numpy`, `python-dotenv` |
 | `.env.example` | Copy to `.env` and edit |
 | `run.sh` / `run.bat` | One-command run (creates venv, installs, starts) |
@@ -118,6 +120,45 @@ The header has a `[ Standard | Original ]` switch (also in the fullscreen bar; k
   like a browser and records every LIVE/CACHED change on both sides. When only the
   client side shows gaps (server says LIVE, 0 reconnects), the network between the
   server and that browser is the cause.
+
+## Camera audio
+* Audio is OFF for everyone until someone clicks a speaker: in a tile's info bar, in
+  the fullscreen bar, or key `M`. One camera at a time per browser -- starting another
+  stops the previous one. The header shows which camera is audible (click it to stop).
+  Fullscreen has a volume slider (remembered per browser; 50 % = the camera's own
+  level). Mute is instant, and the session stays 10 s so unmuting is instant too.
+  Leaving the fullscreen view (or the page with that camera) stops its audio.
+* The NVR streams carry a G.711 microphone track (NVR1 mu-law, NVR2 A-law, 8 kHz).
+  OpenCV (the video path) cannot deliver audio, so a camera being LISTENED to gets its
+  own audio-only RTSP session (the NVR sends ~64 kbit/s, no video): one per camera,
+  shared by every listener, never kept in the background. It uses a normal NVR slot:
+  a background stream yields for it, a watched video stream is never stopped for it.
+  If every slot of that NVR holds watched video (e.g. a grid page whose 6 tiles are
+  all on one NVR), the speaker shows "Waiting for NVR capacity" -- the fullscreen
+  view (one video) always leaves room.
+* The NVRs choose the interleaved RTP channel themselves: an audio-only SETUP asking
+  for 0-1 is answered "interleaved=2-3", so the client always reads the channel from
+  the NVR's SETUP reply (reading the requested one was the cause of "Audio
+  reconnecting..." with no sound).
+* A silent microphone is a working stream: "Audio connected — no sound detected",
+  never a reconnect. Only missing RTP packets reconnect (after the same 8 s as video);
+  a shorter network stall shows "Audio interrupted — waiting for the NVR…" and resumes
+  on the same session.
+* Transport: WebSocket `/audio/<index>` (same access key as video; not limited by
+  the browser's 6 connections per host), G.711 passed through and decoded in the
+  browser, ~0.25 s jitter buffer, packets that would play late are dropped.
+* Audio is independent of video: Standard <-> Original never touches it, an audio
+  failure never touches video, each reconnects on its own.
+* Detection is automatic (every video pre-flight reads the stream's SDP); a camera
+  without an audio track gets a disabled speaker ("No audio available"). Settings page:
+  Audio Automatic / On / Off per camera.
+* `/api/status`: per camera `audio` {available, codec, state, listeners, active,
+  lastPacketAgeMs, levelDb, peakDb, silent, reconnects, slotHeld, transitions, rtsp:
+  {handshake (NVR address masked), nvrInterleaved, tcpBytes, framesByChannel,
+  audioRtpPackets}}; audio sessions appear in the NVR slot table as `AUDIO` /
+  `AUDIO_FULLSCREEN`. The browser console shows `[AUDIO UI]` lines (socket, first
+  packet, a summary every 10 s).
+* Details: `FINAL_CCTV_AUDIO_REPORT.txt`.
 
 ## Run it as a service (Linux, systemd)
 Create `/etc/systemd/system/grav-cctv.service`:

@@ -540,19 +540,23 @@ def test_lingering_original_is_reused(port):
 
 def test_encoder_runs_off_the_capture_thread(port):
     i = NVR1[9]
-    SLOW_ENCODE["ms"] = 120                               # a slow 1080p encode (~8 fps max)
+    v = Viewer(port, url(i, "original", "prio=full"))
+    wait(lambda: O[i].is_live(), 5.0)
+    time.sleep(2.5)
+    base = O[i].grab_fps or 0                          # capture rate with a fast encoder (this machine)
+    SLOW_ENCODE["ms"] = 120                            # now a slow 1080p encode (~8 fps max)
     try:
-        v = Viewer(port, url(i, "original", "prio=full"))
-        wait(lambda: O[i].is_live(), 5.0)
-        time.sleep(3.0)
-        check("slow JPEG encoder: the capture loop still reads the stream at the source rate (~50 fps)",
-              (O[i].grab_fps or 0) >= 40, O[i].grab_fps)
+        d0 = O[i].enc_drops
+        time.sleep(4.5)
+        slow = O[i].grab_fps or 0
+        check(f"slow JPEG encoder: the capture loop still reads at the source rate "
+              f"({slow} fps vs {base} fps with a fast encoder)", base > 0 and slow >= 0.85 * base, (base, slow))
         check("... the encoder simply publishes fewer frames (newest wins, counted), no stall, no reconnect",
-              O[i].enc_drops > 0 and O[i].vstate == "LIVE" and O[i].reconnects == 0 and O[i].stalls == 0,
-              (O[i].enc_drops, O[i].vstate, O[i].reconnects, O[i].stalls))
-        v.close()
+              O[i].enc_drops > d0 and O[i].vstate == "LIVE" and O[i].reconnects == 0 and O[i].stalls == 0,
+              (O[i].enc_drops - d0, O[i].vstate, O[i].reconnects, O[i].stalls))
     finally:
         SLOW_ENCODE["ms"] = 0
+        v.close()
     wait(lambda: not O[i]._running, 5.0)
 
 

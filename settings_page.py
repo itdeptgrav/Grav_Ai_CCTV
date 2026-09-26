@@ -94,6 +94,12 @@ body.has-savebar .wrap{padding-bottom:110px}
 .iname{width:100%}
 .orderrow{display:flex;align-items:center;gap:6px}
 .iorder{width:92px;text-align:center;font-variant-numeric:tabular-nums}
+.iaudio{height:38px;padding:0 12px;border-radius:var(--r);border:1px solid var(--border-2);background:var(--bg);
+  color:var(--text);font:inherit;font-size:14px;width:100%;max-width:360px;cursor:pointer}
+.iaudio:hover{border-color:var(--border-3)}
+.iaudio:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.adet{font-weight:500;color:var(--muted)}
+.adet.ok{color:#4ade80}
 .where{flex:1;min-width:0;margin-left:4px;font-size:12px;color:var(--muted)}
 input.bad,input.bad:focus{border-color:var(--bad);box-shadow:0 0 0 3px var(--bad-soft)}
 .err{display:flex;flex-direction:column;align-items:flex-start;gap:6px;padding:9px 11px;border-radius:var(--r-sm);
@@ -250,6 +256,14 @@ input.bad,input.bad:focus{border-color:var(--bad);box-shadow:0 0 0 3px var(--bad
           <span class=where></span>
         </div>
       </div>
+      <div class=field>
+        <label class="lbl laudio">Audio <span class=adet></span></label>
+        <select class=iaudio>
+          <option value=auto>Automatic (use what the NVR stream offers)</option>
+          <option value=on>On &ndash; always offer the speaker button</option>
+          <option value=off>Off &ndash; never offer audio for this camera</option>
+        </select>
+      </div>
       <div class=err></div>
       <div class=actions>
         <button class="rname ghost sm" title="Use the technical name again"><svg class=ic><use href="#i-reset"/></svg>Reset name</button>
@@ -294,7 +308,9 @@ function pendName(k){ const v = norm(nameRaw(k)); return (!v || v === byKey[k].t
 function pendOrder(k){ const v = String(orderRaw(k)).trim(); if (v === '') return null; const n = Number(v); return Number.isInteger(n) ? n : NaN; }
 const label = k => pendName(k) || byKey[k].technicalName;
 const sameOrder = (a, b) => a === b;                       // NaN !== NaN -> counts as a change
-const isDirty = k => pendName(k) !== savedName(k) || !sameOrder(pendOrder(k), savedOrder(k));
+const savedAudio = k => byKey[k].audio || 'auto';
+const audioRaw = k => (pend[k] && 'audio' in pend[k]) ? pend[k].audio : savedAudio(k);
+const isDirty = k => pendName(k) !== savedName(k) || !sameOrder(pendOrder(k), savedOrder(k)) || audioRaw(k) !== savedAudio(k);
 const dirtyKeys = () => cams.map(c => c.key).filter(isDirty);
 function setPend(k, field, v){ (pend[k] = pend[k] || {})[field] = v; delete serverErr[k]; }
 function duplicates(){
@@ -374,9 +390,12 @@ function buildSlots(){
     const s = {el: e, img: $('img', e), pv: $('.pv', e), badge: $('.badge', e), chip: $('.poschip', e),
                dname: $('.dname', e), tech: $('.tech', e), unsaved: $('.unsaved', e), count: $('.count', e),
                iname: $('.iname', e), iorder: $('.iorder', e), where: $('.where', e), err: $('.err', e),
+               iaudio: $('.iaudio', e), adet: $('.adet', e),
                key: null, idx: null, live: null};
     s.iname.id = 'name' + n; $('.lname', e).htmlFor = s.iname.id;
     s.iorder.id = 'order' + n; $('.lorder', e).htmlFor = s.iorder.id;
+    s.iaudio.id = 'audio' + n; $('.laudio', e).htmlFor = s.iaudio.id;
+    s.iaudio.addEventListener('change', () => { if (s.key){ setPend(s.key, 'audio', s.iaudio.value); renderAll(); } });
     s.img.onerror = () => { const i = s.idx; setTimeout(() => {
       if (s.idx === i && i != null && s.live === i){ s.img.src = previewUrl(i) + '&_r=' + Date.now(); } }, 2000); };
     s.img.onload = () => { if (s.img.getAttribute('src')) s.pv.classList.add('ready'); };
@@ -456,6 +475,11 @@ function renderCards(){
     s.where.textContent = 'Live grid page ' + Math.ceil(pos / GRID_PER) + ', tile ' + ((pos - 1) % GRID_PER + 1) +
                           (pendOrder(k) === null ? ' (automatic)' : '');
     s.count.textContent = norm(nameRaw(k)).length + ' / ' + S.limits.nameMax;
+    if (document.activeElement !== s.iaudio) s.iaudio.value = audioRaw(k);
+    const det = c.audioDetected || {};
+    s.adet.textContent = det.state === 'available' ? 'detected: ' + (det.codec || 'audio') + (det.rate ? ' ' + det.rate / 1000 + ' kHz' : '')
+                       : det.state === 'unavailable' ? 'detected: no audio track' : 'not checked yet';
+    s.adet.className = 'adet' + (det.state === 'available' ? ' ok' : '');
     const ne = nameErr(k), oe = orderErr(k, dups), se = serverErr[k] || '';
     s.iname.classList.toggle('bad', !!ne); s.iorder.classList.toggle('bad', !!oe);
     s.iname.setAttribute('aria-invalid', String(!!ne)); s.iorder.setAttribute('aria-invalid', String(!!oe));
@@ -581,6 +605,7 @@ async function save(keys){
     const ch = {};
     if (pendName(k) !== savedName(k)) ch.displayName = pendName(k);
     if (!sameOrder(pendOrder(k), savedOrder(k))) ch.displayOrder = pendOrder(k);
+    if (audioRaw(k) !== savedAudio(k)) ch.audio = audioRaw(k);
     changes[k] = ch;
   }
   busy = true; renderAll();
@@ -589,7 +614,7 @@ async function save(keys){
     if (r.ok && d.ok){
       keys.forEach(k => { delete pend[k]; delete serverErr[k]; });
       afterSave(d);
-      say('Saved ' + keys.length + ' camera' + (keys.length > 1 ? 's' : '') + '. The live view shows the new names and order.', 'ok');
+      say('Saved ' + keys.length + ' camera' + (keys.length > 1 ? 's' : '') + '. The live view uses the new settings.', 'ok');
     } else if (r.status === 409){
       say((d.errors && d.errors[0] && d.errors[0].message) || 'Settings were changed elsewhere.', 'bad', true);
     } else {

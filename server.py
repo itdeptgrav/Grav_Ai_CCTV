@@ -57,7 +57,11 @@ import re
 import sys
 import time
 import json
+import math
+import base64
 import socket
+import struct
+import hashlib
 import threading
 import collections
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -88,6 +92,7 @@ from nvr_config import (
 )
 from netcheck import NetworkMonitor, sanitize_url
 import rtsp_preflight as rp
+import rtsp_audio as ra
 from camera_settings import CameraSettings, camera_key
 from settings_page import SETTINGS_PAGE
 from grid_page import PAGE
@@ -218,6 +223,26 @@ ORIGINAL_LINGER_S = _envfloat("CCTV_ORIGINAL_LINGER_S", 5.0)
 # RTSP read timeout of the main stream (default: the same as CCTV_READ_TIMEOUT_MS).
 ORIGINAL_READ_TIMEOUT_MS = _envint("CCTV_ORIGINAL_READ_TIMEOUT_MS", READ_TIMEOUT_MS)
 
+# ── camera audio (FINAL_CCTV_AUDIO_REPORT.txt) ─────────────────────────────────────
+# The NVR streams carry a G.711 microphone track, but OpenCV (the video path) cannot
+# deliver audio, so a camera's audio is its OWN audio-only RTSP session: opened only
+# while someone listens (one per camera, shared by every listener), counted as a
+# normal NVR slot, never kept in the background. Off for every viewer until clicked.
+AUDIO_ENABLED        = _envflag("CCTV_AUDIO", True)
+AUDIO_LINGER_S       = _envfloat("CCTV_AUDIO_LINGER_S", 10.0)     # kept after the last listener
+# no RTP PACKET this long = reconnect. Default = the video's read timeout: measured on the
+# real NVRs, a network stall froze audio AND every video stream together; video resumed on
+# its open connection after 4-8 s, so audio waits as long before it reconnects.
+AUDIO_READ_TIMEOUT_S = _envfloat("CCTV_AUDIO_READ_TIMEOUT_S", READ_TIMEOUT_MS / 1000.0)
+AUDIO_OPEN_TIMEOUT_S = _envfloat("CCTV_AUDIO_OPEN_TIMEOUT_S", 8.0)
+# A silent microphone is a working stream (packets keep arriving): it is only REPORTED
+# ("Audio connected - no sound detected") when no packet peaked above this level for
+# AUDIO_SILENCE_S, and never causes a reconnect.
+AUDIO_SILENCE_DBFS   = _envfloat("CCTV_AUDIO_SILENCE_DBFS", -60.0)
+AUDIO_SILENCE_S      = _envfloat("CCTV_AUDIO_SILENCE_S", 3.0)
+AUDIO_MAX_PER_NVR    = max(1, _envint("CCTV_AUDIO_MAX_PER_NVR", 2))  # audio sessions per NVR at most
+AUDIO_KEY_BASE       = 2000        # slot key of camera i's audio session = 2000 + i
+
 # NVR slot priority: a free slot goes to the highest waiter. A worker WITH viewers is
 # ACTIVE and is never preempted -- only workers with 0 viewers are (background, recent,
 # cache refresh, a finished quality switch, a lingering Original).
@@ -231,10 +256,13 @@ PRIO_LINGER              = 25           # 0 viewers: Original kept briefly after
 PRIO_BACKGROUND          = 20           # 0 viewers: kept HOT by the pool
 PRIO_REFRESH             = 10           # 0 viewers: short cache-refresh visit
 PRIO_IDLE                = 0
+PRIO_AUDIO_FULLSCREEN    = 65           # someone listens (fullscreen) -- below every viewed video
+PRIO_AUDIO               = 60           # someone listens (grid tile)
 PRIO_NAMES = {PRIO_FULLSCREEN_ORIGINAL: "FULLSCREEN_ORIGINAL", PRIO_FULLSCREEN_STANDARD: "FULLSCREEN_STANDARD",
               PRIO_GRID_ORIGINAL: "GRID_ORIGINAL", PRIO_GRID_STANDARD: "GRID_STANDARD",
               PRIO_HANDOFF: "HANDOFF", PRIO_RECENT: "RECENT", PRIO_LINGER: "LINGER",
-              PRIO_BACKGROUND: "BACKGROUND_WARM", PRIO_REFRESH: "CACHE_REFRESH", PRIO_IDLE: "IDLE"}
+              PRIO_BACKGROUND: "BACKGROUND_WARM", PRIO_REFRESH: "CACHE_REFRESH", PRIO_IDLE: "IDLE",
+              PRIO_AUDIO_FULLSCREEN: "AUDIO_FULLSCREEN", PRIO_AUDIO: "AUDIO"}
 _BG_PRIO = {"handoff": PRIO_HANDOFF, "recent": PRIO_RECENT, "linger": PRIO_LINGER,
             "background": PRIO_BACKGROUND, "refresh": PRIO_REFRESH}
 
@@ -267,6 +295,78 @@ def _ms(t):
 SETTINGS_FILE = os.getenv("CCTV_SETTINGS_FILE") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "data", "camera-settings.json")
 SETTINGS = CameraSettings(SETTINGS_FILE, CAMERAS, log=ev)
+
+# Which streams have an audio track -- learned for free from the SDP of every video
+# pre-flight (and every audio session), remembered across restarts. Per camera key:
+# {"1": track-or-None, "0": track-or-None}; a missing subtype = not checked yet.
+AUDIO_DETECT_FILE = os.path.join(os.path.dirname(os.path.abspath(SETTINGS_FILE)), "audio-detected.json")
+_AUDIO_DETECT = {}
+_AUDIO_DETECT_LOCK = threading.Lock()
+_AUDIO_DETECT_SAVED = {"t": 0.0, "dirty": False}
+try:
+    with open(AUDIO_DETECT_FILE, encoding="utf-8") as _f:
+        _d = json.load(_f)
+    if isinstance(_d, dict):
+        _AUDIO_DETECT = {k: v for k, v in _d.items() if isinstance(v, dict)}
+except (OSError, ValueError):
+    pass
+
+
+def _note_audio(index, subtype, info):
+    """Remember whether camera `index`'s stream `subtype` has an audio track."""
+    k, sub = camera_key(CAMERAS[index]), str(subtype)
+    info = None if not info else {x: info.get(x) for x in ("codec", "rate", "channels", "playable")}
+    with _AUDIO_DETECT_LOCK:
+        cur = _AUDIO_DETECT.setdefault(k, {})
+        if sub in cur and cur[sub] == info:
+            return
+        cur[sub] = info
+        _AUDIO_DETECT_SAVED["dirty"] = True
+        due = time.monotonic() - _AUDIO_DETECT_SAVED["t"] >= 5.0
+    ev(f"[AUDIO] Cam {index + 1} {CAMERAS[index]['name']} subtype={subtype}: "
+       + (f"audio track {info['codec']} {info['rate']} Hz" if info else "no audio track"))
+    if due:
+        _save_audio_detect()
+
+
+def _save_audio_detect():
+    with _AUDIO_DETECT_LOCK:
+        if not _AUDIO_DETECT_SAVED["dirty"]:
+            return
+        doc = json.dumps(_AUDIO_DETECT, indent=1, sort_keys=True)
+        _AUDIO_DETECT_SAVED["dirty"], _AUDIO_DETECT_SAVED["t"] = False, time.monotonic()
+    try:
+        os.makedirs(os.path.dirname(AUDIO_DETECT_FILE), exist_ok=True)
+        tmp = AUDIO_DETECT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(doc)
+        os.replace(tmp, AUDIO_DETECT_FILE)
+    except OSError:
+        pass
+
+
+def audio_detected(index):
+    """-> ("available" | "unavailable" | "unknown", track or None), from detection only."""
+    with _AUDIO_DETECT_LOCK:
+        d = dict(_AUDIO_DETECT.get(camera_key(CAMERAS[index]), {}))
+    track = d.get("1") or d.get("0")
+    if track:
+        return "available", track
+    if "1" in d or "0" in d:
+        return "unavailable", None
+    return "unknown", None
+
+
+def audio_state(index):
+    """What the UI offers: "disabled" (feature off / Settings: Off), "available",
+    "unavailable" (no audio track found) or "unknown" (not checked yet -- may try)."""
+    det, track = audio_detected(index)
+    ov = SETTINGS.audio_override(index)
+    if not AUDIO_ENABLED or ov == "off":
+        return "disabled", track
+    if ov == "on":
+        return "available", track
+    return det, track
 SETTINGS_MAX_BODY = 64 * 1024
 
 
@@ -836,6 +936,8 @@ class CamStream:
                 PREFLIGHT_SEM[nvr].release()
             if res == rp.OK:
                 _AUTH_OK[nvr] = True
+                if getattr(pf, "sdp", None):             # free audio detection
+                    _note_audio(self.index, self.subtype, ra.audio_info(pf.sdp))
             elif res == rp.AUTH_FAIL:
                 _pause_nvr_auth(nvr)
             return pf, res
@@ -1678,7 +1780,7 @@ def _housekeeping():
     while True:
         time.sleep(0.25)
         now = time.monotonic()
-        for w in STREAMS + ORIG_STREAMS:
+        for w in STREAMS + ORIG_STREAMS + AUDIO:
             try:
                 w._check_stall(now)
                 w._check_linger(now)
@@ -1691,7 +1793,458 @@ STREAMS = [CamStream(c, i) for i, c in enumerate(CAMERAS)]                      
 ORIG_STREAMS = [CamStream(c, i, quality="original") for i, c in enumerate(CAMERAS)]  # Original
 
 
+def _audio_endpoint(nvr):
+    """Where the audio session connects (tests point it at a fake NVR)."""
+    return endpoint(nvr)
+
+
+class AudioWorker:
+    """Camera audio: ONE audio-only RTSP session per camera, shared by every listener
+    (browser WebSocket). Started by the first listener, kept AUDIO_LINGER_S after the
+    last one (a quick re-listen is instant), never kept in the background. It holds a
+    normal NVR slot (key AUDIO_KEY_BASE + index): a free or background slot is used,
+    a viewed video stream is NEVER stopped for it -- if the NVR has no capacity the
+    listener is told "Audio waiting for available NVR capacity". Independent of the
+    video workers: audio failing never touches video, and Standard <-> Original never
+    touches audio (it always reads the audio track of the Standard stream).
+    Attribute / method names match CamStream where the shared slot, pool and status
+    code reads them (viewers = listeners)."""
+    quality = "audio"
+    original = False
+    slot_first = True
+    subtype = STANDARD_SUBTYPE
+
+    def __init__(self, info, index):
+        self.info, self.index, self.name = info, index, info["name"]
+        self.label = f"Cam {index + 1} {info['name']} [Audio]"
+        self.slot_key = AUDIO_KEY_BASE + index
+        self.viewers = 0              # listeners
+        self.viewers_full = 0         # ... of them in the fullscreen view
+        self.last_use = time.time()
+        self._vlock = threading.Lock()
+        self._tlock = threading.Lock()
+        self._cond = threading.Condition()
+        self._running = False
+        self._gen = 0
+        self._worker_done = threading.Event()
+        self._worker_done.set()
+        self._bg, self.bg_reason, self.bg_since, self.linger_until = False, None, 0.0, 0.0
+        self.status, self.status_since, self.last_error = S_IDLE, time.monotonic(), ""
+        self.vstate = "OFF"
+        self.transitions = collections.deque(maxlen=40)
+        self._stop_reason = None
+        self._redial = False
+        self.fail_streak = self.opens = self.reconnects = 0
+        self.codec = self.rate = self.subtype_used = None
+        self.video_setup = False
+        self.packets = self.bytes = 0
+        self.last_packet = 0.0
+        self.first_packet_ms = None
+        self.level_db = self.peak_db = None                # of the last ~1 s of audio (dBFS)
+        self._lv = collections.deque(maxlen=64)            # (t, mean square, peak) per packet
+        self.silent = False           # PLAYING but nothing above AUDIO_SILENCE_DBFS for AUDIO_SILENCE_S
+        self.playing_since = self.last_sound = 0.0
+        self.detail = ""
+        self.reason = ""              # reason of the last state change
+        self.diag = {}                # current / last RTSP session: handshake + counters (no credentials)
+        self._pkts = collections.deque(maxlen=250)        # (n, payload): 10-30 s of audio
+        self._n = 0
+
+    # shared machinery (slot queue, status, transition log) -- same code as video
+    _current = CamStream._current
+    _state = CamStream._state
+    _sleep = CamStream._sleep
+    _acquire_slot = CamStream._acquire_slot
+    transitions_view = CamStream.transitions_view
+
+    def _trans(self, to, reason, detail=""):
+        self.detail = sanitize_url(detail or "")[:300]
+        self.reason = reason
+        if to not in ("PLAYING", "STALLED"):
+            self.silent = False
+        CamStream._trans(self, to, reason, detail)
+        with self._cond:
+            self._cond.notify_all()                         # listeners report the new state
+
+    def ui_cause(self):
+        """Viewer-facing cause of the current state (no technical detail): '' | silent |
+        stalled | capacity | nvr | setup | nostream."""
+        st, r = self.vstate, self.reason
+        if st == "STALLED":
+            return "stalled"                        # session open, no packet for > 2 s
+        if st == "PLAYING":
+            return "silent" if self.silent else ""
+        if st == "WAITING_SLOT":
+            return "capacity"
+        if st == "NVR_UNREACHABLE" or r == "TCP_CONNECT_FAILED":
+            return "nvr"
+        if r in ("DESCRIBE_FAILED", "SETUP_FAILED", "PLAY_FAILED", "TIMEOUT", "AUTH_FAIL", "LOGIN_PAUSED"):
+            return "setup"
+        if r == "NO_AUDIO_PACKETS":
+            return "nostream"
+        return ""
+
+    def twin(self):
+        return self
+
+    @property
+    def pinned(self):
+        return False
+
+    def slot_priority(self):
+        if self.viewers_full > 0:
+            return PRIO_AUDIO_FULLSCREEN
+        if self.viewers > 0:
+            return PRIO_AUDIO
+        if self._running and self._bg:
+            return PRIO_LINGER
+        return PRIO_IDLE
+
+    def priority_name(self):
+        return PRIO_NAMES.get(self.slot_priority(), str(self.slot_priority()))
+
+    def role(self):
+        if self.viewers:
+            return "listening"
+        return "linger" if self._running else "idle"
+
+    def is_live(self, now=None):
+        now = time.monotonic() if now is None else now
+        return self._running and self.last_packet > 0 and now - self.last_packet <= 1.5
+
+    def frame_age_ms(self):
+        return round((time.monotonic() - self.last_packet) * 1000) if self.last_packet else None
+
+    def latest(self):
+        with self._cond:
+            return self._n
+
+    # ── listeners ───────────────────────────────────────────────────────────────
+    def add_listener(self, full=False):
+        spawn = None
+        with self._vlock:
+            self.viewers += 1
+            if full:
+                self.viewers_full += 1
+            if self.bg_reason == "linger":
+                self._bg, self.bg_reason, self.linger_until = False, None, 0.0
+            self.last_use = time.time()
+            if not self._running:
+                self._running = True
+                self._gen += 1
+                prev, self._worker_done = self._worker_done, threading.Event()
+                spawn = (self._gen, prev, self._worker_done)
+            n = self.viewers
+        if spawn:
+            threading.Thread(target=self._run, args=spawn, daemon=True).start()
+        _ensure_housekeeping()
+        _POOL_WAKE.set()
+        return n
+
+    def remove_listener(self, full=False):
+        with self._vlock:
+            if self.viewers > 0:
+                self.viewers -= 1
+            if full and self.viewers_full > 0:
+                self.viewers_full -= 1
+            if self.viewers == 0 and self._running:
+                if AUDIO_LINGER_S > 0:          # quick re-listen / mute grace: no new session
+                    self._bg, self.bg_reason = True, "linger"
+                    self.bg_since = time.monotonic()
+                    self.linger_until = self.bg_since + AUDIO_LINGER_S
+                else:
+                    self._running = False
+                    self._stop_reason = "LISTENERS_GONE"
+            n = self.viewers
+        _POOL_WAKE.set()
+        return n
+
+    def stop_bg(self, reason="POOL_DEMOTION"):
+        with self._vlock:
+            self._bg, self.bg_reason, self.linger_until = False, None, 0.0
+            if self.viewers == 0 and self._running:
+                self._running = False
+                self._stop_reason = reason
+
+    def force_stop(self, reason="FORCED"):
+        with self._vlock:
+            if self._running:
+                self._stop_reason = reason
+            self._running = False
+            self._bg, self.bg_reason = False, None
+        with self._cond:
+            self._cond.notify_all()
+
+    def _check_linger(self, now):
+        with self._vlock:
+            due = (self.viewers == 0 and self._running and self.bg_reason == "linger"
+                   and now > self.linger_until)
+        if due:
+            self.stop_bg("LINGER_EXPIRED (no listener)")
+
+    def _check_stall(self, now):
+        if self.vstate == "PLAYING" and self.last_packet and now - self.last_packet > 2.0:
+            self._trans("STALLED", f"NO_PACKET_AGE_{round((now - self.last_packet) * 1000)}MS",
+                        "session open, the NVR sent no audio packet")
+
+    # ── the worker ─────────────────────────────────────────────────────────────
+    def _quota_ok(self, nvr):
+        with _ACTIVE_LOCK:
+            keys = set(NVR_OWNERS[nvr])
+        held = sum(1 for k in keys if k >= AUDIO_KEY_BASE and k != self.slot_key)
+        return held < AUDIO_MAX_PER_NVR
+
+    def _source_subtype(self):
+        with _AUDIO_DETECT_LOCK:
+            d = dict(_AUDIO_DETECT.get(camera_key(self.info), {}))
+        if "1" in d and not d["1"] and ("0" not in d or d["0"]):
+            return 0                     # the Standard stream has no audio track, the main one may
+        return STANDARD_SUBTYPE
+
+    def _push(self, payload):
+        now = time.monotonic()
+        with self._cond:
+            self._n += 1
+            self._pkts.append((self._n, payload))
+            self.packets += 1
+            self.bytes += len(payload)
+            self.last_packet = now
+            self._cond.notify_all()
+        # level of every packet (8000 table look-ups a second: negligible), over the last second
+        ss, pk = ra.level(payload, self.codec)
+        self._lv.append((now, ss, pk))
+        win = [x for x in self._lv if now - x[0] <= 1.0]
+        ms = sum(x[1] for x in win) / len(win)
+        peak = max(x[2] for x in win)
+        self.level_db = round(10 * math.log10(ms / 32768.0 ** 2), 1) if ms > 0 else -120.0
+        self.peak_db = round(20 * math.log10(peak / 32768.0), 1) if peak > 0 else -120.0
+        # silence is only REPORTED: packets arriving keep the session alive, a quiet room
+        # or a camera without a microphone must never cause a reconnect
+        if pk > 0 and 20 * math.log10(pk / 32768.0) > AUDIO_SILENCE_DBFS:
+            self.last_sound = now
+            if self.silent:
+                self.silent = False
+                ev(f"[{self.label}] audio: sound detected again (peak {self.peak_db} dBFS)")
+                with self._cond:
+                    self._cond.notify_all()
+        elif not self.silent and now - max(self.last_sound, self.playing_since) >= AUDIO_SILENCE_S:
+            self.silent = True
+            ev(f"[{self.label}] audio: no sound detected -- every packet below {AUDIO_SILENCE_DBFS:g} dBFS for "
+               f"{AUDIO_SILENCE_S:g} s (the stream is fine: {self.packets} packets; NOT reconnecting)")
+            with self._cond:
+                self._cond.notify_all()
+        if self.vstate == "STALLED":
+            self._trans("PLAYING", "PACKETS_RESUMED", "audio packets arrive again (same session)")
+
+    def _snap(self, sess):
+        """Credential-free facts of the current / last RTSP audio session (status API)."""
+        self.diag = {"handshake": list(sess.log),
+                     "nvrInterleaved": ({"rtp": sess.audio_channel, "rtcp": sess.rtcp_channel}
+                                        if sess.audio else None),
+                     "videoTrackInterleaved": sess.video_channel,
+                     "tcpBytes": sess.bytes_in,
+                     "framesByChannel": {str(k): v for k, v in sorted(sess.frames.items())},
+                     "audioRtpPackets": sess.audio_packets,
+                     "otherPayloadType": sess.other_pt,
+                     "sessionTimeoutS": sess.session_timeout if sess.session else None}
+
+    def _run(self, gen, prev_done, done):
+        nvr = self.info["nvr"]
+        try:
+            while not prev_done.wait(0.05):          # one audio session per camera, always
+                if not self._current(gen):
+                    return
+            fail = 0
+            self.fail_streak = 0
+            self._stop_reason = None
+            self._redial = False
+            ev(f"[{self.label}] audio worker start ({nvr} ch{self.info['channel']})")
+            self._trans("CONNECTING", "LISTENER", f"{self.viewers} listener(s)")
+            while self._current(gen):
+                h = MONITOR.get(nvr)
+                if h is not None and h.checked and not h.reachable:
+                    if self.vstate != "NVR_UNREACHABLE":
+                        self._trans("NVR_UNREACHABLE", "NVR_UNREACHABLE", f"network monitor: {h.label}")
+                    self._state(gen, S_NVR_DOWN, h.label)
+                    self._sleep(gen, 2.0)
+                    continue
+                if _nvr_auth_paused(nvr):
+                    if self.vstate != "ERROR":
+                        self._trans("ERROR", "LOGIN_PAUSED", "the NVR rejected the credentials; paused")
+                    self._state(gen, S_LOGIN)
+                    self._sleep(gen, 5.0)
+                    continue
+                if not self._quota_ok(nvr):
+                    if self.vstate != "WAITING_SLOT":
+                        self._trans("WAITING_SLOT", "AUDIO_LIMIT",
+                                    f"{AUDIO_MAX_PER_NVR} camera audio session(s) already open on {nvr.upper()}")
+                    self._state(gen, S_WAIT_SLOT, "audio session limit")
+                    self._sleep(gen, 1.0)
+                    continue
+                outcome = self._attempt(gen, nvr, fail)
+                if outcome is None or not self._current(gen):
+                    break
+                fail, pause = outcome
+                self.fail_streak = fail
+                if pause:
+                    self._sleep(gen, pause)
+        finally:
+            with self._vlock:
+                if gen == self._gen and not self._running and self.status != S_IDLE:
+                    self.status, self.status_since = S_IDLE, time.monotonic()
+                reason = self._stop_reason or ("SUPERSEDED" if gen != self._gen else "STOPPED")
+            if self.vstate not in ("OFF", "UNAVAILABLE"):
+                self._trans("OFF", re.split(r"[ :]", reason)[0], reason)
+            done.set()
+            _POOL_WAKE.set()
+            with self._cond:
+                self._cond.notify_all()
+            ev(f"[{self.label}] audio worker stopped")
+
+    def _attempt(self, gen, nvr, fail):
+        """Slot -> DESCRIBE/SETUP(audio)/PLAY -> packets until it drops or nobody listens.
+        -> None (stop) or (fail count, pause s). The slot is always released before
+        any back-off."""
+        if self.vstate not in ("CONNECTING", "RECONNECTING"):
+            self._trans("RECONNECTING" if (self._redial or fail) else "CONNECTING", "RETRY" if fail else "SLOT",
+                        "")
+        if not self._acquire_slot(gen, nvr):        # never above the NVR cap
+            return None
+        why, detail, had, sess = "STOPPED", "", False, None
+        try:
+            if self.vstate == "WAITING_SLOT":
+                self._trans("CONNECTING", "SLOT_ACQUIRED", "")
+            sub = self._source_subtype()
+            host, port = _audio_endpoint(nvr)
+            n = NVRS[nvr]
+            url = f"rtsp://{host}:{port}/cam/realmonitor?channel={self.info['channel']}&subtype={sub}"
+            sess = ra.AudioSession(host, port, n["user"], n["pass"], url, timeout=AUDIO_OPEN_TIMEOUT_S,
+                                   alive=lambda: self._current(gen), with_video=self.video_setup)
+            t0 = time.monotonic()
+            try:
+                info = sess.open()
+            except ra.NoAudio as e:
+                why = e.code
+                _note_audio(self.index, sub, None if e.code == "NO_AUDIO_TRACK" else {"codec": "?", "playable": False})
+                self._trans("UNAVAILABLE", e.code, e.detail)
+                with self._vlock:
+                    self._running = False
+                    self._stop_reason = e.code
+                return None
+            except ra.AuthFailed as e:
+                why = "AUTH_FAIL"
+                _pause_nvr_auth(nvr)
+                self._trans("ERROR", "AUTH_FAIL", e.detail)
+                return fail + 1, 0.0
+            except ra.RtspError as e:
+                if e.code == "ABORTED":
+                    return None
+                why, fail = e.code, fail + 1
+                self._trans("ERROR" if fail >= 3 else "RECONNECTING", e.code, e.detail)
+                self._state(gen, S_OFFLINE if fail >= 3 else S_RETRYING, e.detail)
+                return fail, _backoff_s(fail)
+            finally:
+                self._snap(sess)                        # the handshake, also when it failed
+            self.opens += 1
+            self.codec, self.rate, self.subtype_used = info["codec"], info["rate"], sub
+            self.video_setup = sess.video_setup
+            _AUTH_OK[nvr] = True
+            _note_audio(self.index, sub, {"codec": info["codec"], "rate": info["rate"],
+                                          "channels": info["channels"], "playable": True})
+            ev(f"[{self.label}] audio session open: {info['codec']} {info['rate']} Hz, audio RTP on "
+               f"interleaved channel {sess.audio_channel} (NVR-assigned)"
+               + (", video track set up too" if sess.video_setup else ", audio-only"))
+            t_last = t_ka = t_snap = time.monotonic()
+            while self._current(gen):
+                pkts = sess.read(0.5)
+                now = time.monotonic()
+                self.last_use = time.time()
+                if pkts:
+                    if not had:
+                        had = True
+                        self.first_packet_ms = round((now - t0) * 1000)
+                        self.playing_since, self.last_sound, self.silent = now, 0.0, False
+                        self._lv.clear()
+                        self._state(gen, S_LIVE)
+                        self._trans("PLAYING", "RECONNECTED" if self._redial else "FIRST_PACKET",
+                                    f"{self.codec} {self.rate} Hz, first packet {self.first_packet_ms} ms after "
+                                    f"connecting, interleaved channel {sess.audio_channel}"
+                                    + (" (video track set up too: the NVR refused audio-only)"
+                                       if sess.video_setup else ""))
+                        fail = 0
+                    for payload, _seq, _ts in pkts:
+                        self._push(payload)
+                    t_last = now
+                elif now - t_last > AUDIO_READ_TIMEOUT_S:
+                    # only a missing RTP PACKET counts here; silent packets keep the session alive
+                    gap = round((now - t_last) * 1000)
+                    if had:
+                        why, detail = "READ_TIMEOUT", f"no audio packet for {gap} ms"
+                    else:
+                        why = "NO_AUDIO_PACKETS"
+                        detail = (f"PLAY accepted, but no audio RTP on interleaved channel {sess.audio_channel} "
+                                  f"within {gap} ms (TCP bytes {sess.bytes_in}, frames per channel "
+                                  f"{dict(sorted(sess.frames.items()))})")
+                    break
+                if now - t_ka >= min(20.0, max(5.0, sess.session_timeout / 3.0)):
+                    sess.keepalive()
+                    t_ka = now
+                if now - t_snap >= 1.0:
+                    self._snap(sess)
+                    t_snap = now
+            else:
+                why = self._stop_reason or "STOPPED"
+                return None
+        except ra.RtspError as e:
+            why, detail = e.code, e.detail
+        except OSError as e:
+            why, detail = "STREAM_CLOSED", f"connection error ({type(e).__name__})"
+        finally:
+            if sess is not None:
+                sess.close()
+                self._snap(sess)
+            _slot_release(nvr, self.slot_key, why)
+            _POOL_WAKE.set()
+        if not self._current(gen):
+            return None
+        if had:
+            self.reconnects += 1
+            self._redial = True
+        else:
+            fail += 1
+        self._trans("RECONNECTING", why, detail)
+        self._state(gen, S_RETRYING, detail)
+        return (0, 0.5) if had else (fail, _backoff_s(fail))
+
+    def info_view(self, now, owners):
+        """Credential-free audio state of this camera (status API)."""
+        st, track = audio_state(self.index)
+        last = self.transitions_view(now, 1)
+        return {"available": st, "setting": SETTINGS.audio_override(self.index) or "auto",
+                "codec": self.codec or (track or {}).get("codec"),
+                "rate": self.rate or (track or {}).get("rate"),
+                "state": self.vstate, "detail": self.detail or None, "active": self._running,
+                "listeners": self.viewers, "slotHeld": self.slot_key in owners.get(self.info["nvr"], {}),
+                "priority": self.slot_priority(), "priorityName": self.priority_name(),
+                "lastPacketAgeMs": self.frame_age_ms(), "levelDb": self.level_db, "peakDb": self.peak_db,
+                "silent": self.silent if self.vstate in ("PLAYING", "STALLED") else None,
+                "lastSoundAgeMs": round((now - self.last_sound) * 1000) if self.last_sound else None,
+                "uiCause": self.ui_cause() or None,
+                "packets": self.packets, "kbytes": round(self.bytes / 1024, 1),
+                "reconnects": self.reconnects, "opens": self.opens, "firstPacketMs": self.first_packet_ms,
+                "sourceSubtype": self.subtype_used, "videoTrackSetUp": self.video_setup or None,
+                "listenersFullscreen": self.viewers_full,
+                "lastTransitionReason": last[0]["reason"] if last else None,
+                "rtsp": self.diag or None,
+                "transitions": self.transitions_view(now, 10)}
+
+
+AUDIO = [AudioWorker(c, i) for i, c in enumerate(CAMERAS)]
+
+
 def _worker_by_key(key):
+    if key >= AUDIO_KEY_BASE:
+        return AUDIO[key - AUDIO_KEY_BASE]
     return ORIG_STREAMS[key - ORIG_KEY_BASE] if key >= ORIG_KEY_BASE else STREAMS[key]
 
 
@@ -1811,8 +2364,19 @@ class PoolManager:
                          key=lambda o: queued[o.slot_key])
         nxt = waiting[0] if waiting and not connecting else None
         orig_need = len(holding) + (1 if nxt is not None else 0)
+        # camera audio: a session someone listens to is demand like a viewer -- also
+        # between two attempts (it releases its slot during the back-off; were it not
+        # counted, a background stream would be started in that slot and stopped again
+        # at the retry). Not while it waits for its own per-NVR audio limit. A
+        # lingering one (0 listeners) yields first.
+        aud = [a for a in AUDIO if a.info["nvr"] == nvr and a._running]
+        aud_need = [a for a in aud if a.viewers > 0 and (a.slot_key in owned or a.slot_key in queued
+                                                          or a.reason != "AUDIO_LIMIT")]
+        aud_idle = [a for a in aud if a.viewers == 0 and a.slot_key in owned]
+        if aud_need:
+            self.last_activity[nvr] = now
         # slots left for background streams
-        budget = max(0, NVR_CAP[nvr] - len(viewed) - orig_need)
+        budget = max(0, NVR_CAP[nvr] - len(viewed) - orig_need - len(aud_need))
         bg = [s for s in cams if s.viewers == 0 and s._bg and s._running]
         # Original workers with 0 viewers (quality-switch bridge / linger) hold slots too:
         # they are the first to go when a viewer needs one
@@ -1825,6 +2389,12 @@ class PoolManager:
         for s in list(bg):
             if s.index in live_orig and s.bg_reason not in ("refresh", "handoff"):
                 self._demote(s, "DUPLICATE: this camera's Original is live")
+                bg.remove(s)
+        # a quality-switch bridge whose Original is already live is being released by
+        # the housekeeping right now: THAT slot goes to the next Original in line, so the
+        # pool must not free another one as well (two Originals would connect at once)
+        for s in list(bg):
+            if s.bg_reason == "handoff" and ORIG_STREAMS[s.index].viewers > 0 and ORIG_STREAMS[s.index].is_live(now):
                 bg.remove(s)
 
         # 1. an offline camera gives its background slot back and is retried there
@@ -1864,9 +2434,9 @@ class PoolManager:
 
         # 4. demand: viewed cameras need slots -> demote the least useful background
         #    streams NOW (refresh visits first, then the lowest ranked)
-        excess = len(bg) + len(orig_idle) - budget
-        if excess > 0 and orig_idle:
-            for o in sorted(orig_idle, key=lambda o: o.slot_priority())[:excess]:
+        excess = len(bg) + len(orig_idle) + len(aud_idle) - budget
+        if excess > 0 and (orig_idle or aud_idle):
+            for o in sorted(orig_idle + aud_idle, key=lambda o: o.slot_priority())[:excess]:
                 o.stop_bg("POOL_DEMOTION: slot needed by a viewed camera")
                 self._note(f"{nvr} {o.label} released (0 viewers; slot needed by a viewed camera)")
             return
@@ -1893,7 +2463,7 @@ class PoolManager:
 
         # 5. fill free background slots, paced (controlled warm-up)
         starting = sum(1 for s in bg if s.live_since is None)
-        free = budget - len(bg) - len(orig_idle)
+        free = budget - len(bg) - len(orig_idle) - len(aud_idle)
         missing = [s for s in want if not (s._bg and s._running)]
         if free > 0 and missing:
             if starting < WARM_CONCURRENCY and now - self.last_start[nvr] >= WARM_STEP_S:
@@ -1950,7 +2520,7 @@ def reaper():
     while True:
         time.sleep(5)
         now = time.time()
-        for s in STREAMS + ORIG_STREAMS:
+        for s in STREAMS + ORIG_STREAMS + AUDIO:
             with s._vlock:
                 leaked = s._running and s.viewers <= 0 and not s._bg
                 stale  = now - s.last_use > IDLE_TIMEOUT
@@ -2020,6 +2590,7 @@ def system_status():
     for c in cams:
         c["backgroundRetryInS"] = round(POOL.blocked_for(c["index"], now)) or None
         c["original"] = ORIG_STREAMS[c["index"]].quality_info(now, owners)
+        c["audio"] = AUDIO[c["index"]].info_view(now, owners)
     config = {"nvrMaxConn": NVR_MAX_CONN, "nvrCaps": dict(NVR_CAP), "connectMax": CONNECT_MAX,
               "preflight": PREFLIGHT_ENABLED, "preflightTimeoutMs": PREFLIGHT_TIMEOUT_MS,
               "preflightPerNvr": PREFLIGHT_PER_NVR, "openTimeoutMs": OPEN_TIMEOUT_MS,
@@ -2037,7 +2608,12 @@ def system_status():
                            "gridOnlyMaxWidth": ORIGINAL_GRID_MAX_W or "source size",
                            "jpegQuality": ORIGINAL_JPEG_QUALITY,
                            "fps": ORIGINAL_FPS, "gridFps": "as asked by the page (6)",
-                           "fallback": "Standard, labelled, only while the main stream fails"}}
+                           "fallback": "Standard, labelled, only while the main stream fails"},
+              "audio": {"enabled": AUDIO_ENABLED, "transport": "WebSocket /audio/<index> (G.711 pass-through)",
+                        "separateSession": True, "lingerS": AUDIO_LINGER_S, "maxPerNvr": AUDIO_MAX_PER_NVR,
+                        "readTimeoutS": AUDIO_READ_TIMEOUT_S, "readTimeoutCounts": "RTP packets, not sound",
+                        "silenceDbfs": AUDIO_SILENCE_DBFS, "silenceS": AUDIO_SILENCE_S,
+                        "interleavedChannel": "as assigned by the NVR's SETUP reply"}}
     pool = {"enabled": PERSISTENT, "running": POOL.running, "ticks": POOL.ticks,
             "recentDecisions": list(POOL.events)[-15:]}
     return {"nvrs": nvrs, "cameras": cams, "config": config, "pool": pool}
@@ -2050,7 +2626,8 @@ def stream_info(i):
         owners = {k: dict(v) for k, v in NVR_OWNERS.items()}
     std, orig = STREAMS[i], ORIG_STREAMS[i]
     return {"index": i, "displayName": SETTINGS.display_name(i),
-            "standard": std.quality_info(now, owners), "original": orig.quality_info(now, owners)}
+            "standard": std.quality_info(now, owners), "original": orig.quality_info(now, owners),
+            "audio": AUDIO[i].info_view(now, owners)}
 
 
 def cameras_for_ui():
@@ -2059,8 +2636,96 @@ def cameras_for_ui():
     uses -- it never changes when a camera is renamed or re-ordered."""
     return [{"index": c["index"], "key": c["key"], "name": c["technicalName"],
              "technicalName": c["technicalName"], "displayName": c["displayName"],
-             "displayOrder": c["displayOrder"], "nvr": c["nvr"], "channel": c["channel"]}
+             "displayOrder": c["displayOrder"], "nvr": c["nvr"], "channel": c["channel"],
+             "audio": audio_state(c["index"])[0], "audioCodec": (audio_state(c["index"])[1] or {}).get("codec")}
             for c in SETTINGS.snapshot()["cameras"]]
+
+
+def settings_view(snap):
+    """The Settings API payload plus what was detected about each camera's audio."""
+    for c in snap.get("cameras", []):
+        det, track = audio_detected(c["index"])
+        c["audioDetected"] = {"state": det, "codec": (track or {}).get("codec"), "rate": (track or {}).get("rate")}
+        c["audioEffective"] = audio_state(c["index"])[0]
+    return snap
+
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# viewer-facing audio states (the worker's own names are more detailed)
+_AUDIO_UI_STATE = {"OFF": "OFF", "CONNECTING": "CONNECTING", "WAITING_SLOT": "WAITING", "PLAYING": "PLAYING",
+                   "STALLED": "PLAYING", "RECONNECTING": "RECONNECTING", "NVR_UNREACHABLE": "RECONNECTING",
+                   "ERROR": "ERROR", "UNAVAILABLE": "UNAVAILABLE"}
+
+
+class _WebSocket:
+    """Minimal RFC 6455 server side on a handler's connection (server frames are
+    unmasked). A reader thread answers pings, notices close / a dead peer."""
+
+    def __init__(self, handler):
+        self.h = handler
+        self.closed = False
+        self._wlock = threading.Lock()
+        try:
+            handler.connection.settimeout(35.0)       # the browser answers our 15 s pings
+        except OSError:
+            pass
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _frame(self, op, data):
+        n = len(data)
+        if n < 126:
+            head = bytes([0x80 | op, n])
+        elif n < 65536:
+            head = bytes([0x80 | op, 126]) + struct.pack(">H", n)
+        else:
+            head = bytes([0x80 | op, 127]) + struct.pack(">Q", n)
+        with self._wlock:
+            self.h.wfile.write(head + data)
+
+    def send_binary(self, data):
+        self._frame(0x2, data)
+
+    def send_json(self, obj):
+        self._frame(0x1, json.dumps(obj).encode())
+
+    def ping(self):
+        self._frame(0x9, b"")
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            try:
+                self._frame(0x8, struct.pack(">H", 1000))
+            except OSError:
+                pass
+
+    def _read(self, n):
+        b = self.h.rfile.read(n)
+        if not b or len(b) < n:
+            raise OSError("closed")
+        return b
+
+    def _reader(self):
+        try:
+            while not self.closed:
+                h = self._read(2)
+                op, n = h[0] & 0x0F, h[1] & 0x7F
+                if n == 126:
+                    n = struct.unpack(">H", self._read(2))[0]
+                elif n == 127:
+                    n = struct.unpack(">Q", self._read(8))[0]
+                if n > 65536:
+                    break
+                mask = self._read(4) if h[1] & 0x80 else b"\0\0\0\0"
+                data = bytes(b ^ mask[k % 4] for k, b in enumerate(self._read(n))) if n else b""
+                if op == 0x8:                          # close
+                    break
+                if op == 0x9:                          # ping -> pong
+                    self._frame(0xA, data)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.closed = True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2098,7 +2763,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/cameras":
             self._send(200, json.dumps(cameras_for_ui()).encode(), "application/json")
         elif path == "/api/camera-settings":
-            self._send(200, json.dumps(SETTINGS.snapshot()).encode(), "application/json")
+            self._send(200, json.dumps(settings_view(SETTINGS.snapshot())).encode(), "application/json")
         elif path == "/api/status":
             self._send(200, json.dumps(system_status()).encode(), "application/json")
         elif path.startswith("/api/stream-info/"):
@@ -2111,6 +2776,12 @@ class Handler(BaseHTTPRequestHandler):
             self._snapshot(path)
         elif path.startswith("/stream/"):
             self._stream(path, query)
+        elif path.startswith("/audio/"):
+            i = self._index(path, "/audio/")
+            if i is None:
+                self._send(404, b"bad camera", "text/plain")
+            else:
+                self._audio_ws(i, query)
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -2161,6 +2832,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(500, {"ok": False, "errors": [{"message": "Could not save the settings file on the server."}]})
         if status == 200 and payload.get("changed"):
             ev(f"[SETTINGS] saved revision {payload['revision']}: " + "; ".join(payload["changed"]))
+        if status == 200:
+            payload = settings_view(payload)
         self._json(status, payload)
 
     def _json(self, code, obj):
@@ -2331,6 +3004,64 @@ class Handler(BaseHTTPRequestHandler):
                     orig.fallback_viewers -= 1
             ev(f"[{orig.label}] HTTP viewer disconnected (viewers {n + 1} -> {n})")
 
+    def _audio_ws(self, i, query):
+        """WebSocket: camera i's audio for ONE listener. Binary messages =
+        [1, codec (0 = PCMU, 8 = PCMA), 4-byte packet number] + G.711 bytes as they
+        arrive from the NVR (~40 ms each); text messages = {"state": ...} whenever the
+        audio state changes. Only NEW audio is sent (never a stale backlog)."""
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if "websocket" not in self.headers.get("Upgrade", "").lower() or not key:
+            self._send(400, b"WebSocket upgrade required", "text/plain")
+            return
+        accept = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.close_connection = True
+        ws = _WebSocket(self)
+        aw = AUDIO[i]
+        state, track = audio_state(i)
+        if state in ("disabled", "unavailable"):
+            ws.send_json({"state": "UNAVAILABLE", "detail": "Audio is disabled for this camera"
+                          if state == "disabled" else "No audio available"})
+            ws.close()
+            return
+        full = (query or {}).get("prio", [""])[0] == "full"
+        n = aw.add_listener(full=full)
+        ev(f"[{aw.label}] listener connected (listeners {n - 1} -> {n}){' [fullscreen]' if full else ''}")
+        try:
+            last, sent, t_ping = aw.latest(), None, time.monotonic()
+            now_ui = lambda: (aw.vstate, aw.ui_cause())
+            while not ws.closed:
+                with aw._cond:
+                    aw._cond.wait_for(lambda: aw._n > last or now_ui() != sent or ws.closed, timeout=1.0)
+                    pk = [p for p in aw._pkts if p[0] > last]
+                    cur = now_ui()
+                st = cur[0]
+                if cur != sent:
+                    # viewers get a state + a coarse cause; the precise reason is in /api/status
+                    ws.send_json({"state": _AUDIO_UI_STATE.get(st, st), "cause": cur[1],
+                                  "silent": cur[1] == "silent", "codec": aw.codec, "rate": aw.rate})
+                    sent = cur
+                codec = 0 if aw.codec == "PCMU" else 8
+                for n_, payload in pk:
+                    ws.send_binary(bytes([1, codec]) + struct.pack(">I", n_ & 0xFFFFFFFF) + payload)
+                    last = n_
+                aw.last_use = time.time()
+                if time.monotonic() - t_ping >= 15.0:        # keeps proxies / NAT awake, finds dead peers
+                    ws.ping()
+                    t_ping = time.monotonic()
+                if st == "UNAVAILABLE":
+                    break
+        except OSError:
+            pass
+        finally:
+            n = aw.remove_listener(full=full)
+            ev(f"[{aw.label}] listener disconnected (listeners {n + 1} -> {n})")
+            ws.close()
+
     def _send(self, code, body, ctype):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -2413,7 +3144,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        for s in STREAMS + ORIG_STREAMS:
+        for s in STREAMS + ORIG_STREAMS + AUDIO:
             s.force_stop("SHUTDOWN")
 
 
