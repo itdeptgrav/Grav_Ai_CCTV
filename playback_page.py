@@ -86,8 +86,13 @@ input[type=date]:focus,input[type=time]:focus{outline:none;border-color:var(--ac
 .strack .fill{position:absolute;left:0;top:12px;height:4px;border-radius:2px;background:var(--accent)}
 .strack .knob{position:absolute;top:6px;width:16px;height:16px;margin-left:-8px;border-radius:50%;background:#fff;
   box-shadow:0 0 0 3px var(--accent-soft),0 2px 6px rgba(0,0,0,.4)}
-.strack .ghost{position:absolute;top:-22px;transform:translateX(-50%);padding:2px 7px;border-radius:6px;font-size:12px;
-  background:var(--surface-4);border:1px solid var(--border-3);white-space:nowrap;pointer-events:none}
+#summary{position:relative}
+.tltip{position:absolute;z-index:30;transform:translate(-50%,-100%);padding:4px 9px;border-radius:7px;text-align:center;
+  background:var(--surface-4);border:1px solid var(--border-3);box-shadow:0 4px 14px rgba(0,0,0,.45);white-space:nowrap;
+  pointer-events:none;line-height:1.3}
+.tltip b{display:block;font-size:12.5px;font-weight:600;font-variant-numeric:tabular-nums}
+.tltip small{display:block;font-size:11px;color:var(--muted)}
+.tlline{position:absolute;z-index:29;width:1px;background:rgba(255,255,255,.5);pointer-events:none}
 .ticks{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin:0 0 0 180px}
 
 /* players */
@@ -189,10 +194,12 @@ input[type=date]:focus,input[type=time]:focus{outline:none;border-color:var(--ac
     <div class=tl id=tl></div>
     <div class=scrub><span class=hint>Timeline</span>
       <div class=strack id=strack role=slider aria-label="Playback position" tabindex=0>
-        <div class=rail></div><div class=fill id=sfill></div><div class=knob id=sknob></div><div class=ghost id=sghost hidden></div>
+        <div class=rail></div><div class=fill id=sfill></div><div class=knob id=sknob></div>
       </div>
     </div>
     <div class=ticks id=ticks></div>
+    <div class=tlline id=tlLine hidden></div>
+    <div class=tltip id=tlTip hidden><b id=tlTipT></b><small id=tlTipS hidden>No recording</small></div>
   </section>
 
   <section class=stage id=stage hidden>
@@ -361,7 +368,7 @@ function chipFor(t){
   return c;
 }
 function renderResults(){
-  $('summary').hidden = false; $('stage').hidden = false; $('empty').hidden = true;
+  $('summary').hidden = false; $('stage').hidden = false; $('empty').hidden = true; hideTip();
   $('sumNote').hidden = !RES.note; $('sumNote').textContent = RES.note || '';
   renderSummary(); renderSpeed(); buildTiles(); updateScrub(RES.fromMs);
 }
@@ -375,16 +382,17 @@ function renderSummary(){                                   // again whenever se
   const chips = $('chips'); chips.textContent = ''; d.tiles.forEach(t => chips.append(chipFor(t)));
   const tl = $('tl'); tl.textContent = '';
   const dayLines = (el) => days.forEach(m => { const x = document.createElement('b'); x.className = 'day';
-    x.style.left = ((m - d.fromMs) / span * 100) + '%'; x.title = fLong(m); el.append(x); });
+    x.style.left = ((m - d.fromMs) / span * 100) + '%'; el.append(x); });
   d.tiles.forEach(t => {
     if (t.availability === 'none' || t.availability === 'unreachable' || t.availability === 'error') return;
     const row = document.createElement('div'); row.className = 'tlrow';
     const n = document.createElement('span'); n.className = 'tn'; n.textContent = t.name;
     const bar = document.createElement('div'); bar.className = 'bar' + (t.segments ? '' : ' unk');
     if (t.availability === 'searching') bar.className = 'bar unk srch';
+    bar.dataset.tile = t.id;                                // (the hover tip tells recorded / not)
     (t.segments || []).forEach(([s, e]) => { const i = document.createElement('i');
       i.style.left = ((s - d.fromMs) / span * 100) + '%'; i.style.width = Math.max(.3, (e - s) / span * 100) + '%';
-      i.title = fStamp(s) + ' – ' + fStamp(e); bar.append(i); });
+      bar.append(i); });
     if (t.segments) dayLines(bar);
     row.append(n, bar); tl.append(row);
   });
@@ -541,14 +549,40 @@ function updateScrub(ms){
 function msAt(ev){ const r = $('strack').getBoundingClientRect(); const f = Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width));
   return RES.fromMs + f * (RES.toMs - RES.fromMs); }
 $('strack').addEventListener('pointerdown', (ev) => { if (!RES) return; dragging = true; $('strack').setPointerCapture(ev.pointerId); scrubTo(ev); });
-$('strack').addEventListener('pointermove', (ev) => { if (dragging) scrubTo(ev); });
-$('strack').addEventListener('pointerup', (ev) => { if (!dragging) return; dragging = false; $('sghost').hidden = true; seek(msAt(ev)); });
+$('strack').addEventListener('pointermove', (ev) => { if (dragging) scrubTo(ev); else showTip($('strack'), ev.clientX); });
+$('strack').addEventListener('pointerup', (ev) => { if (!dragging) return; dragging = false; seek(msAt(ev));
+  if (ev.pointerType !== 'mouse') hideTip(); });
+$('strack').addEventListener('pointercancel', () => { dragging = false; hideTip(); });
+$('strack').addEventListener('pointerleave', () => { if (!dragging) hideTip(); });
 $('strack').addEventListener('keydown', (ev) => { if (!ST) return;            // Shift: 10 minutes
   const step = ev.shiftKey ? 600000 : 10000;
   if (ev.key === 'ArrowRight'){ seek((seekTarget || ST.posMs) + step); ev.preventDefault(); }
   if (ev.key === 'ArrowLeft'){ seek((seekTarget || ST.posMs) - step); ev.preventDefault(); } });
-function scrubTo(ev){ const ms = msAt(ev); updateScrub(ms); const g = $('sghost'); g.hidden = false;       // shown while dragging; no seek until release
-  g.textContent = fStamp(ms); g.style.left = ((ms - RES.fromMs) / (RES.toMs - RES.fromMs) * 100) + '%'; }
+function scrubTo(ev){ updateScrub(msAt(ev)); showTip($('strack'), ev.clientX); }   // tip shown while dragging; no seek until release
+
+// ── hover: the date and time under the mouse, on the Timeline and on every camera's bar ──
+let tipTimer = null;
+function showTip(el, clientX){                             // el: the track or a camera bar (the same time axis)
+  if (!RES) return;
+  const r = el.getBoundingClientRect(), box = $('summary').getBoundingClientRect();
+  if (!r.width) return;
+  const f = Math.max(0, Math.min(1, (clientX - r.left) / r.width)), ms = RES.fromMs + f * (RES.toMs - RES.fromMs);
+  const t = el.dataset.tile ? RES.tiles.find(x => String(x.id) === el.dataset.tile) : null;
+  $('tlTipT').textContent = fLong(ms) + ' · ' + fTime(ms);
+  $('tlTipS').hidden = !(t && t.segments && !t.segments.some(([s, e]) => s <= ms && ms < e));   // a gap of this camera
+  const tip = $('tlTip'); tip.hidden = false;
+  const x = r.left + f * r.width - box.left, half = tip.offsetWidth / 2;
+  tip.style.left = Math.max(half, Math.min(box.width - half, x)) + 'px';
+  tip.style.top = (r.top - box.top - 6) + 'px';
+  const first = $('tl').querySelector('.bar'), top = (first || $('strack')).getBoundingClientRect().top;
+  const ln = $('tlLine'); ln.hidden = false;                // a guide line through every row at that moment
+  ln.style.left = x + 'px'; ln.style.top = (top - box.top) + 'px'; ln.style.height = ($('strack').getBoundingClientRect().bottom - top) + 'px';
+}
+function hideTip(){ clearTimeout(tipTimer); $('tlTip').hidden = true; $('tlLine').hidden = true; }
+$('tl').addEventListener('pointermove', (ev) => { const bar = ev.target.closest('.bar'); if (bar) showTip(bar, ev.clientX); else hideTip(); });
+$('tl').addEventListener('pointerleave', (ev) => { if (ev.pointerType === 'mouse') hideTip(); });
+$('tl').addEventListener('pointerdown', (ev) => { const bar = ev.target.closest('.bar');      // touch: shown for a moment
+  if (bar && ev.pointerType !== 'mouse'){ showTip(bar, ev.clientX); clearTimeout(tipTimer); tipTimer = setTimeout(hideTip, 2500); } });
 document.addEventListener('keydown', (ev) => { if (ev.target.tagName === 'INPUT') return;
   if (ev.key === ' ' && ST){ ev.preventDefault(); send({op: ST.paused ? 'play' : 'pause'}); } });
 

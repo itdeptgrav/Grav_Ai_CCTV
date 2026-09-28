@@ -169,7 +169,8 @@ The header has a `[ Standard | Original ]` switch (also in the fullscreen bar; k
   whether something is recorded; on the office LAN also where (bars with the gaps).
   Results come in as each camera is searched (metadata only; video opens only for the
   cameras on the page). Grid 1 / 2 / 2x2 / 3x2, 6 cameras per page, drag + release on
-  the timeline to seek (Shift+arrow keys: 10 min), Play / Pause, 1x / 2x / 4x (fast =
+  the timeline to seek (Shift+arrow keys: 10 min; hovering the timeline or a camera's
+  bar shows the date and time there, "No recording" in that camera's gaps), Play / Pause, 1x / 2x / 4x (fast =
   key frames only; 0.5x is not offered -- the NVRs stop after one frame), full screen of
   one camera. There is no download.
 * Audio: speaker + volume + status in the controls ("Audio available", "Playing ·

@@ -1305,6 +1305,10 @@ def test_pages():
                                                            "quiet microphone raised", "createDynamicsCompressor")))
     check("... long ranges: dated ticks / midnight lines / 'searching' results; limit text from the server",
           all(x in p for x in ("function midnights", "fStamp(", "applyAvail", "searching", "fSpan(CFG.maxRangeH)")))
+    check("... hover on the Timeline or a camera's bar: a tip with the date and time there ('No recording' in that "
+          "camera's gap) and a guide line; the same tip while dragging",
+          all(x in p for x in ("id=tlTip", "id=tlLine", "function showTip", "fLong(ms) + ' · ' + fTime(ms)",
+                               "No recording</small>", "else showTip($('strack')")) and "sghost" not in p)
     check("... how far back follows each NVR's oldest recording: 'footage kept' hint, date pickers start there, "
           "'No recordings that old', the note when the search starts at the oldest recording",
           all(x in p for x in ("footage kept: ", "function keptFor", ".min = ", "No recordings that old: ", "id=sumNote",

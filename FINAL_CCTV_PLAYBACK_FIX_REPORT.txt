@@ -185,6 +185,10 @@ Real NVRs (read only):
     NVR not answering (last good kept) / never known (31 days) / an NVR keeping 70 days
     / RTSP search with a power cut in the way / NVR1's short 24 h DESCRIBE; page and
     Settings content.
+  * Timeline hover (added after, on request): hovering the Timeline or a camera's bar
+    shows a small tip with the date and time there ("28 Sep 2026 · 18:48:31", plus "No
+    recording" in that camera's gaps) and a guide line through all rows; the same tip
+    follows a drag. Checked in the browser on the real NVRs (hover, gap, drag + seek).
 Notes:
   * A camera whose own oldest file starts a few seconds after its NVR's oldest one (or
     much later, like NVR2 CH13) starts with "No recording at this exact time" and begins
