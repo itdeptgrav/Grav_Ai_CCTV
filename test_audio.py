@@ -384,8 +384,10 @@ def test_one_listener(port):
     print(f"      first PLAYING {round((first or t0) - t0, 3)} s after connecting; packet interval "
           f"avg {1000 * sum(gaps) / max(1, len(gaps)):.0f} ms, max {1000 * max(gaps or [0]):.0f} ms")
     w.close()
+    # (the linger itself is proven by the reason below; reading _running at the exact
+    # instant after close() raced with the 0.8 s test linger on a busy machine)
     check("... last listener gone: session kept briefly (linger), then TEARDOWN and slot released",
-          A[i]._running and stopped(i, 4.0) and FAKE["nvr2"].streaming() == 0, (A[i]._running, streaming("nvr2")))
+          stopped(i, 4.0) and wait(lambda: FAKE["nvr2"].streaming() == 0, 3.0), (A[i]._running, streaming("nvr2")))
     check("... logged reason LINGER_EXPIRED", any(e["reason"] == "LINGER_EXPIRED" for e in A[i].transitions))
 
 

@@ -32,6 +32,11 @@ body{min-height:100vh}
 .titles b{font-size:16px;font-weight:700}
 .titles small{color:var(--muted);font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .wrap{max-width:1500px;margin:0 auto;padding:18px max(20px,var(--sar)) 28px max(20px,var(--sal))}
+.pbcard{margin-top:18px;padding:14px 16px;border-radius:var(--r-lg);background:var(--surface);border:1px solid var(--border)}
+.pbh{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;margin-bottom:10px}
+.pbh small{color:var(--muted);font-size:12.5px;flex:1;min-width:200px}
+.pbrows{display:flex;flex-direction:column;gap:6px;margin-bottom:8px}
+.pbrow{display:flex;gap:12px;font-size:13px;color:var(--text-2)} .pbrow b{color:var(--text);min-width:48px}
 body.has-savebar .wrap{padding-bottom:110px}
 
 .alert{display:flex;gap:12px;align-items:flex-start;margin-bottom:16px;padding:12px 14px;border-radius:var(--r);
@@ -223,6 +228,13 @@ input.bad,input.bad:focus{border-color:var(--bad);box-shadow:0 0 0 3px var(--bad
       <ol id=orderList></ol>
     </aside>
   </div>
+  <section id=pbCard class=pbcard aria-label="Recorded playback">
+    <div class=pbh><b>Recorded playback</b><small>Status of the NVRs for recorded footage (read-only; nothing here changes an NVR)</small>
+      <a class="btn sm" id=pbOpen href="/playback">Open Playback</a></div>
+    <div id=pbWarn class=alert hidden><svg class=ic><use href="#i-alert"/></svg><div><b>Security recommendation</b><span id=pbWarnTx></span></div></div>
+    <div id=pbRows class=pbrows><span class=hint>Checking the NVRs&hellip;</span></div>
+    <small class=hint id=pbLimits></small>
+  </section>
 </main>
 <div id=savebar role=region aria-label="Unsaved changes" hidden>
   <span class=dot></span>
@@ -680,6 +692,32 @@ window.addEventListener('pagehide', stopPreviews);
 window.addEventListener('pageshow', (e) => { if (e.persisted) showCards(); });
 // "ready" = the preview's first image has arrived (hides the spinner)
 setInterval(() => slots.forEach(s => s.pv.classList.toggle('ready', !!s.img.getAttribute('src') && s.img.naturalWidth > 0)), 300);
+
+// ── Recorded playback: per-NVR status (clock drift, search method, account rights) ──
+$('#pbOpen').href = '/playback' + q;
+fetch('/api/playback/nvr-info' + q).then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))).then(d => {
+  const rows = $('#pbRows'); rows.textContent = '';
+  Object.entries(d.nvrs).forEach(([name, v]) => {
+    const row = document.createElement('div'); row.className = 'pbrow';
+    const b = document.createElement('b'); b.textContent = name;
+    const m = document.createElement('span');
+    const drift = v.clockDriftS == null ? 'clock drift: not measurable from here'
+      : v.clockDriftS === 0 ? 'clock: correct' : 'clock: ' + Math.abs(v.clockDriftS) + ' s ' + (v.clockDriftS < 0 ? 'slow' : 'fast')
+        + ' (footage is labelled with the NVR clock; NVR time sync would fix it)';
+    const k = v.kept || {};
+    const kept = k.oldest ? 'footage kept: ' + k.days + ' days (oldest recording ' + k.oldest.slice(0, 16) + ')'
+      : 'footage kept: ' + (k.error ? 'not readable now' : 'being checked');
+    m.textContent = [v.model ? v.model + (v.firmware ? ' · firmware ' + v.firmware : '') : null,
+      v.vendorSearch ? 'recording search: full (office network)' : 'recording search: RTSP check only' + (v.remote ? ' (outside the office)' : ''),
+      kept, drift, 'at most ' + v.playbackMax + ' recordings at a time'].filter(Boolean).join(' · ');
+    row.append(b, m); rows.append(row);
+  });
+  $('#pbLimits').textContent = 'This server plays at most ' + d.limits.server + ' cameras at the same time (each needs about one CPU core). Times are NVR time (' + d.tz + ').';
+  if (d.securityWarning){
+    $('#pbWarn').hidden = false;
+    $('#pbWarnTx').textContent = 'The NVR accounts this system uses are full administrator accounts. Create a dedicated NVR account with only live view and playback (replay) permissions and use it in .env. Nothing was changed automatically.';
+  }
+}).catch(() => { $('#pbRows').textContent = 'Playback status not available.'; });
 
 buildSlots();
 fetch('/api/camera-settings' + q).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })

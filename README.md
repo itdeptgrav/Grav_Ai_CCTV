@@ -17,14 +17,16 @@ It is independent of the CMS and of `D:\Ai_cctv` (the original dev copy).
 | `camera_settings.py` | Display names / grid order (stored in `data/`, never in git) |
 | `rtsp_preflight.py` | Fast RTSP check before OpenCV opens a camera |
 | `rtsp_audio.py` | Audio-only RTSP client for a camera's G.711 microphone track |
+| `playback.py`, `playback_page.py` | Recorded playback: search, per-camera playback workers, the `/playback` page |
+| `rtsp_playback.py`, `nvr_api.py`, `playback_time.py` | NVR playback RTSP client, NVR web API (recording search, office LAN only), IST <-> UTC time rules |
 | `nvr_config.py` | Camera list + NVR endpoints (from env) |
 | `netcheck.py` | Reachability probes (cross-platform) |
 | `relay_bench.py` | Viewer-experience benchmark against a running server |
 | `quality_bench.py` | Standard vs Original benchmark (resolution, fps, bandwidth, CPU) |
 | `stability_bench.py` | Long viewing test: records every LIVE/CACHED change, client and server side |
 | `nvr_capacity_probe.py` | SUPERVISED NVR capacity / direct-camera test (see its .txt) |
-| `test_*.py` | Offline tests (no NVR needed): lifecycle, slots, settings, relay, quality, live stability, audio |
-| `fake_nvr.py` | Fake NVR (RTSP + G.711) used only by `test_audio.py` |
+| `test_*.py` | Offline tests (no NVR needed): lifecycle, slots, settings, relay, quality, live stability, audio, playback |
+| `fake_nvr.py` | Fake NVR (live RTSP + G.711, recorded playback, web API) used by `test_audio.py` / `test_playback.py` |
 | `requirements.txt` | `opencv-python`, `numpy`, `python-dotenv` |
 | `.env.example` | Copy to `.env` and edit |
 | `run.sh` / `run.bat` | One-command run (creates venv, installs, starts) |
@@ -159,6 +161,65 @@ The header has a `[ Standard | Original ]` switch (also in the fullscreen bar; k
   `AUDIO_FULLSCREEN`. The browser console shows `[AUDIO UI]` lines (socket, first
   packet, a summary every 10 s).
 * Details: `FINAL_CCTV_AUDIO_REPORT.txt`.
+
+## Recorded playback
+* Header: **Live view | Playback | Settings**. `/playback`: From / To (NVR time, IST;
+  several days are ONE timeline with dated ticks and midnight lines), quick ranges,
+  cameras (search, Select all), **Search recordings**. Each camera shows
+  whether something is recorded; on the office LAN also where (bars with the gaps).
+  Results come in as each camera is searched (metadata only; video opens only for the
+  cameras on the page). Grid 1 / 2 / 2x2 / 3x2, 6 cameras per page, drag + release on
+  the timeline to seek (Shift+arrow keys: 10 min), Play / Pause, 1x / 2x / 4x (fast =
+  key frames only; 0.5x is not offered -- the NVRs stop after one frame), full screen of
+  one camera. There is no download.
+* Audio: speaker + volume + status in the controls ("Audio available", "Playing ·
+  level", "Muted", "No recorded audio", "Audio plays at 1× only"), a speaker per camera
+  to choose which one is heard. Off until clicked (browser autoplay rules). Recorded
+  sound exists at 1x only: at 2x / 4x the NVRs send no audio at all (measured), so the
+  sound stops and comes back by itself at 1x. Quiet microphones (NVR1 typically -50 to
+  -58 dBFS -- inaudible before) are raised automatically up to +30 dB, with a limiter.
+* How far back: as far as each NVR still has footage. Their disks are full and the
+  oldest footage is overwritten all the time (measured 28 Sep 2026: NVR1 ~27 days, NVR2
+  ~22.5 days), so the server reads each NVR's OLDEST recording at start and every 30 min
+  (`CCTV_PLAYBACK_RETENTION_REFRESH_S`; metadata only, ~1 request per camera; outside the
+  office by RTSP checks, to within about an hour). The page shows "footage kept: NVR1 27
+  days (from 1 Sep 17:00) ..." and its date pickers start there; a From earlier than
+  the oldest recording starts the search at it (with a note), a range entirely before
+  it gets "No recordings that old". Only while an NVR's oldest recording is not known
+  (just after a start, NVR not answering) does a fixed 31-day limit apply
+  (`CCTV_PLAYBACK_MAX_RANGE_H`). Also in Settings > Recorded playback.
+* Long ranges: a search is split into NVR requests of at most 7 days and merged (gaps
+  kept); playback runs as NVR sessions of at most 24 h and moves on by itself (across
+  midnight too). Measured: one NVR playback session covers at most ~58 h (NVR1) / ~59 h
+  (NVR2); the recording search answered 30-day queries.
+* How: the proven NVR playback RTSP (`/cam/playback?channel=N&subtype=0&starttime=..`,
+  main stream). The URL takes NVR-LOCAL time, `Range: clock=` takes UTC -- all
+  conversions live in `playback_time.py`. Each camera shown is its own worker (its own
+  NVR session, never a live worker; counted in the per-NVR cap as `PLAYBACK`, below
+  watched live video), decoded with OpenCV/FFmpeg and sent as JPEG + the recorded time
+  over one WebSocket per page. Credentials and RTSP URLs never reach the browser.
+* The two NVRs behave differently (all found on the real NVRs, see the report):
+  NVR2 plays a whole window in one session and jumps over recording gaps; NVR1's
+  session stops at every gap (even at 1 s files after it), so the worker opens a new
+  one at the next recording. Outside the office only RTSP works (the web API is not
+  forwarded): gaps are then found while playing ("No recording at this exact time",
+  Previous / Next recording). With several cameras, one in a gap waits ("No recording
+  until 02:00:44") and rejoins the timeline.
+* Displayed times are the NVR's recording time (the NVR clocks are ~35-40 s slow; they
+  are reported in Settings, not changed). A seek lands on the key frame before the
+  target (2 s GOP): the time shown is within about 1-1.5 s of the camera's on-screen
+  clock (up to ~3 s right after an NVR1 recording gap).
+* Capacity: `CCTV_PLAYBACK_MAX_WORKERS` (default 3; ~1 CPU core per 1x camera) and
+  `CCTV_<NVR>_PLAYBACK_MAX` (default 2). Beyond that the tile says "Playback capacity
+  reached. Stop another playback stream and try again."; a decoder that falls >3 s
+  behind skips to the next key frame. A closed page stops within 20 s (at once with
+  the page's close beacon); paused > 60 s releases the NVR session.
+* Every search and session end is logged to `data/playback-audit.log` (time, client,
+  user, cameras, range -- never credentials). `/api/playback/status` lists workers.
+* Settings > Recorded playback: NVR model/firmware, search method, measured clock
+  drift, limits, and a warning when the NVR accounts are administrators (use an
+  account with only live + replay rights).
+* Details: `FINAL_CCTV_PLAYBACK_REPORT.txt`, `NVR_PLAYBACK_CAPABILITY_REPORT.txt`.
 
 ## Run it as a service (Linux, systemd)
 Create `/etc/systemd/system/grav-cctv.service`:

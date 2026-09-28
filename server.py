@@ -88,7 +88,7 @@ import numpy as np
 
 from nvr_config import (
     CAMERAS, NVRS, CCTV_SUBNET, NETWORK_CHECK_INTERVAL, NETWORK_TIMEOUT,
-    make_url, resolve_nvr_ips, endpoint,
+    make_url, resolve_nvr_ips, endpoint, remote_mode,
 )
 from netcheck import NetworkMonitor, sanitize_url
 import rtsp_preflight as rp
@@ -96,6 +96,9 @@ import rtsp_audio as ra
 from camera_settings import CameraSettings, camera_key
 from settings_page import SETTINGS_PAGE
 from grid_page import PAGE
+from playback_page import PLAYBACK_PAGE
+import playback as pb
+import playback_time as pbt
 
 
 def _envint(name, default):
@@ -262,7 +265,8 @@ PRIO_NAMES = {PRIO_FULLSCREEN_ORIGINAL: "FULLSCREEN_ORIGINAL", PRIO_FULLSCREEN_S
               PRIO_GRID_ORIGINAL: "GRID_ORIGINAL", PRIO_GRID_STANDARD: "GRID_STANDARD",
               PRIO_HANDOFF: "HANDOFF", PRIO_RECENT: "RECENT", PRIO_LINGER: "LINGER",
               PRIO_BACKGROUND: "BACKGROUND_WARM", PRIO_REFRESH: "CACHE_REFRESH", PRIO_IDLE: "IDLE",
-              PRIO_AUDIO_FULLSCREEN: "AUDIO_FULLSCREEN", PRIO_AUDIO: "AUDIO"}
+              PRIO_AUDIO_FULLSCREEN: "AUDIO_FULLSCREEN", PRIO_AUDIO: "AUDIO",
+              pb.PRIO_PLAYBACK: "PLAYBACK"}   # recorded playback: below watched live video
 _BG_PRIO = {"handoff": PRIO_HANDOFF, "recent": PRIO_RECENT, "linger": PRIO_LINGER,
             "background": PRIO_BACKGROUND, "refresh": PRIO_REFRESH}
 
@@ -378,6 +382,7 @@ NVR_WAITERS = {k: {} for k in NVRS}         # nvr -> {camera index: monotonic wa
 _WAIT_PRIO  = {k: {} for k in NVRS}         # nvr -> {camera index: (-priority, wait start)}
 _ACTIVE_LOCK = threading.Lock()
 _POOL_WAKE   = threading.Event()            # viewers / slots changed: re-evaluate the pool now
+_AUDIO_ADMITTED = {k: set() for k in NVRS}  # audio workers admitted per NVR (the audio limit)
 
 # ── setup limits ──
 # Global gate around the OpenCV open only (never held while streaming).
@@ -1989,10 +1994,18 @@ class AudioWorker:
 
     # ── the worker ─────────────────────────────────────────────────────────────
     def _quota_ok(self, nvr):
+        """At most AUDIO_MAX_PER_NVR audio sessions per NVR. An ADMISSION (taken here
+        atomically, kept until the worker stops -- also across its retries) replaces
+        counting held slots, which let simultaneous listeners all pass while every
+        NVR slot was still busy (they then all got a slot, one after the other)."""
         with _ACTIVE_LOCK:
-            keys = set(NVR_OWNERS[nvr])
-        held = sum(1 for k in keys if k >= AUDIO_KEY_BASE and k != self.slot_key)
-        return held < AUDIO_MAX_PER_NVR
+            adm = _AUDIO_ADMITTED[nvr]
+            if self.slot_key in adm:
+                return True
+            if len(adm) < AUDIO_MAX_PER_NVR:
+                adm.add(self.slot_key)
+                return True
+            return False
 
     def _source_subtype(self):
         with _AUDIO_DETECT_LOCK:
@@ -2089,6 +2102,8 @@ class AudioWorker:
                 if pause:
                     self._sleep(gen, pause)
         finally:
+            with _ACTIVE_LOCK:
+                _AUDIO_ADMITTED[nvr].discard(self.slot_key)
             with self._vlock:
                 if gen == self._gen and not self._running and self.status != S_IDLE:
                     self.status, self.status_since = S_IDLE, time.monotonic()
@@ -2242,7 +2257,33 @@ class AudioWorker:
 AUDIO = [AudioWorker(c, i) for i, c in enumerate(CAMERAS)]
 
 
+class _GoneWorker:
+    """Stand-in for a playback worker already forgotten (status read races)."""
+    label, name, quality, viewers, viewers_full, index, vstate = "playback (ended)", "-", "playback", 0, 0, -1, "OFF"
+    _bg, info = False, {"nvr": "-", "channel": 0}
+
+    def slot_priority(self):
+        return 0
+
+    def priority_name(self):
+        return "PLAYBACK"
+
+    def frame_age_ms(self):
+        return None
+
+    def role(self):
+        return "playback"
+
+    def twin(self):
+        return self
+
+    def stop_bg(self, reason=""):
+        pass
+
+
 def _worker_by_key(key):
+    if key >= pb.KEY_BASE:
+        return pb.worker_by_key(key) or _GoneWorker()
     if key >= AUDIO_KEY_BASE:
         return AUDIO[key - AUDIO_KEY_BASE]
     return ORIG_STREAMS[key - ORIG_KEY_BASE] if key >= ORIG_KEY_BASE else STREAMS[key]
@@ -2375,8 +2416,13 @@ class PoolManager:
         aud_idle = [a for a in aud if a.viewers == 0 and a.slot_key in owned]
         if aud_need:
             self.last_activity[nvr] = now
+        # recorded playback: every running playback worker has its page as viewer --
+        # demand like a viewed stream (background streams yield for it)
+        pb_need = pb.running_workers(nvr)
+        if pb_need:
+            self.last_activity[nvr] = now
         # slots left for background streams
-        budget = max(0, NVR_CAP[nvr] - len(viewed) - orig_need - len(aud_need))
+        budget = max(0, NVR_CAP[nvr] - len(viewed) - orig_need - len(aud_need) - len(pb_need))
         bg = [s for s in cams if s.viewers == 0 and s._bg and s._running]
         # Original workers with 0 viewers (quality-switch bridge / linger) hold slots too:
         # they are the first to go when a viewer needs one
@@ -2613,10 +2659,15 @@ def system_status():
                         "separateSession": True, "lingerS": AUDIO_LINGER_S, "maxPerNvr": AUDIO_MAX_PER_NVR,
                         "readTimeoutS": AUDIO_READ_TIMEOUT_S, "readTimeoutCounts": "RTP packets, not sound",
                         "silenceDbfs": AUDIO_SILENCE_DBFS, "silenceS": AUDIO_SILENCE_S,
-                        "interleavedChannel": "as assigned by the NVR's SETUP reply"}}
+                        "interleavedChannel": "as assigned by the NVR's SETUP reply"},
+              "playback": {"maxWorkers": pb.MAX_WORKERS, "perNvr": dict(PLAYBACK_PER_NVR),
+                           "priority": "PLAYBACK (70): below watched live video, above audio",
+                           "timeZone": f"{pbt.NVR_TZ_LABEL} (UTC{pbt.NVR_TZ_OFFSET_MIN / 60:+g})",
+                           "keyframeAdjustS": pb.KEYFRAME_ADJ_S, "pauseHoldS": pb.PAUSE_HOLD_S,
+                           "graceS": pb.GRACE_S, "speeds": list(pb.SPEEDS)}}
     pool = {"enabled": PERSISTENT, "running": POOL.running, "ticks": POOL.ticks,
             "recentDecisions": list(POOL.events)[-15:]}
-    return {"nvrs": nvrs, "cameras": cams, "config": config, "pool": pool}
+    return {"nvrs": nvrs, "cameras": cams, "config": config, "pool": pool, "playback": pb.MANAGER.status()}
 
 
 def stream_info(i):
@@ -2639,6 +2690,50 @@ def cameras_for_ui():
              "displayOrder": c["displayOrder"], "nvr": c["nvr"], "channel": c["channel"],
              "audio": audio_state(c["index"])[0], "audioCodec": (audio_state(c["index"])[1] or {}).get("codec")}
             for c in SETTINGS.snapshot()["cameras"]]
+
+
+# ── recorded playback (playback.py) -- plugged into the same NVR slot accounting ──
+PLAYBACK_PER_NVR = {k: max(0, _envint(f"CCTV_{k.upper()}_PLAYBACK_MAX", pb.PER_NVR_MAX_DEFAULT)) for k in NVRS}
+pb.configure(
+    ev=lambda msg: ev(msg),
+    endpoint=lambda nvr: endpoint(nvr),
+    nvrs=NVRS,
+    remote=lambda: remote_mode(),
+    acquire_slot=lambda w, gen, nvr: CamStream._acquire_slot(w, gen, nvr),
+    release_slot=lambda nvr, key, reason: _slot_release(nvr, key, reason),
+    pool_wake=lambda: _POOL_WAKE.set(),
+    monitor=lambda nvr: MONITOR.get(nvr),
+    cameras=CAMERAS,
+    display_name=lambda i: SETTINGS.display_name(i),
+    per_nvr_max=PLAYBACK_PER_NVR,
+    audit_path=os.path.join(os.path.dirname(os.path.abspath(SETTINGS_FILE)), "playback-audit.log"),
+)
+
+
+def playback_config():
+    """What the playback page needs: NVR time (the page shows NVR time, IST, whatever
+    the browser's zone), cameras by display name/order, limits. No credentials."""
+    cams = sorted(cameras_for_ui(), key=lambda c: (c.get("displayOrder") or 10 ** 6, c["index"]))
+    now = pbt.nvr_now()
+    return {"nvrNow": pbt.fmt_local(now), "nvrNowMs": pbt.to_ms(now), "tz": pbt.NVR_TZ_LABEL,
+            "tzOffsetMin": pbt.NVR_TZ_OFFSET_MIN, "speeds": list(pb.SPEEDS), "maxRangeH": pb.MAX_RANGE_H,
+            "retention": pb.retention_view(),     # each NVR's oldest recording = how far back a search goes
+            "tilesPerPage": pb.TILES_PER_PAGE, "remote": bool(remote_mode()),
+            "limits": {"server": pb.MAX_WORKERS, "perNvr": {k.upper(): pb.per_nvr_max(k) for k in NVRS}},
+            "cameras": [{"index": c["index"], "name": c["displayName"], "technicalName": c["technicalName"],
+                         "nvr": c["nvr"].upper(), "channel": c["channel"], "audio": c["audio"]} for c in cams]}
+
+
+def playback_nvr_info():
+    """Settings > Playback: per NVR what works from here, clock drift, account rights."""
+    info = pb.nvr_info()
+    kept = pb.retention_view()
+    out = {}
+    for k, v in info.items():
+        out[k.upper()] = dict(v, kept=kept.get(k.upper()))
+    return {"nvrs": out, "tz": pbt.NVR_TZ_LABEL,
+            "limits": {"server": pb.MAX_WORKERS, "perNvr": {k.upper(): pb.per_nvr_max(k) for k in NVRS}},
+            "securityWarning": any(v.get("adminAccount") for v in info.values())}
 
 
 def settings_view(snap):
@@ -2664,6 +2759,7 @@ class _WebSocket:
     def __init__(self, handler):
         self.h = handler
         self.closed = False
+        self.on_text = None                   # callback(str) for text messages (playback commands)
         self._wlock = threading.Lock()
         try:
             handler.connection.settimeout(35.0)       # the browser answers our 15 s pings
@@ -2722,6 +2818,11 @@ class _WebSocket:
                     break
                 if op == 0x9:                          # ping -> pong
                     self._frame(0xA, data)
+                elif op == 0x1 and self.on_text is not None:
+                    try:
+                        self.on_text(data.decode("utf-8", "replace"))
+                    except Exception as e:             # a bad command never kills the socket
+                        ev(f"[WS] command error: {e!r}")
         except (OSError, ValueError):
             pass
         finally:
@@ -2782,6 +2883,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, b"bad camera", "text/plain")
             else:
                 self._audio_ws(i, query)
+        elif path == "/playback":
+            self._send(200, PLAYBACK_PAGE.encode(), "text/html; charset=utf-8")
+        elif path == "/api/playback/config":
+            self._json(200, playback_config())
+        elif path == "/api/playback/nvr-info":
+            self._json(200, playback_nvr_info())
+        elif path == "/api/playback/status":
+            self._json(200, pb.MANAGER.status())
+        elif path == "/api/playback/ws":
+            self._playback_ws(query)
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -2793,7 +2904,76 @@ class Handler(BaseHTTPRequestHandler):
         self._update_settings()
 
     def do_POST(self):
-        self._update_settings()
+        if urlparse(self.path).path.startswith("/api/playback/"):
+            self._playback_post()
+        else:
+            self._update_settings()
+
+    def _client(self):
+        """Who asked (audit log): proxy headers first (Cloudflare), else the peer."""
+        ip = (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+              or self.client_address[0])
+        user = self.headers.get("Cf-Access-Authenticated-User-Email") or None
+        return ip, user
+
+    def _playback_post(self):
+        """POST /api/playback/search {from, to, cameras, replaces?} | /api/playback/close {sid}.
+        Same access check and JSON-only rule as the settings API (CSRF)."""
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if 0 <= length <= SETTINGS_MAX_BODY:
+            body = self.rfile.read(length)
+        else:
+            self.close_connection = True
+            return self._json(413, {"ok": False, "error": "Request too large."})
+        if not self._authorised(query):
+            return self._json(401, {"ok": False, "error": "unauthorised"})
+        if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json":
+            return self._json(415, {"ok": False, "error": "Content-Type must be application/json."})
+        try:
+            doc = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return self._json(400, {"ok": False, "error": "Body is not valid JSON."})
+        if not isinstance(doc, dict):
+            return self._json(400, {"ok": False, "error": "Body must be a JSON object."})
+        ip, user = self._client()
+        if parsed.path == "/api/playback/search":
+            code, out = pb.MANAGER.search(doc, client=ip, user=user)
+            return self._json(code, out)
+        if parsed.path == "/api/playback/close":
+            ok = isinstance(doc.get("sid"), str) and pb.MANAGER.close(doc["sid"], "PAGE_CLOSED")
+            return self._json(200, {"ok": bool(ok)})
+        return self._json(404, {"ok": False, "error": "not found"})
+
+    def _playback_ws(self, query):
+        """WebSocket of a playback page (?sid=...): JPEG frames with their recorded time,
+        the chosen camera's G.711 audio, state JSON; commands come back as text."""
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if "websocket" not in self.headers.get("Upgrade", "").lower() or not key:
+            self._send(400, b"WebSocket upgrade required", "text/plain")
+            return
+        accept = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.close_connection = True
+        ws = _WebSocket(self)
+        s = pb.MANAGER.get((query or {}).get("sid", [""])[0])
+        if s is None:
+            ws.send_json({"t": "error", "error": "expired",
+                          "msg": "This playback session has ended. Search again."})
+            ws.close()
+            return
+        try:
+            pb.MANAGER.run_ws(s, ws)
+        finally:
+            ws.close()
 
     def _update_settings(self):
         parsed = urlparse(self.path)
@@ -3138,12 +3318,18 @@ def main():
               f"server that uses the same NVRs.")
     else:
         print("persistent relay OFF (CCTV_PERSISTENT=0): cameras connect on demand.")
+    print(f"recorded playback: /playback -- at most {pb.MAX_WORKERS} cameras at once on this server, per NVR "
+          + ", ".join(f"{k}={v}" for k, v in PLAYBACK_PER_NVR.items()) + f" (times: NVR {pbt.NVR_TZ_LABEL}); "
+          f"searches reach back to each NVR's oldest recording (checked every "
+          f"{pb.RETENTION_REFRESH_S / 60:g} min)")
+    pb.start_retention_watch()                    # metadata only: ~1 request per camera
     print("Press Ctrl+C to stop.\n", flush=True)
     try:
         QuietServer((BIND, PORT), Handler).serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        pb.MANAGER.close_all("SHUTDOWN")          # TEARDOWN of every playback session
         for s in STREAMS + ORIG_STREAMS + AUDIO:
             s.force_stop("SHUTDOWN")
 

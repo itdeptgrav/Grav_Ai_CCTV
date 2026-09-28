@@ -1,0 +1,207 @@
+GRAV CCTV -- RECORDED PLAYBACK FIX REPORT (audio + long ranges)        2026-09-28
+Project: D:\GRAV_Project\grav-cctv        (nothing committed; nothing deployed)
+
+How it was tested
+  * Real NVRs, READ ONLY (nothing changed on an NVR, no recording touched), one camera
+    at a time for every capability probe; the app itself on a separate check server
+    (127.0.0.1:8013, this code, outbound limited to the NVR LAN addresses), driven
+    through the page in the in-app browser and through its search API + WebSocket.
+    The user's own server on :8000 was not touched.
+  * Offline: 8 suites with the fake NVRs (they now reproduce every NVR behaviour found
+    below) -- 540 checks, 0 failures (with the follow-up at the end).
+
+==========================================================================================
+ISSUE 1 -- RECORDED AUDIO
+==========================================================================================
+1. Exact reason recorded audio did not play
+   The audio path itself worked (NVR -> server -> WebSocket -> G.711 decoded in the
+   browser -> Web Audio). Three things made it look broken:
+   a) The screenshot was at 4x. In fast playback the NVRs send NO audio at all --
+      measured at the RTSP level: 0 audio packets in 6 s at Scale 2.0 and 4.0 on both
+      NVRs (while video key frames kept coming). The server dropped audio at 2x/4x and
+      the page DISABLED the speaker, yet the tile still said "Audio: PCMU" -- misleading.
+   b) At 1x the sound was off until a small speaker icon in the tile footer was
+      clicked; there was no speaker/volume in the controls and no "click to listen"
+      prompt (the volume only appeared after that click).
+   c) The PCMU cameras (NVR1) record extremely quietly. Measured at 1x (28 Sep, office
+      hours): CEO office typical -51..-56 dBFS, Reception -50, Meeting -47, corridor
+      -58 dBFS (its loudest 40 ms only -48). The old player could add at most +6 dB
+      (volume 100 % = 2x), so it played at about -50 dBFS -- practically inaudible.
+      NVR2 (PCMA) cameras record at -19..-40 dBFS: audible.
+   Fix: speaker (listen / mute / unmute) + volume + a status line in the controls,
+   the speaker per camera kept, explicit states, audio kept selected through fast
+   playback and resumed at 1x by itself, and an automatic level for quiet
+   microphones (up to +30 dB towards -24 dBFS, limiter against loud events).
+2. Does 1x real audio now work?            PASS (see 4 for the human-ear part)
+   Browser test (click on the speaker): AudioContext running; packets at real time
+   (PCMA 8/s x 1024 B, PCMU 25.7/s x 320 B); level measured at the speaker output
+   (analyser after boost + volume): PM office -16..-33 dBFS, CEO office -23..-29 dBFS
+   ("quiet microphone raised +30 dB"). Status e.g. "Playing · CEO office · -23 dB ·
+   quiet microphone raised +30 dB". Also after a seek to another day, pause/resume,
+   mute/unmute, and 4x -> 1x (sound back after 0.6 s) -- no page reload.
+3. Audio codecs tested:                    PCMA 8 kHz (NVR2), PCMU 8 kHz (NVR1)
+4. Actual sound heard:                     NOT TESTED by ear (I cannot hear). The
+   signal at the browser's audio output was measured (above). 20 s WAV clips of the
+   real recordings were sent: CEO_office_PCMU_as_recorded.wav (nearly silent -- the
+   cause), CEO_office_PCMU_as_played_auto_level.wav (what the player now outputs),
+   PM_office_PCMA_as_recorded.wav. Please confirm by clicking the speaker at 1x.
+5. 2x audio behaviour:  no sound -- NOT POSSIBLE from these NVRs (0 audio packets at
+   Scale 2). Shown explicitly: "Audio plays at 1× only (fast playback has no sound)";
+   tile "Audio at 1× only (PCMU)"; the choice is kept; sound returns at 1x by itself.
+   Accelerated audio is not practical: the only source of 2x/4x footage is the NVR's
+   key-frame-only fast mode, which carries no audio.
+6. 4x audio behaviour:  same as 2x (0 audio packets at Scale 4).       PASS (explicit)
+
+==========================================================================================
+ISSUE 2 -- THE 24-HOUR LIMIT
+==========================================================================================
+7. Exact source of the old limit (OUR code):
+   * playback.py:56      MAX_RANGE_H = _envfloat("CCTV_PLAYBACK_MAX_RANGE_H", 24.0)
+   * playback.py:1299    err = pt.validate_range(a, b, MAX_RANGE_H)   (search API)
+   * playback_time.py:84-90  validate_range() -> "The time range is too long: at most
+                         24 hours per search."
+   * playback_page.py:277  the same check in the browser (maxRangeH from
+                         /api/playback/config, server.py:2719)
+8. App-side or NVR-side: APP-SIDE (a precaution chosen when the feature was built).
+9. NVR1 maximum query range (CP-UNR-4K4322-V3, CEO office CH4, measured):
+   * recording search (mediaFileFind): NO limit found -- 1 h, 24 h, 25 h, 48 h, 72 h,
+     7 days, 14 days, 30 days all answered; a 7-day query returned exactly the files of
+     seven 1-day queries (179); 30 days = 689 files in 16 s (retention since 1 Sep).
+   * RTSP DESCRIBE: answers windows up to 30 days.
+   * ONE RTSP playback session: covers at most 57.98 h of a 72 h window (PLAY at +57 h
+     OK, at +58.5 h -> 500). A real per-SESSION limit, not a search limit.
+10. NVR2 maximum query range (CP-UNR-4K4322-V4, HR office CH8, measured):
+   * recording search: NO limit found up to 30 days (472 files in 7.4 s; retention
+     since 6 Sep); 7-day query == seven 1-day queries (163 files).
+   * DESCRIBE: up to 30 days. ONE playback session: at most 59.00 h (+58.5 h OK,
+     +59.5 h -> 500).
+11. Range-splitting implementation
+   * playback_time.plan_ranges(a, b, hours): consecutive NVR-safe windows (local time,
+     across midnight fine). New limit: 31 days (a month covers what the NVRs keep;
+     justified by the 30-day search test) -- CCTV_PLAYBACK_MAX_RANGE_H.
+     UPDATE (follow-up below): the limit now follows each NVR's OLDEST recording; the
+     31 days only apply while that is not known yet.
+   * Search: split into requests of <= 7 days (CCTV_PLAYBACK_SEARCH_CHUNK_H; one 7-day
+     request is 4-5x faster than seven 1-day ones), pages of 100 files, results
+     deduplicated and merged into ONE timeline (gaps kept). Metadata only; one query
+     at a time per NVR (never parallel queries on an NVR), the cameras of the visible
+     page first. The reply comes within 3 s; slower results reach the page over its
+     WebSocket and cameras start playing as their result arrives.
+   * Playback: NVR sessions of <= 24 h (CCTV_PLAYBACK_SESSION_SPAN_H; the NVRs cover
+     ~58 h). At a session's end playback continues in the next session by itself (no
+     Search click); a seek outside the current session opens the right one (~3 s).
+   * Page: one timeline over all days -- dated ticks ("26 Sep 10:00:00"), midnight
+     lines, dated seek bubble, "searching…" rows, Shift+arrow = 10 min.
+12. 25-hour test:  PASS  NVR2 HR office 27 Sep 14:00 -> 28 Sep 15:00: search 1.6 s
+    (25.0 h, no gap); plays; seek to +24.5 h (new NVR session, 3.1 s) and back;
+    camera clock (date + time) matches.
+13. 48-hour test:  PASS  NVR2 26 Sep 15:00 -> 28 Sep 15:00: search 1.7 s, 47.5 h in
+    2 segments -- the real gap 26 Sep 18:29:44 -> 19:00:36 shown; seek +47 h; seek
+    into the gap -> "No recording at this exact time" + previous/next recording.
+14. 72-hour test:  PASS  NVR2 25 -> 28 Sep: search 1.7 s; seeks to +59.5 h and +71.5 h
+    (where ONE NVR session fails) work; NVR1 CEO office 25 Sep 10:00 -> 28 Sep 10:00
+    (the requested example) accepted in the browser -- no 24 h rejection -- timeline
+    with dates, search 1.1 s, NVR1's nightly ~37 s gaps shown, seeks to +70.5 h, 26 Sep,
+    both sides of midnight; audio on across a seek to 27 Sep. Camera clocks matched.
+    Also RTSP-only (outside-the-office mode): both NVRs, far seeks, and gap detection
+    (NVR2 next recording 19:00:36 exact; NVR1 02:00:45, a few s late).
+15. Cross-midnight test:  PASS  continuous play 27 Sep 23:59:30 -> 28 Sep 00:00:40 with
+    NVR sessions shortened to 18 s: 3 automatic hand-overs, 523 pictures, largest step
+    0.76 s, no false gap; the camera's own date rolls 27 -> 28 Sep with the shown time;
+    seeks to 00:00:05 / 00:00:10 / 23:59:55 on both NVRs land on the right date.
+    Offline: 23:50 -> 00:10 is one request with the right URL date and UTC clock.
+16. Multi-camera test:  PASS
+    * 3 cameras x 48 h (PM office NVR2, CEO + Reception NVR1): all play; one seek to
+      another day for all 3 (spread 1.3 s); 170 % of one core, 321 MB. Search 2.2 s
+      (one earlier run took 38.6 s while an NVR web API was slow).
+    * Select All (25) x 7 days, metadata only: reply 3.0 s; results streamed in
+      (15 cameras by 16.6 s, all 25 by 33.2 s; 23 with gaps, 2 none); video only for
+      the visible page (2 on NVR2 = its limit, the others "Capacity reached");
+      nothing left running after close.
+17. Files changed:  playback.py, playback_time.py, playback_page.py, fake_nvr.py,
+    test_playback.py, README.md, .env.example (comments), this report; with the
+    follow-up also nvr_api.py, server.py, settings_page.py.
+18. Automated tests (all offline suites):  PASS
+    test_playback 131 · test_audio 84 · test_camera_settings 86 · test_lifecycle 11 ·
+    test_live_stability 44 · test_quality 60 · test_relay 65 · test_slots 59
+    = 540 checks, 0 failures (new: range limit, planner, midnight, paged/chunked/
+    deduplicated long search, session hand-over across midnight, far seeks, RTSP-only
+    long range, progressive search, audio 1x -> 4x -> 1x / seek / pause; follow-up:
+    the oldest-recording limit, see below).
+19. NOT TESTED
+    * The sound by a human ear (see 4) -- please confirm.
+    * The public-IP path end to end (the RTSP-only mode it uses was tested on the LAN).
+    * A 24 h NVR-session boundary reached by 24 h of continuous playback (the same
+      hand-over was tested with 18 s sessions on the real NVR).
+    * Playback over a full 31-day range (search tested to 30 days; seeks to 3 days).
+
+==========================================================================================
+FOLLOW-UP (28 Sep, 17:10-18:10) -- THE LIMIT FOLLOWS EACH NVR'S OLDEST RECORDING
+==========================================================================================
+Before: a fixed 31 days (CCTV_PLAYBACK_MAX_RANGE_H) -- our own number, not an NVR limit.
+Now a search reaches back exactly as far as the selected cameras' NVRs still have footage
+(their disks are full and overwrite the oldest footage all the time).
+  * The server reads each NVR's OLDEST recording at start and every 30 min
+    (CCTV_PLAYBACK_RETENTION_REFRESH_S). Office LAN: the web API's file list -- one
+    metadata request per camera, 30-day windows (the query size measured safe), stepping
+    further back only if an NVR ever keeps more. Outside the office: RTSP DESCRIBE checks
+    (bisection, then the exact second; ~80-100 short requests per NVR, one at a time),
+    taken 10 s early so it is never later than any camera's oldest footage. A failed
+    check keeps the last good answer and is retried after 2 min.
+  * Search: From earlier than the oldest recording -> the search starts there, with a
+    note ("Nothing is recorded before 01 Sep 2026 18:00:00, so the search starts there.
+    NVR1 keeps 27 days of footage (from 01 Sep 2026 18:00)."); a range entirely before it
+    -> "No recordings that old: ...". Cameras on both NVRs: the older NVR bounds it. The
+    fixed 31 days apply ONLY while an NVR's oldest recording is not known yet (the first
+    12-42 s after a server start, or an NVR that never answered) -- the message says so.
+  * Page: "footage kept: NVR1 27 days (from 1 Sep 18:00), NVR2 22.5 days (from 6 Sep
+    05:00)" next to the time zone; the date pickers start at the oldest date of the
+    selected cameras' NVRs; the same checks before sending; the note above the timeline;
+    refreshed every 10 min and with every search. Settings > Recorded playback shows
+    "footage kept: 27 days (oldest recording 2026-09-01 18:00)" per NVR.
+Real NVRs (read only):
+  * Read automatically at server start: NVR1 2026-09-01 18:00:00 (27.0 days; all 12
+    cameras 18:00:00-18:00:05), NVR2 2026-09-06 05:00:00 (22.5 days; CH13 from 10 Sep
+    03:48:09, CH7 nothing) -- equal to the independent measurement at 17:05 except that
+    NVR1 had overwritten one more hour (17:00 -> 18:00). 12 s (NVR1) / 42 s (NVR2).
+  * CEO office 25 Aug -> 2 Sep: searched from 1 Sep 18:00:00 with the note (first
+    recording 18:00:00); 20 Aug -> 1 Sep 12:00 -> 400 "No recordings that old: NVR1 keeps
+    27 days of footage (from 01 Sep 2026 18:00)."; HR office 1 -> 7 Sep: from 6 Sep
+    05:00:00; CEO + HR 3 -> 7 Sep: unchanged; HR 2 -> 5 Sep -> 400 (NVR2's own limit);
+    1 Aug -> now (58 days asked) accepted: 27 days searched in 12 s (642 h, 55 segments).
+  * Played from the oldest recording: CEO office, camera clock 01/09/2026 18:00:07 at
+    shown 18:00:06. In the browser: hint, date pickers (1 Sep; 6 Sep with an NVR2 camera),
+    the rejection, From moved to 06-09-2026 05:00:00 with the note, played (camera clock
+    05:00:26 at shown 05:00:28).
+  * Outside the office (RTSP only): NVR1 17:59:49, NVR2 04:59:50 (real 18:00:00 /
+    05:00:00), ~10 s per NVR; the same searches and playback from the oldest recording
+    work (camera clock 18:00:07 at shown 18:00:05).
+  * FOUND AND FIXED on the way: NVR1 answers a 24-hour DESCRIBE 27 min 49 s short (exact
+    for windows up to 2 h; measured on CH3 and CH4). The RTSP-only "next recorded moment"
+    probe trusted that answer, so outside the office playback from NVR1's oldest recording
+    would have started 28 min late. The probe now checks the moment it finds and
+    bisects back to the first recorded second.
+  * Tests: + reading the oldest recording (LAN / RTSP), start at it / reject / two NVRs /
+    NVR not answering (last good kept) / never known (31 days) / an NVR keeping 70 days
+    / RTSP search with a power cut in the way / NVR1's short 24 h DESCRIBE; page and
+    Settings content.
+Notes:
+  * A camera whose own oldest file starts a few seconds after its NVR's oldest one (or
+    much later, like NVR2 CH13) starts with "No recording at this exact time" and begins
+    by itself when its recording does (existing gap behaviour; ~10 s outside the office
+    because of the margin).
+
+Other findings / warnings
+  * Shown time vs the camera clock: within ~1-2 s; up to ~3.6 s at NVR2's hourly file
+    change (HH:00:03) and right after an NVR1 gap. At each session end (once per 24 h
+    of continuous play) the NVRs step their RTP clock back ~1 s: ~1 s of pictures there
+    may be skipped/labelled 1 s early.
+  * The NVR web APIs are sometimes slow (one 48 h search 38.6 s, re-run 2.2 s).
+  * 4x decoding + 3 other streams on this laptop made one decoder skip ahead (the
+    protection works; CPU is the laptop's limit, as reported before).
+  * data/audio-detected.json (live audio cache) was found corrupted by a write race in
+    server.py -- flagged as a separate task, not changed here.
+  * Your :8000 server was last restarted at 17:02:13, BEFORE the oldest-recording
+    follow-up (playback.py, playback_time.py, nvr_api.py, server.py, playback_page.py,
+    settings_page.py changed after it): restart it to use it. Production (cctv.grav.in)
+    is unchanged.

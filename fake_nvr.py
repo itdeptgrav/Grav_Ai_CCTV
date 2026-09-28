@@ -20,7 +20,10 @@ import time
 import socket
 import struct
 import hashlib
+import datetime
 import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 def _md5(s):
@@ -65,6 +68,19 @@ class FakeNvr:
         self.interleaved = interleaved     # "dahua" | "echo" (use the client's) | {track: rtp channel}
         self.packet_bytes = packet_bytes
         self.transports = []               # Transport replies sent to SETUPs (newest last)
+        # recorded playback (/cam/playback): channel -> [(start, end)] naive NVR-local datetimes
+        self.recordings = {}
+        self.ts_jumps = {}                 # channel -> [NVR-local datetime]: the RTP clock jumps +2.04 s
+                                           # there although the footage does not (real NVR2 quirk)
+        self.end_step_back = True          # both real NVRs: ~2 s before endtime the RTP clock steps
+                                           # BACK ~1 s (then BYE + close)
+        self.gap_ends_session = False      # real NVR1 (fw 4.001): a playback session only covers the
+                                           # recording up to the first gap (DESCRIBE counts that part;
+                                           # PLAY past it -> 500 + close; at the gap BYE + close)
+        self.play_log = []                 # every playback PLAY: {"ch", "range", "scale"}
+        self.pb_active = 0                 # playback sessions streaming now
+        self.pb_peak = 0
+        self.pb_sessions = 0
         self.lock = threading.Lock()
         self.active = {}                   # channel -> sessions currently streaming (after PLAY)
         self.peak_total = 0                # most sessions streaming at once on this NVR
@@ -162,6 +178,13 @@ class FakeNvr:
                         [f'WWW-Authenticate: Digest realm="{self.realm}", nonce="{self.nonce}", stale="FALSE"'])
             return
         base = uri.split("/trackID")[0]
+        if "/cam/playback" in uri and method == "DESCRIBE":
+            return self._pb_describe(c, st, cseq, uri)
+        if st.get("pb") is not None and method == "PLAY":
+            return self._pb_play(c, st, cseq, hdrs)
+        if st.get("pb") is not None and method == "PAUSE":
+            st["pb"]["paused"] = True
+            return self._reply(c, st, cseq, 200, "OK", [f"Session: {st['session']}"])
         if method == "DESCRIBE":
             codec = self.audio.get(st["ch"])
             sdp = ["v=0", "o=- 0 0 IN IP4 127.0.0.1", "s=Media Server", "t=0 0",
@@ -257,3 +280,255 @@ class FakeNvr:
                 c.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+
+    # ── recorded playback (the real NVRs' behaviour, NVR_PLAYBACK_CAPABILITY_REPORT.txt) ──
+    # DESCRIBE /cam/playback?channel&starttime&endtime (NVR local) -> 404 if nothing is
+    # recorded, else SDP + "a=range:npt=0-<recorded seconds of the window>". PLAY
+    # "Range: clock=<UTC>-" starts at the key frame at/before that time (2 s GOP from the
+    # RECORDING's start -- so at the From time it is the key frame before the window, like
+    # the real NVR) or at the next recording inside a gap; a time outside the window ->
+    # 500 + connection closed. Scale 2/4 = key frames only, no audio. Crossing a gap makes
+    # the RTP timestamp jump by the gap length. At endtime: RTCP BYE + close. Each video
+    # frame carries its TRUE recorded time (b"FAKE" + ms) -- the camera's on-screen clock.
+    IST = datetime.timedelta(minutes=330)
+
+    def _pb_describe(self, c, st, cseq, uri):
+        qs = dict(urllib.parse.parse_qsl(uri.split("?", 1)[1].split("/")[0])) if "?" in uri else {}
+        try:
+            ch = int(qs["channel"])
+            a = datetime.datetime.strptime(qs["starttime"], "%Y_%m_%d_%H_%M_%S")
+            b = datetime.datetime.strptime(qs["endtime"], "%Y_%m_%d_%H_%M_%S")
+        except (KeyError, ValueError):
+            return self._reply(c, st, cseq, 400, "Bad Request")
+        segs, real = [], []
+        for s0, e0 in sorted(self.recordings.get(ch, [])):
+            s1, e1 = max(s0, a), min(e0, b)
+            if e1 > s1:
+                segs.append((s1, e1))
+                real.append((s0, e1))                              # recording start kept (key frame grid)
+        if self.gap_ends_session:
+            # NVR1: only a window STARTING inside a recording file is answered; the session
+            # runs on through files that follow seamlessly (hourly files) and stops at the
+            # first gap or overlap (e.g. the 1 s file at the start of a recording)
+            k = next((i for i, r in enumerate(real) if r[0] <= a < r[1]), None)
+            if k is None:
+                segs, real = [], []
+            else:
+                j = k + 1
+                while j < len(real) and 0 <= (real[j][0] - real[j - 1][1]).total_seconds() <= 1.0:
+                    j += 1
+                segs, real = segs[k:j], real[k:j]
+            rec = sum((e - s).total_seconds() for s, e in segs)
+        else:
+            # NVR2: "window end - first recorded moment" (gaps inside are not subtracted)
+            rec = (segs[-1][1] - segs[0][0]).total_seconds() if segs else 0
+        if rec <= 0:
+            return self._reply(c, st, cseq, 404, "Not Found")
+        st["ch"] = ch
+        st["pb"] = {"ch": ch, "a": a, "b": b, "segs": real, "pos": None, "paused": True, "scale": 1.0,
+                    "vts": 1000000, "ats": 50000, "vseq": 20000, "aseq": 30000, "thread": None, "range": None,
+                    "jumps": sorted(self.ts_jumps.get(ch, [])), "lock": threading.Lock()}
+        codec = self.audio.get(ch)
+        sdp = ["v=0", "o=- 0 0 IN IP4 127.0.0.1", "s=Media Server", "t=0 0", "a=control:*",
+               f"a=range:npt=0-{rec:.6f}", "m=video 0 RTP/AVP 98", "a=rtpmap:98 H265/90000", "a=control:trackID=0"]
+        if codec:
+            pt = 0 if codec == "PCMU" else 8
+            sdp += [f"m=audio 0 RTP/AVP {pt}", f"a=rtpmap:{pt} {codec}/8000", "a=control:trackID=1"]
+        self._reply(c, st, cseq, 200, "OK", ["Content-Type: application/sdp", f"Content-Base: {uri}/"],
+                    "\r\n".join(sdp) + "\r\n")
+
+    def _pb_locate(self, pb, t):
+        for s0, e0 in pb["segs"]:
+            if s0 <= t < e0:
+                return s0 + datetime.timedelta(seconds=int((t - s0).total_seconds() // 2) * 2)
+            if s0 > t:
+                return s0
+        return None
+
+    def _pb_play(self, c, st, cseq, hdrs):
+        pb = st["pb"]
+        rng = hdrs.get("range", "")
+        try:
+            scale = float(hdrs.get("scale", "1") or 1)
+        except ValueError:
+            scale = 1.0
+        with self.lock:
+            self.play_log.append({"ch": pb["ch"], "range": rng, "scale": scale})
+        m = re.match(r"clock=(\d{8}T\d{6})Z-", rng)
+        with pb["lock"]:                          # not while the stream thread is mid-frame
+            if m:
+                target = datetime.datetime.strptime(m.group(1), "%Y%m%dT%H%M%S") + self.IST
+                if not pb["a"] <= target < pb["b"] or (self.gap_ends_session and target >= pb["segs"][-1][1]):
+                    self._reply(c, st, cseq, 500, "Internal Server Error")
+                    st["stop"].set()                               # like the real NVR: drops the connection
+                    return
+                pb["pos"] = self._pb_locate(pb, target)
+                pb["range"] = f"clock={m.group(1)}Z-{(pb['b'] - self.IST).strftime('%Y%m%dT%H%M%S')}Z"
+                pb["jumps"] = [j for j in sorted(self.ts_jumps.get(pb["ch"], [])) if pb["pos"] and j > pb["pos"]]
+            elif pb["pos"] is None:
+                pb["pos"] = self._pb_locate(pb, pb["a"])
+                pb["range"] = "npt=0.000000-"
+            pb["scale"] = scale
+            info = f"url=trackID=0;seq={pb['vseq']};rtptime={pb['vts']}"
+            if self.audio.get(pb["ch"]):
+                info += f",url=trackID=1;seq={pb['aseq']};rtptime={pb['ats']}"
+            self._reply(c, st, cseq, 200, "OK", [f"Session: {st['session']}", f"Range: {pb['range']}", f"RTP-Info: {info}"])
+            pb["paused"] = False
+        if pb["thread"] is None:
+            with self.lock:
+                self.pb_active += 1
+                self.pb_sessions += 1
+                self.pb_peak = max(self.pb_peak, self.pb_active)
+            pb["thread"] = threading.Thread(target=self._pb_stream, args=(c, st), daemon=True)
+            pb["thread"].start()
+
+    def _pb_send_video(self, c, st, pb, vch, key, rec_ms):
+        nal = bytes([(19 if key else 1) << 1, 1]) + b"FAKE" + struct.pack(">Q", rec_ms)
+        rtp = struct.pack(">BBHII", 0x80, 0x80 | 98, pb["vseq"] & 0xFFFF, pb["vts"] & 0xFFFFFFFF, 0x7777) + nal
+        pb["vseq"] += 1
+        self._send(c, st, b"$" + bytes([vch]) + struct.pack(">H", len(rtp)) + rtp)
+
+    def _pb_stream(self, c, st):
+        pb = st["pb"]
+        vch, ach = st["chan"].get(0), st["chan"].get(1)
+        codec = self.audio.get(pb["ch"])
+        apt = 0 if codec == "PCMU" else 8
+        tone_bytes = tone(codec or "PCMA", 320)
+        epoch = datetime.datetime(1970, 1, 1)
+        try:
+            while not st["stop"].is_set():
+                if pb["paused"]:
+                    time.sleep(0.01)
+                    continue
+                with pb["lock"]:                  # a PLAY (new position) never lands mid-frame
+                    if pb["paused"]:
+                        continue
+                    pos = pb["pos"]
+                    seg = next(((s0, e0) for s0, e0 in pb["segs"] if pos is not None and s0 <= pos < e0), None)
+                    if seg is None and pos is not None:
+                        nxt = next((s0 for s0, _ in pb["segs"] if s0 > pos), None)
+                        if nxt is not None:                        # gap: the RTP clock jumps with it
+                            gap = (nxt - pos).total_seconds()
+                            pb["vts"] += int(gap * 90000)
+                            pb["ats"] += int(gap * 8000)
+                            pb["pos"] = nxt
+                            continue
+                    if pos is None or seg is None or pos >= pb["b"]:
+                        if vch is not None:                        # end of the window: RTCP BYE
+                            bye = bytes([0x81, 203, 0, 1]) + struct.pack(">I", 0x7777)
+                            self._send(c, st, b"$" + bytes([vch + 1]) + struct.pack(">H", len(bye)) + bye)
+                        time.sleep(0.05)
+                        break
+                    rec_ms = int((pos - self.IST - epoch).total_seconds() * 1000)
+                    idx = int(round((pos - seg[0]).total_seconds() * 25))
+                    key = idx % 50 == 0
+                    if pb["scale"] == 1:
+                        if self.end_step_back and not pb.get("stepped") and pos >= pb["b"] - datetime.timedelta(seconds=2):
+                            pb["stepped"] = True
+                            pb["vts"] -= 90000                                 # real NVR quirk at the end
+                        if pb["jumps"] and pos >= pb["jumps"][0]:
+                            while pb["jumps"] and pos >= pb["jumps"][0]:
+                                pb["jumps"].pop(0)
+                            pb["vts"] += int(2.04 * 90000)             # clock jump, footage continues
+                        if vch is not None:
+                            self._pb_send_video(c, st, pb, vch, key, rec_ms)
+                        if ach is not None and codec:
+                            rtp = (struct.pack(">BBHII", 0x80, apt, pb["aseq"] & 0xFFFF, pb["ats"] & 0xFFFFFFFF, 0x8888)
+                                   + tone_bytes)
+                            pb["aseq"] += 1
+                            self._send(c, st, b"$" + bytes([ach]) + struct.pack(">H", len(rtp)) + rtp)
+                        pb["pos"] = pos + datetime.timedelta(milliseconds=40)
+                        pb["vts"] += 3600
+                        pb["ats"] += 320
+                        pause_s = 0.04
+                    else:                                          # fast: key frames only, no audio
+                        if not key:
+                            k = seg[0] + datetime.timedelta(seconds=(int((pos - seg[0]).total_seconds() // 2) + 1) * 2)
+                            pb["vts"] += int((k - pos).total_seconds() * 90000)
+                            pb["pos"] = k
+                            continue
+                        if vch is not None:
+                            self._pb_send_video(c, st, pb, vch, True, rec_ms)
+                        pb["pos"] = pos + datetime.timedelta(seconds=2)
+                        pb["vts"] += 180000
+                        pause_s = 2.0 / pb["scale"]
+                time.sleep(pause_s)
+        except OSError:
+            pass
+        finally:
+            with self.lock:
+                self.pb_active -= 1
+            st["stop"].set()
+            try:
+                c.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+class FakeVendorApi:
+    """The NVR's web API as far as playback uses it (HTTP, no auth): getVendor /
+    getDeviceType / getSoftwareVersion, getCurrentTime (NVR clock = now + drift),
+    getUserInfo (account group), mediaFileFind over the SAME recordings dict."""
+
+    def __init__(self, recordings, drift_s=-37, group="admin"):
+        self.recordings, self.drift_s, self.group = recordings, drift_s, group
+        self.calls = []
+        self.delay_s = 0.0                 # a slow NVR: each findFile takes this long
+        self._find = {}
+        api = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                path, _, query = self.path.partition("?")
+                q = dict(urllib.parse.parse_qsl(query))
+                api.calls.append((path, q.get("action")))
+                body = api.answer(path, q)
+                data = body.encode()
+                self.send_response(200 if body != "Error" else 400)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.host = f"127.0.0.1:{self.srv.server_address[1]}"
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def answer(self, path, q):
+        act = q.get("action")
+        if path.endswith("magicBox.cgi"):
+            return {"getVendor": "vendor=CPPLUS\r\n", "getDeviceType": "type=FAKE-NVR-4K\r\n",
+                    "getSoftwareVersion": "version=9.9.9.R,build:2026-01-01\r\n"}.get(act, "Error")
+        if path.endswith("global.cgi"):
+            now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + FakeNvr.IST
+            return "result=" + (now + datetime.timedelta(seconds=self.drift_s)).strftime("%Y-%m-%d %H:%M:%S") + "\r\n"
+        if path.endswith("userManager.cgi"):
+            return f"user.Group={self.group}\r\nuser.Name=someone\r\n"
+        if path.endswith("mediaFileFind.cgi"):
+            if act == "factory.create":
+                return "result=4242\r\n"
+            if act == "findFile":
+                try:
+                    ch = int(q["condition.Channel"])
+                    a = datetime.datetime.strptime(q["condition.StartTime"], "%Y-%m-%d %H:%M:%S")
+                    b = datetime.datetime.strptime(q["condition.EndTime"], "%Y-%m-%d %H:%M:%S")
+                except (KeyError, ValueError):
+                    return "Error"
+                if ch < 1:
+                    return "Error"
+                time.sleep(self.delay_s)
+                self._find[q.get("object")] = [(s, e) for s, e in sorted(self.recordings.get(ch, [])) if e > a and s < b]
+                return "OK\r\n"
+            if act == "findNextFile":                        # at most `count` per call, like the NVRs
+                rest = self._find.get(q.get("object"), [])
+                n = max(1, int(q.get("count", "100") or 100))
+                files, self._find[q.get("object")] = rest[:n], rest[n:]
+                out = [f"found={len(files)}"]
+                for i, (s, e) in enumerate(files):
+                    out += [f"items[{i}].StartTime={s:%Y-%m-%d %H:%M:%S}", f"items[{i}].EndTime={e:%Y-%m-%d %H:%M:%S}",
+                            f"items[{i}].Type=dav", f"items[{i}].VideoStream=Main"]
+                return "\r\n".join(out) + "\r\n"
+            return "OK\r\n"
+        return "Error"

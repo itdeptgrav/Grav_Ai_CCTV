@@ -1,0 +1,191 @@
+NVR PLAYBACK CAPABILITY REPORT  (read-only investigation, no application changes)
+Project : D:\GRAV_Project\grav-cctv            Date: 2026-09-28, 11:21-11:34 IST
+Tested from the laptop on the office LAN (192.168.1.41, Wi-Fi "Grav_Production").
+No NVR setting and no recording was changed. Only read operations were used:
+  HTTP GET of the vendor API, ONVIF Get*/Find* SOAP calls (a search session ended with
+  EndSearch), RTSP DESCRIBE / SETUP / PLAY / PAUSE / TEARDOWN. At most 2 playback
+  sessions at a time (same camera, 5 s); every other session was single and <= 60 s.
+Credentials, serial numbers and the public IP are not written anywhere in this report.
+The frames read below were decoded from the NVR streams and inspected by eye; they
+stay in a temporary folder and are NOT copied into the project (people are visible).
+
+==========================================================================================
+VERDICT
+==========================================================================================
+  NVR1  historical playback by code: YES
+  NVR2  historical playback by code: YES
+Both NVRs are CP PLUS (Dahua-based) CP-UNR-4K4322 recorders and expose the SAME three
+proven paths: (1) the vendor RTSP playback URL with start/end date-time, (2) the vendor
+HTTP recording-search API, (3) ONVIF Profile G (recording search + replay URI). Seek,
+pause and 2x / 4x fast-forward work inside one RTSP session. Recorded audio is present.
+The URL was not guessed: the path is the NVR's own (ONVIF GetReplayUri answers
+rtsp://<nvr>/cam/playback?token=...), and the channel / starttime / endtime form (the
+vendor's Dahua-style playback parameters) is proven by the NVR's replies -- 200 with the
+requested duration, 404 when nothing is recorded -- and by the camera's burned-in clock
+(OSD) in the decoded frames. Every claim below is backed that way.
+
+==========================================================================================
+NVR1
+==========================================================================================
+  Model / firmware   CP-UNR-4K4322-V3, vendor CPPLUS, software 4.001.00AT002.0.R
+                     (build 2023-10-16), hardware V1.0, processor ST7108
+                     (magicBox.cgi getDeviceType / getSoftwareVersion / getVendor)
+  Web API            plain HTTP (port 80); HTTPS refused. ONVIF over HTTP.
+  Clock / time zone  TimeZone 8 "Chennai" = IST (UTC+5:30), daylight saving off,
+                     NTP DISABLED; NVR clock 35 s behind the laptop at 11:22:56.
+  Recordings kept    since 2026-09-01 05:28 UTC (about 27 days); continuous ("Timing")
+                     main-stream recording in 1-hour .dav files.
+
+  historical playback supported by code : YES
+  method                 : RTSP playback URL (vendor), RTSP digest auth, TCP:
+                             rtsp://<nvr>:554/cam/playback?channel=<N>&subtype=0
+                               &starttime=YYYY_MM_DD_HH_MM_SS&endtime=YYYY_MM_DD_HH_MM_SS
+                           (N = the same 1-based channel as live view; times = NVR
+                           local time, IST). Alternative: ONVIF Replay (GetReplayUri)
+                           -> rtsp://<nvr>/cam/playback?token=RecordMediaProfile01300
+                           &proto=Onvif for channel 14.
+  recording search supported : YES
+                           * vendor API mediaFileFind.cgi (factory.create / findFile /
+                             findNextFile / close / destroy): channel 14, 11:00-11:02 ->
+                             2 files 10:00:05-11:00:05 and 11:00:05-11:22:56 (live-growing),
+                             Type dav, VideoStream Main, Flags Timing, in ~0.2 s per call
+                           * ONVIF Search GetRecordingSummary: data from 2026-09-01T05:28:01Z
+                             to now, 22 recording tracks; FindRecordings works but was
+                             still "Searching" after 3.5 s (slower than the vendor API)
+                           * RTSP DESCRIBE: 200 + "a=range:npt=0-120" for a recorded
+                             2-minute window; 404 for a future window and for 2020.
+  start/end date-time supported : YES. starttime 11:05:00 -> first decoded frame OSD
+                           "28/09/2026 11:05:00"; DESCRIBE range = the requested 120 s.
+                           (Playing a window through to its end was proven on NVR2; on
+                           NVR1 only the DESCRIBE range shows the end -- see NOT TESTED.)
+  channel selection supported : YES. RTSP channel=14 = Corridor office (verified by the
+                           picture). Search API: condition.Channel is 1-based (14), the
+                           results and file paths are 0-based (Channel=13). ONVIF token:
+                           RecordMediaProfile + 3-digit 0-based camera + 2-digit stream.
+  audio in playback supported : YES. SDP: H265/90000 video + PCMU/8000 audio. Audio-only
+                           session: 150 packets in 6 s, 320 bytes (40 ms) each, level
+                           -64 ... -46 dBFS, on the NVR-assigned interleaved channel 2.
+  seek supported         : YES, inside one session:
+                           * PLAY "Range: npt=60.000-" -> 200, first frame OSD 11:06:00
+                             (window started 11:05:00)
+                           * PLAY "Range: clock=20260928T053540Z-" (UTC) -> 200, OSD
+                             11:05:40 IST; the same digits as local time -> 500 + the NVR
+                             closes the connection (clock= must be UTC)
+                           * PAUSE -> 200, 0 RTP packets during 2 s; PLAY resumes
+                           * fast-forward: PLAY "Scale: 2.0" -> 200, 7.95 s of footage in
+                             3.77 s, OSD 11:06:30 -> 11:06:38, KEY FRAMES ONLY (5 frames)
+  multiple playback streams possible : NOT TESTED on NVR1 (one camera only, as asked).
+                           Datasheet (V3): outgoing ("forward") bandwidth 48 Mbps, ONVIF
+                           profile T/S/G; the playback-channel count is not stated.
+  evidence               : OpenCV opened the playback URL in 1.3 s, 2560x1440, 25 fps
+                           (133 frames in 5 s); decoded OSD readings above; NVR replies
+                           quoted above.
+
+==========================================================================================
+NVR2
+==========================================================================================
+  Model / firmware   CP-UNR-4K4322-V4, vendor CPPLUS (update serial prefix "DH-" =
+                     Dahua OEM), software 1.00.14.00.R (build 2025-11-14), hardware V1.0,
+                     processor ST7108
+  Web API            HTTPS only (HTTP redirects to HTTPS; self-signed certificate).
+                     ONVIF also HTTPS only (HTTP -> 403 "TransModeError").
+  LAN address        192.168.1.36 (it moved from .44 -- see the earlier router fix)
+  Clock / time zone  TimeZone 8 "Chennai" = IST, daylight saving off, NTP DISABLED;
+                     NVR clock 40 s behind the laptop at 11:21:19. ONVIF TZ "IST-5:30".
+  Recordings kept    since 2026-09-05 19:58 UTC (about 22 days); HR office (channel 8)
+                     earliest 2026-09-05T20:30:03Z; continuous main-stream recording in
+                     1-hour .cpv files.
+
+  historical playback supported by code : YES
+  method                 : the same RTSP playback URL as NVR1 (proven below); ONVIF
+                           Replay GetReplayUri -> rtsp://<nvr>/cam/playback?token=
+                           RecordMediaProfile00700&proto=Onvif for channel 8.
+  recording search supported : YES
+                           * mediaFileFind.cgi: channel 8, 11:00-11:02 -> 2 files
+                             10:00:03-11:00:03 and 11:00:03-11:21:19 (live-growing),
+                             Type cpv, VideoStream Main, Flags Timing, ~0.25 s per call.
+                             condition.Channel=0 -> 400 (1-based); results 0-based.
+                           * ONVIF Search: GetRecordingSummary 2026-09-05T19:58:32Z .. now,
+                             30 recording tracks; FindRecordings + GetRecordingSearchResults
+                             for RecordMediaProfile00700 -> earliest 2026-09-05T20:30:03Z,
+                             latest = now, SearchState Completed.
+                           * RTSP DESCRIBE: 200 + range for recorded windows, 404 when
+                             nothing is recorded (future, 2020). For a PARTLY recorded
+                             window the range is only the recorded part: 600 s requested
+                             ending in the future -> "npt=0-261"; a 36-day window starting
+                             before the first recording -> "npt=0-32397" (the 9 h that
+                             exist). So npt counts RECORDED time, not wall time.
+  start/end date-time supported : YES. Window 11:05:00-11:06:00, main stream, OpenCV:
+                           OSD 11:04:58 (first frame = preceding key frame), 11:05:18
+                           (+20 s), 11:05:38 (+40 s), last frame 11:05:59; the stream
+                           ENDED BY ITSELF after 59.9 s (1516 frames at 25 fps). Played at
+                           ~11:26 -- 21 minutes after the footage: historical, not live.
+  channel selection supported : YES. channel=8 = HR office (verified by the picture).
+  audio in playback supported : YES. SDP: H265/90000 + PCMA/8000. Audio-only session:
+                           47 packets in 6 s, 1024 bytes (128 ms) each, -43 ... -31 dBFS,
+                           NVR-assigned interleaved channel 2 (asked 0-1 -> answered 2-3,
+                           exactly like live audio).
+  seek supported         : YES, inside one session:
+                           * PLAY "Range: npt=60.000-" -> 200, OSD 11:05:58 (key frame
+                             before 11:06:00)
+                           * PLAY "Range: clock=20260928T053540Z-" (UTC) -> 200, OSD
+                             11:05:38; local digits -> 500 + connection closed
+                           * PAUSE -> 200, 0 RTP packets during 2 s
+                           * Scale 2.0 -> 8.0 s of footage in 3.9 s (OSD 11:06:28 ->
+                             11:06:36), key frames only
+                           * Scale 4.0 -> 16.0 s in 3.9 s (OSD 11:05:58 -> 11:06:14), key
+                             frames only
+                           * Scale 0.5 -> accepted (200) but the NVR sent ONE frame and
+                             then nothing for 4 s: slow motion NOT supported
+                           Seeks land on the preceding key frame (about 2 s GOP).
+  multiple playback streams possible : YES (2 tested). Two playback sessions of HR office
+                           at the same time (11:07-11:08 and 11:09-11:10): both PLAY 200,
+                           3.32 and 3.54 Mbit/s, both at 1x. More were not tried.
+                           Datasheet (V4, cpplusworld.com): multi-channel playback "Up to
+                           16 Channels", "60 Mbps outgoing", ONVIF 22.12 Profile T/S/G.
+  evidence               : as quoted; OpenCV opened the URL in 1.7 s, first frame 1.8 s.
+
+==========================================================================================
+WHAT THIS MEANS FOR THE PLAYBACK FEATURE (facts to design with -- nothing built yet)
+==========================================================================================
+ 1. Time zones: the URL starttime/endtime are NVR LOCAL time (IST); RTSP clock= ranges
+    and ONVIF times are UTC. Both NVRs are IST without DST, so the conversion is a fixed
+    5:30 -- the browser's time must be converted to IST, not sent as-is.
+ 2. NVR clocks are 35-40 s slow (NTP is off on both). Footage is labelled with the NVR
+    clock: "10:00:00" on the NVR happened at about 10:00:40 real time. Recommendation
+    (your decision, nothing changed): enable NTP on both NVRs.
+ 3. Only the MAIN stream is recorded (subtype=1 -> 404; ONVIF lists "Extra" recording
+    tracks but they are empty). Every playback stream is 2560x1440 H.265 at 25 fps,
+    ~3.3-3.5 Mbit/s. Decoding it costs about as much CPU as a live "Original" tile; that,
+    not the NVR, will limit how many cameras can play at once on the server.
+ 4. The NVR paces playback at real speed (1x) -- it does not send faster when read
+    faster. Smooth 2x/4x or slow motion is not available from the NVR; Scale 2/4 gives
+    key-frame-only fast-forward (about 1 frame per 2 s of footage).
+ 5. Seek: use PLAY Range clock=<UTC> (exact wall time, correct across recording gaps);
+    npt counts recorded time only, so it drifts after a gap. Pause: PAUSE / PLAY.
+ 6. Availability: DESCRIBE answers 200 + recorded duration or 404 (works wherever RTSP
+    works, i.e. also from outside the office); mediaFileFind lists the actual files and
+    their exact start/end (finds gaps), but only on the office LAN.
+ 7. Remote access: the router forwards only the RTSP ports, so from outside the office
+    the RTSP playback URL + DESCRIBE are usable, the vendor HTTP API and ONVIF are not.
+    Production (Alienware) is on the LAN and can use all three.
+ 8. Security observation: both configured NVR accounts are in the "admin" group with
+    full rights (user management, system config, backup, ...). Playback only needs the
+    "Replay" (and "Monitor") rights; a dedicated least-privilege account would limit the
+    damage if the credentials leak. Nothing was changed.
+
+==========================================================================================
+NOT TESTED
+==========================================================================================
+  * Playback through the public IP / forwarded ports (the laptop was on the office LAN)
+    and through cctv.grav.in.
+  * NVR1: playing a window through to its end, Scale 4 / 0.5, concurrent playback.
+  * More than 2 concurrent playback streams on either NVR (capacity / limits).
+  * Windows with a recording GAP in the middle (none known); how npt behaves across it.
+  * ONVIF Replay as an RTSP session (only GetReplayUri was called; the vendor URL was
+    used for all media tests).
+  * Clip download (the vendor API exposes file paths; no file was downloaded).
+  * Long windows (> 3 minutes of media were not played).
+
+  Sources (datasheets): https://cpplusworld.com/cp-unr-4k4322-v4 ,
+  https://cpplusworld.com/cp-unr-4k4322-v3

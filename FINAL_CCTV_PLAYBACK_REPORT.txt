@@ -1,0 +1,191 @@
+GRAV CCTV -- RECORDED PLAYBACK: FINAL REPORT                        2026-09-28
+Project: D:\GRAV_Project\grav-cctv          (nothing committed; nothing deployed)
+Capability proof: NVR_PLAYBACK_CAPABILITY_REPORT.txt (read-only investigation)
+
+How it was tested
+  * Offline: 8 suites with fake NVRs (they now reproduce every real-NVR behaviour
+    found below) -- 505 checks, 0 failures.
+  * Real NVRs: a separate check server on 127.0.0.1:8013 (the working-tree code,
+    synthetic live video, REAL playback; outbound connections limited to the NVRs'
+    LAN addresses), driven like the page (search API + the real WebSocket). Saved
+    frames were compared with the camera's burned-in clock (OSD). The /playback page
+    was also used in the in-app browser. The user's own server on :8000 was never
+    touched.
+  * The NVRs were only read: no setting, recording or clock was changed.
+
+==========================================================================================
+PLAYBACK VERDICT:
+READY WITH WARNINGS
+==========================================================================================
+
+NVR1   (CP-UNR-4K4322-V3, firmware 4.001.00AT002.0.R 2023-10-16; corridor office CH14)
+Recorded playback:  PASS  28 Sep 12:30:00-12:31:00, found via the NVR search API,
+                    first picture 2.4 s after Search.
+Start/end:          PASS  first PLAY = the From time (UTC clock=); camera clock on the
+                    first picture 12:30:00; stream ended by itself, last picture
+                    12:30:59.65 (camera clock 12:31:00), "Playback ended", frames in order.
+Audio:              PASS  PCMU (mu-law), 320-byte packets at real time (76 in 3 s);
+                    one camera at a time; none at 2x/4x.
+Seek:               PASS  forward 0.39 s, back 0.30 s, near end 0.29 s to the first
+                    picture; camera clock = requested second (12:30:40, :10, :50).
+Pause:              PASS  0 pictures while paused; resume continues (+0.08 s).
+1x:                 PASS  25 pictures/s decoded (~10/s sent to the browser by design).
+2x:                 PASS  2.1x real time (key frames only, ~1 picture/s).
+4x:                 PASS  3.94x real time (key frames only, ~2 pictures/s).
+2 simultaneous:     PASS  corridor + CEO office: both 25/s, decoder backlog 4-5,
+                    0 skips, 0 reconnects, 0.33 s apart; 240% of one core in total.
+CPU per stream:     ~1.2 cores (one camera full view 130% incl. ~12% idle server;
+                    2 cameras 240%).
+Problems:           * An NVR1 playback session only covers the recording up to its
+                      first gap: it sends BYE + closes there, and PLAY past it -> 500 +
+                      close. FIXED: the worker opens a new session at the next
+                      recording (verified on a real 43 s gap, 26 Sep 02:00:01-02:00:44).
+                    * After that gap NVR1 has a 1 s file overlapping the new recording
+                      (02:00:44-02:00:45): handled (one extra quick reopen).
+                    * NVR1 answers DESCRIBE only for a window that STARTS inside a
+                      recording -> the outside-the-office search / gap probe was
+                      adapted (else "No recording found" for a From inside a gap).
+                    * Right after that gap the shown time was up to ~3 s off the
+                      camera clock (the NVR's first usable key frame is later than
+                      its file index says). Elsewhere within ~1 s.
+                    * Once (15:32-15:35) NVR1's web API and RTSP stopped answering for
+                      ~3 min while this and the user's own server were using it; it
+                      recovered by itself.
+
+NVR2   (CP-UNR-4K4322-V4, firmware 1.00.14.00.R 2025-11-14; HR office CH8)
+Recorded playback:  PASS  28 Sep 12:00:00-12:01:00, found via the NVR search API (HTTPS),
+                    first picture 2.7 s after Search.
+Start/end:          PASS  PLAY clock=20260928T063000Z for From 12:00:00 IST; camera clock
+                    12:00:00 on the first picture; ended by itself, last picture
+                    12:00:59.72-.76 (camera clock 12:01:00), frames in order.
+Audio:              PASS  PCMA (A-law), 1024-byte packets at real time (22-28 in 3 s).
+Seek:               PASS  0.35-0.8 s to the first picture; camera clock = requested
+                    second (12:00:40, :10, :50).
+Pause:              PASS  0 pictures while paused; resume +0.08-0.12 s.
+1x:                 PASS  25 pictures/s decoded when the NVR delivers at full speed
+                    (see Problems).
+2x:                 PASS  1.94-2.09x real time (one run 1.44x), key frames only.
+4x:                 PASS  3.25-4.08x real time, key frames only.
+2 simultaneous:     PASS  HR + PM office: both 25/s, 0.08-0.32 s apart, 0 skips.
+4 simultaneous if tested:
+                    TESTED: NVR2 delivered all 4 without errors or reconnects, but THIS
+                    LAPTOP could not decode 4 x 2560x1440 H.265 in real time (19-23
+                    pictures/s, backlog up to 73, 2-4 skips to the next key frame).
+                    3 simultaneous: PASS (all 25/s, backlog 4-5, 295% of one core).
+CPU per stream:     ~1 core in the grid (3 cameras 295% total); one camera full view
+                    (1280 px) ~1.5 cores (154-159%).
+Problems:           * RTP clock jumped +2.04 s at the hourly file change (HH:00:03) when
+                      playback started in the last GOP before it (footage continuous):
+                      compensated -- the shown time follows the camera clock.
+                    * Both NVRs step the RTP clock BACK ~1 s just before the To time.
+                      With 2+ cameras this caused "Playback connection failed" at the
+                      end. FIXED + verified ("Playback ended" on both).
+                    * DESCRIBE reports "window end - first recorded moment": gaps
+                      inside a window are invisible over RTSP; outside the office they
+                      are found while playing.
+                    * In two final runs (15:31, 15:38) NVR2 delivered playback at only
+                      40-60 % of real time (my side idle; the user was also using
+                      playback on :8000). Playback went on without errors, slower.
+                    * The NVR search API costs 1-3 s per camera (HTTPS, digest login per
+                      request): "Select all" (25 cameras) took 16-45 s on the office LAN.
+
+TIMEZONE
+NVR local -> playback URL:   PASS  (starttime=2026_09_28_12_00_00 for 12:00:00 IST; the
+                             DESCRIBE range = the requested window; camera clocks match)
+UTC clock seek:              PASS  (Range: clock=20260928T063040Z for 12:00:40 IST ->
+                             camera clock 12:00:40; local digits are never sent -- they
+                             were proven to give 500 + a dropped connection)
+NVR clock drift observed:
+NVR1:  34-35 s SLOW (NTP disabled)      -- shown in Settings, not changed
+NVR2:  39-40 s SLOW (NTP disabled)      -- shown in Settings, not changed
+(Shown times are the NVR's recording time = what the camera burned into the picture.)
+
+MULTI CAMERA
+Selected multiple:  PASS  (2 per NVR, 3 on NVR2, 1 per NVR; one shared timeline:
+                    0.08-0.9 s apart; a camera in a gap waits and rejoins)
+Select All:         PASS  (25 cameras searched in one request, 6 per page; capacity
+                    message on the rest: "NVR2 playback limit reached (2). Stop another
+                    playback and try again."; next page stops page 1 and starts page 2;
+                    "No recording found for this camera and time range." where empty)
+Grid:               PASS  (1 / 2 / 2x2 / 3x2; each tile: name, NVR + channel, status,
+                    time, audio, full screen, stop; checked in the browser)
+
+RECORDING SEARCH
+NVR1:  office LAN: NVR search API (exact segments, gaps drawn) -- PASS
+       outside the office (RTSP only, tested on the LAN with the API disabled) -- PASS
+       (From inside a gap -> "found (with gaps)", not "No recording")
+NVR2:  office LAN: NVR search API over HTTPS -- PASS; RTSP only -- PASS
+No-recording handling:  PASS ("No recording found for this camera and time range.")
+
+GAP HANDLING
+PASS  -- real gaps, office LAN and RTSP-only:
+  * NVR2 HR office 26 Sep 18:29:44 -> 19:00:36 (31 min): playing across it alone jumps
+    over it ("Recording gap skipped"; camera clock 19:00:37 after it); seeking into it
+    -> "No recording at this exact time" + Previous / Next recording; Next recording
+    plays from 19:00:36.
+  * NVR1 corridor 26 Sep 02:00:01 -> 02:00:44 (NVR1 ends its session there): alone ->
+    new session, continues at 02:00:44; seek into it / Next recording -> PASS; with
+    HR office playing: "No recording until 02:00:44", rejoined when the timeline got
+    there (2.3 s apart right after, then in sync).
+
+WORKER CLEANUP
+PASS  -- closing the page stops its playback at once (close beacon; otherwise after
+20 s); 0 workers / 0 NVR sessions after every test (checked via /api/playback/status
+and the NVR connection table); paused > 60 s releases the NVR session; a new search
+replaces the old one; Stop frees capacity; server shutdown tears everything down; no
+leftover processes.
+
+SECURITY
+Credentials exposed to browser:  NO
+(The browser receives JPEG pictures, recorded times and G.711 audio over the
+WebSocket; tested: no NVR username/password/rtsp:// in config, search, WebSocket,
+status or NVR-info responses; every playback URL needs the access key (401 without);
+searches and session ends are audit-logged to data/playback-audit.log without
+credentials; Settings warns that the NVR accounts are ADMINISTRATORS -- nothing was
+changed automatically.)
+
+LIVE VIEW REGRESSION:
+PASS  (offline: lifecycle 11, slots 59, camera settings 86, relay 65, quality 60, live
+stability 44, audio 84, playback 96 = 505 checks, 0 failures. Playback uses its own
+NVR sessions and slot keys, below watched live video: watched live streams are never
+touched, playback waits "Waiting for NVR capacity". The live page only gained a
+"Playback" link. Found + fixed on the way: a race that could let a 3rd audio session
+past the per-NVR audio limit.)
+
+PUBLIC/REMOTE PLAYBACK:
+NOT TESTED through the public IP (this laptop is on the office LAN; the router cannot
+loop back to its own public ports). The RTSP-only mode a hosted server uses (no NVR web
+API) WAS tested against both real NVRs: search, playback, NVR1 + NVR2 gaps -- PASS.
+
+FILES MODIFIED:
+  new:      playback.py  playback_page.py  playback_time.py  nvr_api.py  rtsp_playback.py
+            test_playback.py  NVR_PLAYBACK_CAPABILITY_REPORT.txt  FINAL_CCTV_PLAYBACK_REPORT.txt
+  changed:  server.py (routes /playback + /api/playback/*, slot accounting, audio-limit
+            race fix, status), grid_page.py (Playback link), settings_page.py
+            ("Recorded playback" card), ui_theme.py (icons), fake_nvr.py (playback,
+            NVR1/NVR2 quirks, web API), test_audio.py (flaky check), README.md,
+            .env.example (playback settings, account advice -- comments only)
+
+WARNINGS:
+  1. Capacity was measured on the dev laptop only (i7-13620H, shared with the :8000
+     server): 3 cameras at 1x play smoothly, 4 fall behind. Defaults: 3 per server
+     (CCTV_PLAYBACK_MAX_WORKERS), 2 per NVR. Measure on the Alienware before raising.
+     A decoder >3 s behind skips to the next key frame instead of lagging further.
+  2. Public path not tested end to end (see above).
+  3. The NVR accounts in .env are administrators: create live + replay-only accounts.
+  4. NVR clocks are 34-40 s slow (NTP off); footage is labelled with that clock.
+  5. Shown time vs the camera clock: within ~1-1.5 s (seeks land on the key frame
+     before the target, 2 s GOP); up to ~3 s right after an NVR1 recording gap.
+  6. The NVRs themselves can be slow: NVR2 delivered at 40-60 % of real time in two
+     runs, NVR1 stopped answering for ~3 min once (both while the user's server was
+     also using them); playback continued / recovered without errors.
+  7. Office-LAN search is slow for many cameras: "Select all" 16-45 s.
+  8. 2x / 4x = key frames only (~1-2 pictures/s) and no audio; 0.5x is not offered.
+  9. On the LAN the gaps are drawn from the NVR search; outside the office they are
+     only found while playing (DESCRIBE cannot see them).
+ 10. The browser's full-screen API could not be checked in the embedded test browser;
+     the in-page full-screen view (one camera, 1280 px, controls kept) works.
+ 11. The user's :8000 server was restarted by the user at 15:34:50 and runs this code.
+     The production server (cctv.grav.in) is unchanged: nothing committed/deployed.
+ 12. Search results are cached 45 s (a recording that appears later needs a new
+     search after that).

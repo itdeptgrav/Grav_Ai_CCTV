@@ -279,6 +279,7 @@ body.fs{--foot:0px}
     <button type=button class=apill id=apill hidden><svg class=ic><use href="#i-vol"/></svg><span class=an></span></button>
     <div class=qseg role=radiogroup aria-label="Video quality"><button type=button role=radio data-q=standard aria-checked=true title="Standard &ndash; faster, lower bandwidth (Q)"><span class=ql>Standard</span><span class=qs>Std</span></button><button type=button role=radio data-q=original aria-checked=false title="Original &ndash; full camera quality, higher bandwidth (Q)"><span class=ql>Original</span><span class=qs>Orig</span></button></div>
     <button class="icon ghost fsb" title="Full screen (F)" aria-label="Full screen" hidden><svg class=ic><use href="#i-max"/></svg></button>
+    <a class=btn id=playbackLink href="/playback" title="Recorded footage"><svg class=ic><use href="#i-history"/></svg><span class=lbl>Playback</span></a>
     <a class=btn id=settingsLink href="/settings" title="Rename and re-order cameras"><svg class=ic><use href="#i-sliders"/></svg><span class=lbl>Settings</span></a>
   </div>
 </header>
@@ -335,6 +336,7 @@ function loadCameras(){
   });
 }
 document.getElementById('settingsLink').href = '/settings' + q;
+document.getElementById('playbackLink').href = '/playback' + q;
 
 function pages(){ return Math.max(1, Math.ceil(cams.length/PER)); }
 // Video quality, remembered per browser (default Standard -- also for a new browser).
