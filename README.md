@@ -41,7 +41,39 @@ It is independent of the CMS and of `D:\Ai_cctv` (the original dev copy).
    - Linux/macOS: `./run.sh`
    - Windows: `run.bat`
    (or manually: `pip install -r requirements.txt` then `python server.py`)
-3. Open `http://<server-ip>:8000/?key=<your CCTV_TOKEN>`.
+3. Open `http://<server-ip>:8000/?key=<your CCTV_TOKEN>` (administrators), or open
+   CCTV from the GRAV CMS (everybody else — see below).
+
+## Who sees which camera (person-wise permissions)
+* **Administrators' key link** `/?key=<CCTV_TOKEN>`: every camera, sound, playback and
+  camera Settings, no password. Opened in a browser, the key is exchanged at once for a
+  signed `cctv_key` cookie (HttpOnly; 400 days, renewed whenever a page is opened; **Sign
+  out** removes it) and the page reloads without the key in the address bar. Scripts and
+  tools may keep sending `?key=` (answered directly). Changing `CCTV_TOKEN` retires the
+  link and signs out every browser that used it.
+* **Everybody else signs in from the GRAV CMS** (`/cctv` in the CMS → `POST
+  /api/cctv/sso` → this app's `/sso?token=…`, a 90-second HS256 token naming the
+  person → a signed `cctv_session` cookie, HttpOnly, SameSite=Lax). What they may do is
+  asked of the CMS (`GET <CCTV_CMS_API_URL>/api/cctv/internal/access`, service key):
+  platform administrators → everything; otherwise the person must hold a department
+  with **CCTV camera access** on AND have cameras assigned in **Access control → People
+  & roles → CCTV** — per camera **Live** / **Audio** (live and recorded sound) /
+  **Playback**. No camera assigned = an empty page, never all cameras.
+* **Enforced here on every route** (`server.py`, `cctv_access.py`): the camera list is
+  filtered before it is sent; `/stream`, `/snapshot`, `/api/stream-info`, Original
+  quality and `/audio` answer **403** for a camera/feature the viewer may not use;
+  playback search refuses such cameras, a playback session belongs to the person who
+  started it, and sound is only sent for permitted cameras. Settings, `/api/status`,
+  the settings API and NVR info are administrator-only. A shared camera worker never
+  lets anyone through who did not pass the check for their own request.
+* **Revoking works on open views**: the CMS tells this app at once
+  (`POST /api/internal/access-changed`), permissions are cached `CCTV_PERMISSION_TTL_S`
+  (15 s) at most, and every open picture, sound and playback is re-checked every 2 s —
+  a removed camera goes dark within ~2 s. If the CMS cannot answer, the last answer is
+  kept `CCTV_PERMISSION_GRACE_S` (60 s), then access is refused (fail closed).
+* The CMS reads this app's camera list (`GET /api/internal/cameras`, service key) for its
+  editor — names/order stay in this app's Settings, never a second list.
+* Tests: `python test_access.py` (91 checks; fake CMS, fake NVRs, no real NVR contact).
 
 ## How it reaches the cameras
 `CCTV_ACCESS_MODE=auto` (default): if the server sits on the CCTV LAN it uses the
@@ -259,5 +291,9 @@ nssm install GravCCTV "C:\path\to\grav-cctv\.venv\Scripts\python.exe" "C:\path\t
 - **Bandwidth:** each viewer streams from the server's uplink (~0.3–0.5 Mbps per
   camera at the default size). The grid shows 6 per page to stay within the 6-per-NVR
   connection cap.
-- **Security:** the `?key=` token is the only gate — keep the link private and use a
-  strong `CCTV_TOKEN`. Consider IP-allowlisting at the proxy for extra safety.
+- **Security:** the `?key=` link is full access — keep it to administrators, use a
+  strong `CCTV_TOKEN` and never write it into code, comments or commits (this repository
+  is public); everybody else signs in from the CMS with per-person
+  permissions (see "Who sees which camera"). `CCTV_SSO_SECRET` / `CCTV_SERVICE_KEY` must
+  match the CMS backend and never be committed. With neither `CCTV_TOKEN` nor CMS
+  sign-in configured the site is OPEN (development only; the server warns at start).

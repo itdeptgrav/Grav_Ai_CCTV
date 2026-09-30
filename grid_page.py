@@ -110,6 +110,12 @@ body.viewing{overflow:hidden}
 .notice>.ic{color:#f87171}
 .notice div{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
 .notice small{color:#fca5a5}
+.notice.info{background:var(--surface);border-color:var(--border-2);color:var(--text)}
+.notice.info>.ic{color:var(--text-2)} .notice.info small{color:var(--text-2)}
+.who{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-2);white-space:nowrap}
+.who .wn{max-width:160px;overflow:hidden;text-overflow:ellipsis}
+.who a{color:var(--text-2)} .who a:hover{color:var(--text)}
+@media (max-width:760px){.who .wn{display:none}}
 
 /* ── footer / status bar ─────────────────────────────────── */
 .foot{display:flex;align-items:center;gap:12px;min-height:var(--foot);
@@ -281,6 +287,7 @@ body.fs{--foot:0px}
     <button class="icon ghost fsb" title="Full screen (F)" aria-label="Full screen" hidden><svg class=ic><use href="#i-max"/></svg></button>
     <a class=btn id=playbackLink href="/playback" title="Recorded footage"><svg class=ic><use href="#i-history"/></svg><span class=lbl>Playback</span></a>
     <a class=btn id=settingsLink href="/settings" title="Rename and re-order cameras"><svg class=ic><use href="#i-sliders"/></svg><span class=lbl>Settings</span></a>
+    <span class=who id=who hidden><span class=wn id=whoName></span><a href="/logout" id=signOut>Sign out</a></span>
   </div>
 </header>
 <main id=wall>
@@ -288,6 +295,10 @@ body.fs{--foot:0px}
     <svg class=ic><use href="#i-alert"/></svg>
     <div><b>Could not load the camera list</b><small id=noticeMsg></small></div>
     <button class=sm id=retryBtn>Try again</button>
+  </div>
+  <div class="notice info" id=noCams hidden>
+    <svg class=ic><use href="#i-off"/></svg>
+    <div><b>No CCTV cameras have been assigned to your account.</b><small id=noCamsMsg>Ask an administrator to give you cameras in Access control.</small></div>
   </div>
   <div class=grid id=grid></div>
 </main>
@@ -700,7 +711,9 @@ for (let i = 0; i < 256; i++){
   const a = i ^ 0x55, e = (a >> 4) & 7, m = a & 0x0F, t = e ? (((m << 4) + 0x108) << (e - 1)) : ((m << 4) + 8);
   ALAW[i] = ((a & 0x80) ? t : -t) / 32768;
 }
-function hasAudio(cam){ return !!cam && cam.audio !== 'unavailable' && cam.audio !== 'disabled'; }
+// 'denied': this viewer may not hear this camera (per-person CCTV permissions) -- the
+// server refuses its sound too; the speaker is not shown at all.
+function hasAudio(cam){ return !!cam && cam.audio !== 'unavailable' && cam.audio !== 'disabled' && cam.audio !== 'denied'; }
 function audioCtx(){             // called inside the click: the browser allows sound only then
   if (!AUD.ctx){
     const C = window.AudioContext || window.webkitAudioContext;
@@ -854,12 +867,13 @@ function speaker(btn, cam, isNow){
 function renderAudio(){
   cells.forEach(c => {
     const mine = c.cam && AUD.cam === c.idx;
-    c.aud.hidden = !c.cam;
+    c.aud.hidden = !c.cam || c.cam.audio === 'denied';
     if (c.cam) speaker(c.aud, c.cam, mine);
     c.cell.classList.toggle('aon', !!mine && !AUD.muted);
   });
   const lv = fullscreen && liveCam, mine = lv && AUD.cam === liveCam.index;
   if (lv) speaker($('abtn'), liveCam, mine);
+  $('abox').hidden = !!lv && liveCam.audio === 'denied';
   $('abox').classList.toggle('on', !!mine && !AUD.muted);
   const at = mine ? audioText() : {t: '', k: ''};
   $('astat').textContent = at.t; $('astat').className = 'astat ' + at.k;
@@ -977,9 +991,30 @@ function tick(){
 tick();
 setInterval(tick, 1000);
 
+// Who is looking (the server decides everything; this only hides what they cannot use):
+// Settings for administrators, Playback when they may play something back, their name
+// and Sign out after a GRAV CMS sign-in, and a plain message when no camera is theirs.
+let ME = null;
+function applyMe(){
+  if (!ME) return;
+  $('settingsLink').hidden = !ME.admin;
+  $('playbackLink').hidden = !ME.admin && !ME.playback;
+  $('who').hidden = !ME.signOut;
+  $('whoName').textContent = ME.name || ME.email || '';
+  $('whoName').title = ME.email || '';
+  $('noCams').hidden = !loaded || cams.length > 0;
+  if (!$('noCams').hidden)
+    $('noCamsMsg').textContent = ME.playback ? 'Recorded playback is available to you: open Playback.'
+                                             : 'Ask an administrator to give you cameras in Access control.';
+}
+function loadMe(){
+  return fetch('/api/me' + q).then(r => r.ok ? r.json() : null).then(m => { ME = m; applyMe(); }).catch(() => {});
+}
+
 function start(){
   $('notice').hidden = true;
-  loadCameras().then(draw, (e) => {
+  loadMe();
+  loadCameras().then(() => { draw(); applyMe(); }, (e) => {
     $('noticeMsg').textContent = (e && e.message ? e.message + '. ' : '') + 'Check the network connection, then try again.';
     $('notice').hidden = false;
     cells.forEach(c => c.cell.classList.add('empty'));

@@ -61,11 +61,12 @@ import math
 import base64
 import socket
 import struct
+import hmac
 import hashlib
 import threading
 import collections
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 # Load .env (optional dependency) before anything reads the environment.
 try:
@@ -99,6 +100,7 @@ from grid_page import PAGE
 from playback_page import PLAYBACK_PAGE
 import playback as pb
 import playback_time as pbt
+import cctv_access as ca
 
 
 def _envint(name, default):
@@ -124,7 +126,12 @@ PORT         = _envint("CCTV_PORT", 8000)
 # Listen address. 0.0.0.0 = reachable from the LAN (default, unchanged). Behind a
 # Cloudflare tunnel on the same machine, 127.0.0.1 keeps it off the LAN entirely.
 BIND         = os.getenv("CCTV_BIND", "0.0.0.0").strip() or "0.0.0.0"
-TOKEN        = os.getenv("CCTV_TOKEN", "change-me-to-a-strong-secret")  # real value in .env; "" disables the gate
+# The administrators' key link (/?key=<CCTV_TOKEN>): full access, no password. Opened in a
+# browser it becomes a session cookie and the key is removed from the address bar. ""
+# = no key link; with CMS sign-in (cctv_access) also unset, the site is OPEN
+# (development only). A key on cctv_access's published list is refused.
+TOKEN        = os.getenv("CCTV_TOKEN", "change-me-to-a-strong-secret")  # real value in .env
+KEY_RETIRED  = bool(TOKEN) and ca.published(TOKEN)
 STREAM_W     = _envint("CCTV_STREAM_W", 640)
 STREAM_H     = _envint("CCTV_STREAM_H", 360)
 STREAM_FPS   = _envint("CCTV_STREAM_FPS", 8)
@@ -2681,15 +2688,27 @@ def stream_info(i):
             "audio": AUDIO[i].info_view(now, owners)}
 
 
-def cameras_for_ui():
+def cameras_for_ui(pr=None, feature="live"):
     """Credential-free camera list for the grid, in TECHNICAL order (compatible with
     earlier clients); the page sorts by displayOrder. 'index' is what /stream/<index>
-    uses -- it never changes when a camera is renamed or re-ordered."""
-    return [{"index": c["index"], "key": c["key"], "name": c["technicalName"],
-             "technicalName": c["technicalName"], "displayName": c["displayName"],
-             "displayOrder": c["displayOrder"], "nvr": c["nvr"], "channel": c["channel"],
-             "audio": audio_state(c["index"])[0], "audioCodec": (audio_state(c["index"])[1] or {}).get("codec")}
-            for c in SETTINGS.snapshot()["cameras"]]
+    uses -- it never changes when a camera is renamed or re-ordered.
+
+    pr (cctv_access.Principal): ONLY the cameras this viewer may use for `feature` are
+    listed -- the others are never sent to the browser -- each with the viewer's own
+    permissions. Sound they may not hear is reported as audio "denied"."""
+    out = []
+    for c in SETTINGS.snapshot()["cameras"]:
+        if pr is not None and not pr.can(c["key"], feature):
+            continue
+        state, track = audio_state(c["index"])
+        perms = {f: (pr.can(c["key"], f) if pr is not None else True) for f in ca.FEATURES}
+        if not perms["audio"]:
+            state, track = "denied", None
+        out.append({"index": c["index"], "key": c["key"], "name": c["technicalName"],
+                    "technicalName": c["technicalName"], "displayName": c["displayName"],
+                    "displayOrder": c["displayOrder"], "nvr": c["nvr"], "channel": c["channel"],
+                    "audio": state, "audioCodec": (track or {}).get("codec"), "permissions": perms})
+    return out
 
 
 # ── recorded playback (playback.py) -- plugged into the same NVR slot accounting ──
@@ -2710,18 +2729,30 @@ pb.configure(
 )
 
 
-def playback_config():
+def playback_config(pr=None):
     """What the playback page needs: NVR time (the page shows NVR time, IST, whatever
-    the browser's zone), cameras by display name/order, limits. No credentials."""
-    cams = sorted(cameras_for_ui(), key=lambda c: (c.get("displayOrder") or 10 ** 6, c["index"]))
+    the browser's zone), cameras by display name/order, limits. No credentials.
+    pr: only the cameras this viewer may PLAY BACK are listed ("Select all" = those)."""
+    cams = sorted(cameras_for_ui(pr, "playback"), key=lambda c: (c.get("displayOrder") or 10 ** 6, c["index"]))
     now = pbt.nvr_now()
     return {"nvrNow": pbt.fmt_local(now), "nvrNowMs": pbt.to_ms(now), "tz": pbt.NVR_TZ_LABEL,
             "tzOffsetMin": pbt.NVR_TZ_OFFSET_MIN, "speeds": list(pb.SPEEDS), "maxRangeH": pb.MAX_RANGE_H,
             "retention": pb.retention_view(),     # each NVR's oldest recording = how far back a search goes
             "tilesPerPage": pb.TILES_PER_PAGE, "remote": bool(remote_mode()),
             "limits": {"server": pb.MAX_WORKERS, "perNvr": {k.upper(): pb.per_nvr_max(k) for k in NVRS}},
+            "viewer": viewer_view(pr),
             "cameras": [{"index": c["index"], "name": c["displayName"], "technicalName": c["technicalName"],
-                         "nvr": c["nvr"].upper(), "channel": c["channel"], "audio": c["audio"]} for c in cams]}
+                         "nvr": c["nvr"].upper(), "channel": c["channel"], "audio": c["audio"],
+                         "permissions": c["permissions"]} for c in cams]}
+
+
+def viewer_view(pr):
+    """Who is looking, for the pages' header: admin (Settings link), what they may use
+    (Live / Playback links, empty states), sign-out for a CMS sign-in. No secrets."""
+    v = (pr or ca.OPEN_PRINCIPAL).view()
+    v["signOut"] = bool(pr is not None and pr.kind in ("user", "key"))
+    v["cmsUrl"] = (ca.CONFIG.cms_app + "/cctv") if ca.CONFIG.cms_app else None
+    return v
 
 
 def playback_nvr_info():
@@ -2844,25 +2875,134 @@ class Handler(BaseHTTPRequestHandler):
             if LOG_REQUESTS:
                 ev(f"TCP close :{self.client_address[1]}")
 
-    def _authorised(self, query):
-        return not TOKEN or query.get("key", [""])[0] == TOKEN
+    # ── who is asking, and may they? (person-wise CCTV permissions, cctv_access.py) ──
+    # Every camera route checks THIS viewer for THAT camera and THAT feature; a camera a
+    # viewer may not use answers 403 whatever URL is typed, and a shared camera worker
+    # never lets anyone through who did not pass the check for their own request.
+    ADMIN_PATHS = {"/settings", "/camera-settings", "/api/camera-settings", "/api/status",
+                   "/api/playback/nvr-info", "/api/playback/status"}
+    PAGE_PATHS = {"/", "/playback", "/settings", "/camera-settings"}
+
+    def _cookie(self, name):
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v
+        return None
+
+    def _principal(self, query):
+        """The viewer of THIS request (cached for the request): the administrators' key
+        link, a CMS sign-in (session cookie, permissions from the CMS), or None."""
+        if self._pr_done:
+            return self._pr
+        self._pr_done, pr = True, None
+        self._key_via_cookie = False
+        key = (query or {}).get("key", [""])[0]
+        if key and TOKEN and not KEY_RETIRED and hmac.compare_digest(key.encode(), TOKEN.encode()):
+            pr = ca.KEY_PRINCIPAL
+        elif TOKEN and not KEY_RETIRED and ca.read_key_session(self._cookie(ca.KEY_COOKIE), TOKEN):
+            pr = ca.KEY_PRINCIPAL                         # the key link, after its clean redirect
+            self._key_via_cookie = True
+        elif not TOKEN and not ca.CONFIG.sso_enabled():
+            pr = ca.OPEN_PRINCIPAL                        # no gate configured at all (development)
+        else:
+            sess = ca.read_session(self._cookie(ca.COOKIE))
+            if sess is not None:
+                pr = ca.principal_for(sess)
+        self._pr = pr
+        return pr
+
+    def _camera_key(self, i):
+        return SETTINGS.keys[i]
+
+    def _secure(self):
+        """Did the browser use https (Cloudflare forwards that)? The session cookie is Secure then."""
+        return (self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+                or '"https"' in self.headers.get("CF-Visitor", ""))
+
+    def _gate_page(self, code, title, detail, headers=()):
+        """A plain page instead of the app: signed out, access refused, retired link."""
+        esc = lambda s: str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")   # noqa: E731
+        cms = (ca.CONFIG.cms_app + "/cctv") if ca.CONFIG.cms_app else ""
+        link = f'<p><a href="{esc(cms)}">Open CCTV from the GRAV CMS</a></p>' if cms else ""
+        body = (f"<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport "
+                f"content='width=device-width,initial-scale=1'><title>{esc(title)} · GRAV CCTV</title>"
+                f"<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0a0c10;"
+                f"color:#e8ebf1;font:15px/1.5 system-ui,sans-serif}}main{{max-width:460px;padding:24px;text-align:center}}"
+                f"h1{{font-size:19px;margin:0 0 8px}}p{{color:#b4bccb;margin:6px 0}}a{{color:#60a5fa}}</style></head>"
+                f"<body><main><h1>{esc(title)}</h1><p>{esc(detail)}</p>{link}</main></body></html>").encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _refuse(self, path, code, message):
+        """401 / 403 in the shape the caller understands: a page, JSON, or plain text."""
+        if path in self.PAGE_PATHS:
+            title = "Sign in to see CCTV" if code == 401 else "No access"
+            return self._gate_page(code, title, message)
+        if path.startswith("/api/"):
+            return self._json(code, {"ok": False, "error": message})
+        return self._send(code, message.encode(), "text/plain; charset=utf-8")
+
+    def _require(self, path, query, admin=False):
+        """The viewer, or None after answering 401 / 403 (not signed in, CCTV refused,
+        or an administrator-only page for somebody who is not one)."""
+        pr = self._principal(query)
+        if pr is None:
+            key = (query or {}).get("key", [""])[0]
+            msg = ("This key link was retired (its key was published). Open CCTV from the GRAV CMS."
+                   if key and ca.published(key) else "Open CCTV from the GRAV CMS to sign in.")
+            self._refuse(path, 401, msg)
+            return None
+        if not pr.allowed:
+            self._refuse(path, 403, pr.message or "CCTV access is not enabled for your account.")
+            return None
+        if admin and not pr.admin:
+            self._refuse(path, 403, "Only administrators can open this.")
+            return None
+        return pr
+
+    def _may(self, pr, i, feature, path):
+        """May this viewer use camera i for `feature`? Else 403 (never a hint that it exists)."""
+        if pr.can(self._camera_key(i), feature):
+            return True
+        self._refuse(path, 403, "This camera is not available to you.")
+        return False
 
     def do_GET(self):
+        self._pr_done, self._pr = False, None             # one principal per request (keep-alive)
         parsed = urlparse(self.path)
         path   = parsed.path
         query  = parse_qs(parsed.query)
         if LOG_REQUESTS:
             ev(f"HTTP {self.command} {path} from :{self.client_address[1]} "
                f"(Connection: {self.headers.get('Connection', '-')})")
-        if not self._authorised(query):
-            self._send(401, b"unauthorised", "text/plain")
+        # sign-in / sign-out and the CMS's own calls carry their own proof
+        if path == "/sso":
+            return self._sso(query)
+        if path == "/logout":
+            return self._logout()
+        if path.startswith("/api/internal/"):
+            return self._internal(path)
+        pr = self._require(path, query, admin=path in self.ADMIN_PATHS)
+        if pr is None:
             return
+        if path in self.PAGE_PATHS and pr is ca.KEY_PRINCIPAL and (query or {}).get("key") \
+                and "text/html" in self.headers.get("Accept", ""):
+            return self._key_redirect(path, query)
         if path == "/":
-            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            self._page(PAGE)
         elif path in ("/settings", "/camera-settings"):
-            self._send(200, SETTINGS_PAGE.encode(), "text/html; charset=utf-8")
+            self._page(SETTINGS_PAGE)
+        elif path == "/api/me":
+            self._json(200, viewer_view(pr))
         elif path == "/api/cameras":
-            self._send(200, json.dumps(cameras_for_ui()).encode(), "application/json")
+            self._send(200, json.dumps(cameras_for_ui(pr, "live")).encode(), "application/json")
         elif path == "/api/camera-settings":
             self._send(200, json.dumps(settings_view(SETTINGS.snapshot())).encode(), "application/json")
         elif path == "/api/status":
@@ -2871,50 +3011,165 @@ class Handler(BaseHTTPRequestHandler):
             i = self._index(path, "/api/stream-info/")
             if i is None:
                 self._send(404, b"bad camera", "text/plain")
-            else:
-                self._send(200, json.dumps(stream_info(i)).encode(), "application/json")
+            elif self._may(pr, i, "live", path):
+                info = stream_info(i)
+                if not pr.can(self._camera_key(i), "audio"):
+                    info["audio"] = {"state": "denied", "available": False}
+                self._send(200, json.dumps(info).encode(), "application/json")
         elif path.startswith("/snapshot/"):
-            self._snapshot(path)
+            self._snapshot(path, pr)
         elif path.startswith("/stream/"):
-            self._stream(path, query)
+            self._stream(path, query, pr)
         elif path.startswith("/audio/"):
             i = self._index(path, "/audio/")
             if i is None:
                 self._send(404, b"bad camera", "text/plain")
-            else:
-                self._audio_ws(i, query)
+            elif self._may(pr, i, "live", path) and self._may(pr, i, "audio", path):
+                self._audio_ws(i, query, pr)
         elif path == "/playback":
-            self._send(200, PLAYBACK_PAGE.encode(), "text/html; charset=utf-8")
+            self._page(PLAYBACK_PAGE)
         elif path == "/api/playback/config":
-            self._json(200, playback_config())
+            self._json(200, playback_config(pr))
         elif path == "/api/playback/nvr-info":
             self._json(200, playback_nvr_info())
         elif path == "/api/playback/status":
             self._json(200, pb.MANAGER.status())
         elif path == "/api/playback/ws":
-            self._playback_ws(query)
+            self._playback_ws(query, pr)
         else:
             self._send(404, b"not found", "text/plain")
+
+    # ── CMS sign-in / sign-out, and the CMS's own calls ────────────────────────
+    def _sso(self, query):
+        """GET /sso?token=... -- a 90-second token from the GRAV CMS naming the person.
+        Verified once, exchanged for a signed session cookie, then on to the cameras."""
+        try:
+            claims = ca.verify_sso((query or {}).get("token", [""])[0])
+        except ca.SsoError as e:
+            ev(f"[ACCESS] sign-in refused: {e}")
+            return self._gate_page(401, "Sign-in did not work", str(e))
+        cookie = ca.make_session(claims)
+        # a sign-in always asks the CMS afresh (access just granted must work at once)
+        ca.PERMISSIONS.invalidate(email=claims.get("email"))
+        pr = ca.principal_for(ca.read_session(cookie))
+        ev(f"[ACCESS] signed in: {claims.get('email') or claims.get('sub')} ({claims.get('subj')}) -> "
+           + ("admin" if pr.admin else f"{pr.view()['live']} live / {pr.view()['playback']} playback camera(s)"
+              if pr.allowed else f"refused ({pr.denial})"))
+        self.send_response(302)
+        self.send_header("Location", "/")
+        self.send_header("Set-Cookie", ca.cookie_header(cookie, self._secure()))
+        # a person signing in on this browser replaces any key-link session on it
+        self.send_header("Set-Cookie", ca.cookie_header("", self._secure(), max_age=0, name=ca.KEY_COOKIE))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _key_redirect(self, path, query):
+        """The key link opened in a browser: remember it in a session cookie and show the
+        same page WITHOUT the key in the address bar (nothing secret left on screen)."""
+        rest = [(k, v) for k, vs in (query or {}).items() if k != "key" for v in vs]
+        target = path + (("?" + "&".join(f"{quote(k)}={quote(v)}" for k, v in rest)) if rest else "")
+        self.send_response(302)
+        self.send_header("Location", target)
+        self.send_header("Set-Cookie", self._key_cookie())
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _key_cookie(self):
+        return ca.cookie_header(ca.make_key_session(TOKEN), self._secure(),
+                                max_age=ca.KEY_SESSION_TTL, name=ca.KEY_COOKIE)
+
+    def _page(self, html):
+        """An app page. A key-link browser gets its cookie renewed with it, so a browser
+        in use never runs out (ca.KEY_SESSION_TTL)."""
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        if self._pr is ca.KEY_PRINCIPAL and getattr(self, "_key_via_cookie", False):
+            self.send_header("Set-Cookie", self._key_cookie())
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _logout(self):
+        self._gate_page(200, "Signed out", "You are signed out of GRAV CCTV.",
+                        headers=[("Set-Cookie", ca.cookie_header("", self._secure(), max_age=0)),
+                                 ("Set-Cookie", ca.cookie_header("", self._secure(), max_age=0, name=ca.KEY_COOKIE))])
+
+    def _internal(self, path):
+        """GET /api/internal/cameras -- the camera list for the CMS's Access control
+        editor; POST /api/internal/access-changed -- the CMS says somebody's access changed.
+        Only with the shared service key."""
+        if not ca.service_ok(self.headers.get("X-CCTV-Service-Key", "")):
+            return self._json(401, {"ok": False, "error": "unauthorised"})
+        if self.command == "GET" and path == "/api/internal/cameras":
+            cams = sorted(cameras_for_ui(), key=lambda c: (c.get("displayOrder") or 10 ** 6, c["index"]))
+            return self._json(200, {"ok": True, "cameras": [
+                {"key": c["key"], "displayName": c["displayName"], "technicalName": c["technicalName"],
+                 "nvr": c["nvr"], "channel": c["channel"], "displayOrder": c["displayOrder"], "audio": c["audio"]}
+                for c in cams]})
+        if self.command == "POST" and path == "/api/internal/access-changed":
+            doc = self._read_json_body()
+            if doc is None:
+                return None
+            everyone = doc.get("all") is True
+            n = ca.PERMISSIONS.invalidate(email=doc.get("email"), everyone=everyone)
+            ev(f"[ACCESS] CMS: access changed for {'everyone' if everyone else doc.get('email')} "
+               f"-- {n} cached decision(s) dropped; open views re-check now")
+            return self._json(200, {"ok": True, "dropped": n})
+        return self._json(404, {"ok": False, "error": "not found"})
+
+    def _read_json_body(self):
+        """The request's JSON object, or None after answering 413 / 415 / 400."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if not 0 <= length <= SETTINGS_MAX_BODY:
+            self.close_connection = True
+            self._json(413, {"ok": False, "error": "Request too large."})
+            return None
+        body = self.rfile.read(length)
+        if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json":
+            self._json(415, {"ok": False, "error": "Content-Type must be application/json."})
+            return None
+        try:
+            doc = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            self._json(400, {"ok": False, "error": "Body is not valid JSON."})
+            return None
+        if not isinstance(doc, dict):
+            self._json(400, {"ok": False, "error": "Body must be a JSON object."})
+            return None
+        return doc
 
     # Camera settings are changed with PUT (or POST) /api/camera-settings, behind the
     # same access check as everything else. A JSON content type is required: a
     # cross-site form cannot send one without a CORS preflight, which this server
     # never approves (CSRF protection once access moves to cookies/SSO).
     def do_PUT(self):
+        self._pr_done, self._pr = False, None
         self._update_settings()
 
     def do_POST(self):
-        if urlparse(self.path).path.startswith("/api/playback/"):
+        self._pr_done, self._pr = False, None
+        path = urlparse(self.path).path
+        if path.startswith("/api/internal/"):
+            self._internal(path)
+        elif path.startswith("/api/playback/"):
             self._playback_post()
         else:
             self._update_settings()
 
-    def _client(self):
-        """Who asked (audit log): proxy headers first (Cloudflare), else the peer."""
+    def _client(self, pr=None):
+        """Who asked (audit log): proxy headers first (Cloudflare), else the peer; the
+        signed-in person when there is one."""
         ip = (self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For", "").split(",")[0].strip()
               or self.client_address[0])
-        user = self.headers.get("Cf-Access-Authenticated-User-Email") or None
-        return ip, user
+        user = ((pr.email or pr.name) if pr is not None and pr.kind == "user" else
+                "key link" if pr is not None and pr.kind == "key" else None)
+        return ip, user or self.headers.get("Cf-Access-Authenticated-User-Email") or None
 
     def _playback_post(self):
         """POST /api/playback/search {from, to, cameras, replaces?} | /api/playback/close {sid}.
@@ -2930,8 +3185,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.close_connection = True
             return self._json(413, {"ok": False, "error": "Request too large."})
-        if not self._authorised(query):
-            return self._json(401, {"ok": False, "error": "unauthorised"})
+        pr = self._require(parsed.path, query)
+        if pr is None:
+            return None
         if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json":
             return self._json(415, {"ok": False, "error": "Content-Type must be application/json."})
         try:
@@ -2940,22 +3196,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"ok": False, "error": "Body is not valid JSON."})
         if not isinstance(doc, dict):
             return self._json(400, {"ok": False, "error": "Body must be a JSON object."})
-        ip, user = self._client()
+        ip, user = self._client(pr)
         if parsed.path == "/api/playback/search":
-            code, out = pb.MANAGER.search(doc, client=ip, user=user)
+            # every camera asked for must allow THIS viewer recorded playback (else 403)
+            code, out = pb.MANAGER.search(doc, client=ip, user=user, access=pr)
             return self._json(code, out)
         if parsed.path == "/api/playback/close":
-            ok = isinstance(doc.get("sid"), str) and pb.MANAGER.close(doc["sid"], "PAGE_CLOSED")
+            s = pb.MANAGER.get(doc.get("sid")) if isinstance(doc.get("sid"), str) else None
+            ok = s is not None and pb.MANAGER.owns(s, pr) and pb.MANAGER.close(doc["sid"], "PAGE_CLOSED")
             return self._json(200, {"ok": bool(ok)})
         return self._json(404, {"ok": False, "error": "not found"})
 
-    def _playback_ws(self, query):
+    def _playback_ws(self, query, pr):
         """WebSocket of a playback page (?sid=...): JPEG frames with their recorded time,
-        the chosen camera's G.711 audio, state JSON; commands come back as text."""
+        the chosen camera's G.711 audio, state JSON; commands come back as text. Only the
+        person who searched may attach (a session id alone is not enough)."""
         key = self.headers.get("Sec-WebSocket-Key", "")
         if "websocket" not in self.headers.get("Upgrade", "").lower() or not key:
             self._send(400, b"WebSocket upgrade required", "text/plain")
             return
+        s = pb.MANAGER.get((query or {}).get("sid", [""])[0])
+        if s is not None and not pb.MANAGER.owns(s, pr):
+            ev(f"[ACCESS] playback session {s.sid[:6]}: attach refused for {pr.ident}")
+            return self._refuse("/api/playback/ws", 403, "This playback session belongs to somebody else.")
         accept = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
         self.send_response(101, "Switching Protocols")
         self.send_header("Upgrade", "websocket")
@@ -2964,7 +3227,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         ws = _WebSocket(self)
-        s = pb.MANAGER.get((query or {}).get("sid", [""])[0])
         if s is None:
             ws.send_json({"t": "error", "error": "expired",
                           "msg": "This playback session has ended. Search again."})
@@ -2989,8 +3251,11 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.close_connection = True
             return self._json(413, {"ok": False, "errors": [{"message": "Request too large."}]})
-        if not self._authorised(query):
+        pr = self._principal(query)
+        if pr is None:
             return self._json(401, {"ok": False, "errors": [{"message": "unauthorised"}]})
+        if not (pr.allowed and pr.admin):             # camera names / order: administrators only
+            return self._json(403, {"ok": False, "errors": [{"message": "Only administrators can change camera settings."}]})
         if parsed.path != "/api/camera-settings":
             return self._json(404, {"ok": False, "errors": [{"message": "not found"}]})
         ctype = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
@@ -3026,10 +3291,21 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return None
 
-    def _snapshot(self, path):
+    # A viewer's permission is re-checked this often while a picture or sound streams:
+    # a camera taken away in the CMS goes dark within about this long.
+    RECHECK_S = 2.0
+
+    def _still(self, pr, key, *features):
+        """-> (principal re-decided, still allowed?) for a long-lived stream."""
+        pr = pr.recheck()
+        return pr, pr.allowed and all(pr.can(key, f) for f in features)
+
+    def _snapshot(self, path, pr):
         i = self._index(path, "/snapshot/")
         if i is None:
             self._send(404, b"bad camera", "text/plain")
+            return
+        if not self._may(pr, i, "live", path):            # checked BEFORE the shared worker is touched
             return
         cam = STREAMS[i]
         cam.add_viewer()
@@ -3046,11 +3322,15 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             cam.remove_viewer()
 
-    def _stream(self, path, query=None):
+    def _stream(self, path, query=None, pr=None):
         i = self._index(path, "/stream/")
         if i is None:
             self._send(404, b"bad camera", "text/plain")
             return
+        pr = pr or ca.OPEN_PRINCIPAL
+        if not self._may(pr, i, "live", path):            # checked BEFORE the shared worker is touched
+            return
+        key = self._camera_key(i)
         # ?fps=N (1..STREAM_FPS): lower send rate for low-bandwidth previews (Settings
         # page). Same camera worker, same NVR slot, same cached JPEG -- only fewer
         # frames are written to THIS viewer.
@@ -3066,13 +3346,14 @@ class Handler(BaseHTTPRequestHandler):
                 ofps = int((query or {}).get("fps", [ORIGINAL_FPS])[0])
             except (TypeError, ValueError):
                 ofps = ORIGINAL_FPS
-            return self._stream_original(i, max(1, min(ORIGINAL_FPS, ofps)), full)
+            return self._stream_original(i, max(1, min(ORIGINAL_FPS, ofps)), full, pr)
         fps = max(1, min(STREAM_FPS, fps))
         cam = STREAMS[i]
         ORIG_STREAMS[i].hold_for_handoff()       # Original -> Standard: bridge until live
         n = cam.add_viewer(full=full)
         ev(f"[{cam.label}] HTTP viewer connected (viewers {n - 1} -> {n}){' [fullscreen]' if full else ''}")
         t_conn = time.monotonic()
+        t_check = t_conn
         sent_live = False
         try:
             self.send_response(200)
@@ -3080,8 +3361,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Accel-Buffering", "no")   # nginx: do not buffer MJPEG
             self.end_headers()
+            # no length: when the SERVER ends it (permission removed) the connection must
+            # close, or a keep-alive browser would wait on it forever
+            self.close_connection = True
             delay = 1.0 / fps
             while True:
+                if time.monotonic() - t_check >= self.RECHECK_S:
+                    t_check = time.monotonic()
+                    pr, ok = self._still(pr, key, "live")
+                    if not ok:
+                        ev(f"[{cam.label}] live permission removed for {pr.ident} -- stream ended")
+                        break
                 cam.last_use = time.time()
                 # the FIRST part goes out at once: a HOT camera's live frame, else its
                 # cached frame (clearly stamped CACHED), else the status card
@@ -3112,7 +3402,7 @@ class Handler(BaseHTTPRequestHandler):
                          b"\r\nX-Frame-State: " + state.encode() +
                          b"\r\n\r\n" + jpg + b"\r\n")
 
-    def _stream_original(self, i, fps, full):
+    def _stream_original(self, i, fps, full, pr=None):
         """MJPEG of camera i's MAIN stream (Original mode). One Original worker per
         camera, shared by every Original viewer. Until its first Original frame
         arrives, the viewer keeps seeing the camera's Standard picture with a small
@@ -3125,10 +3415,13 @@ class Handler(BaseHTTPRequestHandler):
         per second, and the last one again after 1 s without a new one -- that write
         is also how a closed connection is noticed."""
         orig, std = ORIG_STREAMS[i], STREAMS[i]
+        pr = pr or ca.OPEN_PRINCIPAL
+        key = self._camera_key(i)
         std.hold_for_handoff()                   # Standard -> Original: bridge until live
         n = orig.add_viewer(full=full, fps=fps)
         ev(f"[{orig.label}] HTTP viewer connected (viewers {n - 1} -> {n}){' [fullscreen]' if full else ''}")
         t_conn = time.monotonic()
+        t_check = t_conn
         sent_live = False
         fallback = False                     # this viewer also holds a Standard viewer (main stream failed)
         try:
@@ -3137,9 +3430,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
+            self.close_connection = True         # (see _stream: a server-ended stream closes)
             gap = 0.85 / fps                     # min time between two parts (cap at ~fps)
             last, t_last = None, 0.0
             while True:
+                if time.monotonic() - t_check >= self.RECHECK_S:
+                    t_check = time.monotonic()
+                    pr, ok = self._still(pr, key, "live")
+                    if not ok:
+                        ev(f"[{orig.label}] live permission removed for {pr.ident} -- stream ended")
+                        break
                 orig.last_use = std.last_use = time.time()
                 jpg, state = orig.frame_for_viewer()
                 if state == "live":
@@ -3184,11 +3484,14 @@ class Handler(BaseHTTPRequestHandler):
                     orig.fallback_viewers -= 1
             ev(f"[{orig.label}] HTTP viewer disconnected (viewers {n + 1} -> {n})")
 
-    def _audio_ws(self, i, query):
+    def _audio_ws(self, i, query, pr=None):
         """WebSocket: camera i's audio for ONE listener. Binary messages =
         [1, codec (0 = PCMU, 8 = PCMA), 4-byte packet number] + G.711 bytes as they
         arrive from the NVR (~40 ms each); text messages = {"state": ...} whenever the
-        audio state changes. Only NEW audio is sent (never a stale backlog)."""
+        audio state changes. Only NEW audio is sent (never a stale backlog).
+        The caller has checked live + audio for THIS viewer; re-checked while it plays."""
+        pr = pr or ca.OPEN_PRINCIPAL
+        cam_key = self._camera_key(i)
         key = self.headers.get("Sec-WebSocket-Key", "")
         if "websocket" not in self.headers.get("Upgrade", "").lower() or not key:
             self._send(400, b"WebSocket upgrade required", "text/plain")
@@ -3213,8 +3516,16 @@ class Handler(BaseHTTPRequestHandler):
         ev(f"[{aw.label}] listener connected (listeners {n - 1} -> {n}){' [fullscreen]' if full else ''}")
         try:
             last, sent, t_ping = aw.latest(), None, time.monotonic()
+            t_check = t_ping
             now_ui = lambda: (aw.vstate, aw.ui_cause())
             while not ws.closed:
+                if time.monotonic() - t_check >= self.RECHECK_S:
+                    t_check = time.monotonic()
+                    pr, ok = self._still(pr, cam_key, "live", "audio")
+                    if not ok:
+                        ws.send_json({"state": "UNAVAILABLE", "detail": "Sound is not available to you for this camera"})
+                        ev(f"[{aw.label}] sound permission removed for {pr.ident} -- listener dropped")
+                        break
                 with aw._cond:
                     aw._cond.wait_for(lambda: aw._n > last or now_ui() != sent or ws.closed, timeout=1.0)
                     pk = [p for p in aw._pkts if p[0] > last]
@@ -3323,6 +3634,15 @@ def main():
           f"searches reach back to each NVR's oldest recording (checked every "
           f"{pb.RETENTION_REFRESH_S / 60:g} min)")
     pb.start_retention_watch()                    # metadata only: ~1 request per camera
+    probs = ca.CONFIG.problems()
+    print("access: administrators' key link " + ("ON" if TOKEN and not KEY_RETIRED else "OFF")
+          + "; per-person sign-in from the GRAV CMS "
+          + (f"ON (permissions from {ca.CONFIG.cms_api})" if not probs else "OFF -- " + "; ".join(probs)))
+    if KEY_RETIRED:
+        print("WARNING: CCTV_TOKEN is a value that was published in git. The key link is OFF until you set "
+              "another CCTV_TOKEN in .env.")
+    if not TOKEN and probs:
+        print("WARNING: no access gate is configured -- EVERY visitor sees every camera. Development only.")
     print("Press Ctrl+C to stop.\n", flush=True)
     try:
         QuietServer((BIND, PORT), Handler).serve_forever()

@@ -1418,10 +1418,13 @@ class Tile:
     def __init__(self, tid, index, info, name):
         self.id, self.index, self.info, self.name = tid, index, info, name
         self.nvr, self.channel = info["nvr"], info["channel"]
+        self.key = f"{self.nvr}:{self.channel}"      # the camera's stable key (permissions)
         self.avail = None                    # search result (None: still searching)
         self.avail_ver = 0                   # session.avail_ver when it arrived
         self.worker = None
         self.state, self.msg = "SEARCHING", "Searching recordings..."
+        self.denied = False                  # the viewer lost recorded playback for this camera
+        self.audio_allowed = True            # ... or its sound (per-person CCTV permissions)
 
     def locate(self, t):
         segs = (self.avail or {}).get("segments")
@@ -1439,17 +1442,25 @@ class Tile:
              "recordedS": a.get("recordedS"), "method": a.get("method")}
         if full:
             v["segments"] = [[pt.to_ms(s), pt.to_ms(e)] for s, e in segs] if segs is not None else None
-        if self.worker is not None and (self.worker._running or self.worker.state in
-                                        ("ENDED", "ERROR", "NO_RECORDING", "NVR_UNREACHABLE", "GAP")):
+        if self.worker is not None and not self.denied and (self.worker._running or self.worker.state in
+                                                            ("ENDED", "ERROR", "NO_RECORDING", "NVR_UNREACHABLE", "GAP")):
             v.update(self.worker.view())
         else:
             v.update({"state": self.state, "msg": self.msg, "recMs": None, "gap": None, "audio": None})
+        v["audioAllowed"] = self.audio_allowed and not self.denied
+        if not v["audioAllowed"]:
+            v["audio"] = None                # no sound offered for this camera
         return v
 
 
 class Session:
-    def __init__(self, sid, a, b, tiles, client):
+    def __init__(self, sid, a, b, tiles, client, access=None):
         self.sid, self.a, self.b, self.tiles, self.client = sid, a, b, tiles, client
+        # Who started it (cctv_access.Principal: .ident, .can(key, feature), .recheck());
+        # None = no per-person permissions (tests / direct use). Only the same person may
+        # attach to it, and their permissions are re-checked while it runs.
+        self.access = access
+        self.t_access = time.monotonic()
         self.lock = threading.RLock()
         self.cv = threading.Condition()
         self.paused, self.speed = False, 1
@@ -1526,8 +1537,9 @@ class PlaybackManager:
         self._audit_lock = threading.Lock()
 
     # ── search ───────────────────────────────────────────────────────────────
-    def search(self, body, client=None, user=None):
-        """-> (http status, response dict)."""
+    def search(self, body, client=None, user=None, access=None):
+        """-> (http status, response dict). access: the viewer (cctv_access.Principal) --
+        every camera asked for must allow THEM recorded playback, or nothing is searched."""
         cams = HOOK.cameras
         try:
             a = pt.parse_local(body.get("from"))
@@ -1549,6 +1561,12 @@ class PlaybackManager:
             if i not in seen:
                 seen.add(i)
                 sel.append(i)
+        if access is not None:
+            refused = [i for i in sel if not access.can(f"{cams[i]['nvr']}:{cams[i]['channel']}", "playback")]
+            if refused:
+                return 403, {"ok": False, "code": "PLAYBACK_NOT_PERMITTED", "cameras": refused,
+                             "error": "You do not have recorded playback for: "
+                                      + ", ".join(HOOK.display_name(i) for i in refused) + "."}
         # how far back: each selected NVR's oldest recording (read from the NVRs); the
         # fixed MAX_RANGE_H only while an NVR's oldest recording is not known
         first, kept = retention_limit({cams[i]["nvr"] for i in sel})
@@ -1566,8 +1584,11 @@ class PlaybackManager:
         if isinstance(prev, str):
             self.close(prev, "NEW_SEARCH")
         tiles = [Tile(k, i, cams[i], HOOK.display_name(i)) for k, i in enumerate(sel)]
+        if access is not None:
+            for t in tiles:
+                t.audio_allowed = access.can(t.key, "audio")
         sid = secrets.token_urlsafe(12)
-        s = Session(sid, a, b, tiles, client)
+        s = Session(sid, a, b, tiles, client, access=access)
         with self.lock:
             self.sessions[sid] = s
         self._ensure_hk()
@@ -1666,7 +1687,7 @@ class PlaybackManager:
         return len(running_workers()) < MAX_WORKERS and len(running_workers(nvr)) < per_nvr_max(nvr)
 
     def _start_tile(self, s, tile, t=None):
-        if (tile.avail or {}).get("status") not in ("found", "partial"):
+        if tile.denied or (tile.avail or {}).get("status") not in ("found", "partial"):
             return
         w = tile.worker
         if w is not None and w._running:
@@ -1700,6 +1721,58 @@ class PlaybackManager:
                     self._start_tile(s, tile)
         s.notify(state_changed=True)
 
+    # ── per-person permissions, re-checked while the session runs ────────────
+    ACCESS_RECHECK_S = 2.0
+
+    def owns(self, s, access):
+        """May this viewer attach to / close this session? Only the person who started it."""
+        return s.access is None or (access is not None and access.ident == s.access.ident)
+
+    def recheck_access(self, s, force=False):
+        """The owner's permissions now (cctv_access re-asks the CMS when stale or told
+        of a change): a camera whose playback was taken away stops, a camera whose sound
+        was taken away goes silent, and a viewer who lost CCTV altogether loses the
+        session. -> False when the session was closed."""
+        if s.access is None or s.closed:
+            return not s.closed
+        now = time.monotonic()
+        if not force and now - s.t_access < self.ACCESS_RECHECK_S:
+            return True
+        s.t_access = now
+        try:
+            acc = s.access.recheck()
+        except Exception as e:                            # never let a check crash the session
+            HOOK.ev(f"[PLAYBACK] session {s.sid[:6]} permission re-check failed: {e!r}")
+            return True
+        s.access = acc
+        if not acc.allowed:
+            if s.ws is not None:
+                try:
+                    s.ws.send_json({"t": "error", "error": "denied",
+                                    "msg": acc.message or "Your CCTV access was removed."})
+                except OSError:
+                    pass
+            self.close(s.sid, "PERMISSION_REVOKED")
+            return False
+        changed = False
+        with s.lock:
+            for t in s.tiles:
+                play, hear = acc.can(t.key, "playback"), acc.can(t.key, "audio")
+                if not play and not t.denied:
+                    t.denied, changed = True, True
+                    if t.worker is not None:
+                        t.worker.stop("PERMISSION_REVOKED")
+                    t.worker = None
+                    t.state, t.msg = "DENIED", "Your recorded playback permission for this camera was removed."
+                    HOOK.ev(f"[PLAYBACK] session {s.sid[:6]} {t.name}: playback permission removed")
+                if hear != t.audio_allowed:
+                    t.audio_allowed, changed = hear, True
+                if s.audio_tile == t.id and (t.denied or not t.audio_allowed):
+                    s.audio_tile, changed = -1, True
+        if changed:
+            s.notify(state_changed=True)
+        return True
+
     # ── WebSocket session ────────────────────────────────────────────────────
     def run_ws(self, s, ws):
         """Blocking: the page's WebSocket (handler thread). Sends frames / audio / state."""
@@ -1715,6 +1788,8 @@ class PlaybackManager:
             while not ws.closed and s.ws is ws and not s.closed:
                 with s.cv:
                     s.cv.wait(timeout=0.2)
+                if not self.recheck_access(s):
+                    break
                 now = time.monotonic()
                 if s.avail_ver != sent_avail:             # recording searches finished since
                     with s.lock:
@@ -1738,7 +1813,7 @@ class PlaybackManager:
                             ws.send_binary(b"V" + bytes([tile.id]) + int(ms).to_bytes(8, "big")
                                            + (seq & 0xFFFFFFFF).to_bytes(4, "big") + jpg)
                 at = s.audio_tile
-                if at >= 0 and not s.paused and at < len(s.tiles):
+                if at >= 0 and not s.paused and at < len(s.tiles) and s.tiles[at].audio_allowed and not s.tiles[at].denied:
                     w = s.tiles[at].worker
                     if w is not None:
                         key = (at, id(w))
@@ -1795,7 +1870,9 @@ class PlaybackManager:
                     if t.worker is not None and t.worker._running:
                         t.worker.command("speed", x=s.speed, seq=s.seq)
             elif op == "audio" and isinstance(c.get("tile"), int):
-                s.audio_tile = c["tile"] if 0 <= c["tile"] < len(s.tiles) else -1
+                t = c["tile"]
+                # sound only for a camera whose sound THIS viewer may hear
+                s.audio_tile = t if 0 <= t < len(s.tiles) and s.tiles[t].audio_allowed and not s.tiles[t].denied else -1
             elif op == "focus" and isinstance(c.get("tile"), int):
                 s.focus = c["tile"] if 0 <= c["tile"] < len(s.tiles) else -1
             elif op == "page" and isinstance(c.get("tiles"), list):

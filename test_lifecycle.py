@@ -16,7 +16,7 @@ import sys
 import time
 import types
 
-# Offline unit tests: no real RTSP pre-flight to the NVRs, no event log noise.https://cctv.grav.in/?key=grav-cctv-4821
+# Offline unit tests: no real RTSP pre-flight to the NVRs, no event log noise.
 os.environ["CCTV_PREFLIGHT"] = "0"
 os.environ["CCTV_PERSISTENT"] = "0"          # on-demand mode (the fallback); test_relay.py covers the pool
 os.environ["CCTV_LOG_EVENTS"] = "0"

@@ -1,0 +1,296 @@
+GRAV CCTV -- PERSON-WISE CCTV PERMISSIONS                              28 Sep 2026
+Repos: grav-cctv, grav-cms-backend, grav-cms (both CMS repos first fast-forwarded to
+origin/NEW_CMS_BRANCH, as agreed; your old backend package-lock.json change is kept in
+git stash@{0}). Nothing committed, nothing deployed.
+
+Decisions you made (28 Sep): all 3 repos; full access = platform administrators; per
+camera Live / Audio / Playback (Audio = live AND recorded sound); department CCTV toggle
+AND per-person cameras both needed; nobody gets cameras on day one; people only (shared
+department logins get none unless they are administrators).
+Changed later on 28 Sep, on your instruction: the administrators' key link is KEPT --
+the same key as before, full access, no password, on cctv.grav.in and on the local
+server -- and the key is taken out of the address bar the moment it is opened (see 16).
+(First plan was a new key; that is withdrawn.)
+
+==========================================================================================
+1. FILES CHANGED
+==========================================================================================
+grav-cms-backend
+  services/cctv/cctvAccess.service.js    NEW  the one CCTV decision (precedence below)
+  services/cctv/cctvLink.js              NEW  sign-in token, service key, CCTV camera
+                                              list, "access changed" notices
+  routes/cctvSso.js                      REWRITTEN  POST/GET /api/cctv/sso (personal
+                                              90 s token; was: redirect with the shared
+                                              key) + GET /api/cctv/internal/access
+  Middlewear/cctvAuth.js                 DELETED  (trusted the token's isAdmin claim)
+  server.js                              /api/cctv mount without cctvAuth
+  models/Access/DepartmentRole.js        + cctvCameras [{key, live, audio, playback}]
+  services/access/accessGrantAdmin.service.js  cctv grants through the ONE audited
+                                              write (validation, audit before/after,
+                                              history line, notice to CCTV)
+  services/access/appAccess.service.js   exports verifiedIdentity
+  services/departmentRoles.js            holders list carries cctvCameras
+  routes/Admin/accessAdmin.js            GET /api/admin/cctv/cameras; department
+                                              CCTV-toggle audit + notice
+  test/cctv/cctv-person-access.test.js   NEW  21 tests
+  test/access/gac2-single-writer.contract.test.js  1-line Windows path fix (see 14)
+grav-cms
+  components/access/CctvAccessControl.js NEW  the per-person CCTV editor
+  components/access/cctvAccessModel.js   NEW  its rules (pure)
+  components/access/cctvAccessModel.test.mjs  NEW  10 tests
+  components/access/PeoplePanel.js       CCTV chip on the person's row, history
+  lib/accessApi.js                       listCctvCameras, listCctvHolders, setCctvAccess
+  app/cctv/page.js                       asks for a personal sign-in link
+  components/access/grantWrite.test.mjs  setCctvAccess added to the reason/key check
+grav-cctv
+  cctv_access.py                         NEW  sign-in token, session cookie, permission
+                                              cache (asks the CMS), principals
+  server.py                              every route checks the viewer; /sso, /logout,
+                                              /api/me, /api/internal/*; re-checks
+  playback.py                            session owner, per-camera playback / sound
+  grid_page.py / playback_page.py        only permitted cameras and controls, empty
+                                              states, name + Sign out
+  test_access.py                         NEW  91 checks
+  README.md, .env.example, .gitignore    docs; the leaked SSO secret replaced by a
+                                              placeholder; .env backups ignored
+  test_lifecycle.py                      a pasted key-link URL removed from a comment
+  .env (not in git)                      the SAME key as before, NEW SSO secret, service
+                                              key, CMS URLs (backup: .env.backup-before-cctv-permissions)
+  grav-cms-backend/.env (not in git)     same NEW secrets, CCTV_APP_URL=http://localhost:8000,
+                                              CCTV_KEY removed (backup kept)
+
+==========================================================================================
+2. EXISTING ACCESS-CONTROL MODEL FOUND
+==========================================================================================
+  * Departments (AccessDepartment) are granted to employees (primary + additional);
+    each department has a "CCTV camera access" toggle (cctvEnabled).
+  * Module roles live in department_roles rows (application slug + email), written ONLY
+    by changeAppAccess() -- reason + idempotency key, one MongoDB transaction, an
+    append-only hash-chained AccessGrantEvent, a ChangeLog line for "Access history".
+    A contract test enforces the single writer.
+  * Platform administrator = DeptUser.isAdmin, re-read from the database with the
+    session's tokenVersion on every check (the Access control page is admin-only).
+  * CCTV before: /api/cctv/sso checked "admin or a department with cctvEnabled" and then
+    redirected to cctv.grav.in/?key=<ONE shared key> (hard-coded fallback in source).
+    No identity reached the CCTV site, so everybody allowed saw EVERY camera, and the
+    key sat in their browser history. The CCTV site's only gate was that key.
+
+==========================================================================================
+3. FINAL PRECEDENCE (PASS -- tested)
+==========================================================================================
+  1. Platform administrator (database-verified) -> every camera, live, audio, playback,
+     camera Settings. Also the administrators' key link (unchanged key).
+  2. Shared department login that is not an administrator -> no CCTV ("sign in with
+     your own work email").
+  3. Department gate: the person must hold an ACTIVE department with CCTV camera access
+     on (primary or additional). Off -> "CCTV is not enabled for your department".
+  4. The person's cameras (the cctv grant): exactly those, each with its own
+     Live / Audio / Playback. None assigned -> an empty page, never all cameras.
+  5. The CCTV server checks THIS viewer for THAT camera and THAT feature on every
+     request (the final enforcement).
+  Deactivated person or revoked session version -> refused.
+
+==========================================================================================
+4. DATA MODEL
+==========================================================================================
+  department_roles row, departmentSlug "cctv" (a module whose slug is fixed in code --
+  no fake "CCTV department"), keyed by email like every other grant:
+      { departmentSlug: "cctv", email, role: "viewer", isActive,
+        cctvCameras: [ { key: "nvr2:8", live: true, audio: false, playback: true }, ... ] }
+  * Camera = the CCTV app's STABLE key "<nvr>:<channel>", never a list position.
+  * Written only through changeAppAccess (PUT /api/admin/app-access, application
+    "cctv"): role viewer with >= 1 camera, or no role (revoke; cameras cleared).
+    Unknown keys, other roles, cctvCameras on another application -> 400.
+  * No new collection (the Atlas cluster is at its 500-collection limit).
+
+==========================================================================================
+5. CAMERA-LEVEL PERMISSIONS (PASS)
+==========================================================================================
+  Live = live video; Audio = the camera's sound in live view AND recorded playback;
+  Playback = recorded footage. A camera is assigned when Live or Playback is on
+  (playback-only is possible); Audio needs Live or Playback. Example from your spec
+  verified in the browser: Rahul -- HR office live + playback (no audio), Reception
+  live + audio (no playback); every other camera absent.
+
+==========================================================================================
+6. LIVE ENFORCEMENT (PASS)
+==========================================================================================
+  /api/cameras lists only the viewer's live cameras (others are never sent);
+  /stream/<i> (Standard and Original), /snapshot/<i>, /api/stream-info/<i> -> 403 for a
+  camera without Live, checked BEFORE the shared worker is touched.
+
+==========================================================================================
+7. AUDIO ENFORCEMENT (PASS)
+==========================================================================================
+  /audio/<i> -> 403 (no socket) without Live + Audio; the speaker is not shown for that
+  camera (live grid, single view, playback tile, playback controls); in playback the
+  server refuses to select that camera's sound and never sends its packets.
+
+==========================================================================================
+8. PLAYBACK ENFORCEMENT (PASS)
+==========================================================================================
+  /api/playback/config lists only playback cameras ("Select all" = exactly those);
+  POST /api/playback/search -> 403 if ANY camera asked for lacks Playback (nothing is
+  searched); a playback session belongs to its starter -- another person attaching to
+  its WebSocket -> 403, closing it -> refused; sound per camera as in 7.
+
+==========================================================================================
+9. DIRECT-ROUTE PROTECTION (PASS)
+==========================================================================================
+  Signed out -> 401 (pages: "Open CCTV from the GRAV CMS"); a wrong key -> 401; the key
+  link -> everything (16); other cameras -> 403 on every camera URL; Settings, /api/status,
+  settings API, NVR info, playback status -> administrators only (403); camera names /
+  order cannot be changed by viewers (403). Sign-in tokens: HS256, 90 s, single use,
+  audience/issuer checked; tampered session cookie = signed out; the CMS-only endpoints
+  need the service key. Shared worker: a live HR stream for an authorised viewer did not
+  let an unauthorised viewer attach (403, viewer count unchanged).
+
+==========================================================================================
+10. FRONTEND BEHAVIOUR (PASS -- real browser, isolated test system)
+==========================================================================================
+  People & roles: a "CCTV · 2 cameras · live 2 · audio 1 · playback 1" chip on each person
+  who holds a CCTV-enabled department (or already has cameras); it opens the editor:
+  camera list read from the CCTV site (names, NVR, channel), search, grouped by NVR,
+  Live / Audio / Playback per camera, select + bulk (+/- Live, Audio, Playback, Remove),
+  a warning when their department has CCTV off, Discard / Save -> the confirmation lists
+  every change and asks for a reason. Sam (Sales, CCTV off) had no chip.
+  CCTV site: signed-in name + Sign out; Settings only for administrators; Playback only
+  when they have playback cameras; "No CCTV cameras have been assigned to your account."
+  The CMS /cctv page shows the server's reason when refused.
+
+==========================================================================================
+11. MIGRATION (as you chose)
+==========================================================================================
+  Nobody gets cameras automatically: people who used CCTV through their department see
+  the empty page until cameras are assigned. Administrators and the key link are
+  unaffected (the key link works exactly as before). Note: that same key is in the
+  browser history of everybody the CMS used to send to CCTV with it, and in the public
+  GitHub repository (see Security notes) -- whoever has it sees every camera.
+
+==========================================================================================
+12. REVOKE (PASS)
+==========================================================================================
+  Saving a change makes the CMS tell the CCTV site at once; open live video, sound and
+  playback are re-checked every 2 s. Measured: an open live stream ended 2.0 s after the
+  change (browser e2e: change 21:32:46, stream ended 21:32:49); without the notice, by the
+  cache expiry in 2.0 s (test with 1 s cache); sound socket closed with "Sound is not
+  available to you"; playback tile stopped ("DENIED"); losing CCTV altogether closes the
+  playback session. New requests are refused immediately. A department toggle switched
+  off tells the CCTV site to re-check everybody. If the CMS cannot answer: the last answer
+  for 60 s, then refused (fail closed).
+
+==========================================================================================
+13. AUDIT (PASS)
+==========================================================================================
+  Every CCTV grant change: AccessGrantEvent (append-only, hash chain) with actor, target,
+  before/after cameras, reason, time; plus the Access history line, e.g. "CCTV 2 cameras:
+  +Reception office (live, sound); +HR office (live, playback). <reason> -- E2E Admin".
+  Department CCTV toggle changes are logged. The CCTV site logs every sign-in, refusal,
+  permission-driven stream end, and records the person on the playback audit log.
+  No secrets are logged.
+
+==========================================================================================
+14. TESTS
+==========================================================================================
+  grav-cctv (offline: fake CMS, fake NVRs, synthetic video; outbound guard)
+    test_access 104 (new; 13 of them for the key link, 16) · test_playback 132 ·
+    test_audio 84 · test_camera_settings 86 · test_lifecycle 11 · test_live_stability 44 ·
+    test_quality 60 · test_relay 65 · test_slots 59  = 645 checks, 0 failures     PASS
+    (re-run after the key-link change, 28 Sep 22:46-22:57)
+  grav-cms-backend (Jest, in-memory MongoDB)
+    test/cctv 21 (new) + gac2 grant administration + single-writer contract = 69 PASS
+    test/access + test/cctv: 209 pass, 5 FAIL -- the same 5 fail on an untouched checkout
+    of your current commit (pre-existing on Windows: QC cache spies, a seeding duplicate
+    key, a `git grep` quoting issue). The contract test's own Windows path bug is fixed
+    (1 line), so it now proves no second writer of grants exists.
+  grav-cms (node --test)  cctvAccessModel 10 (new) + grantWrite + accessModel = 31 PASS
+    (the project's full `npm test` needs `npm install` first: the updated repo added
+    esbuild / jsdom / testing-library as dev dependencies; I did not run npm install
+    while your dev server was running.)
+  Your 11 required cases:
+    1 CEO/admin: all cameras, live, audio, playback ............................ PASS
+    2 User A (HR only: live yes, audio no, playback yes) ........................ PASS
+    3 User B (Reception audio only, Corridor playback only) ..................... PASS
+    4 CCTV access but no camera -> empty state .................................. PASS
+    5 No CCTV access -> refused, direct routes blocked (tile hidden: see 15) ....... PASS
+    6 Direct stream URL for another camera -> 403 ............................... PASS
+    7 Direct audio URL unauthorised -> 403 ...................................... PASS
+    8 Direct playback API unauthorised -> 403 ................................... PASS
+    9 Select All playback = only permitted cameras .............................. PASS
+   10 Revoked while logged in -> denied, open views cut within ~2 s .............. PASS
+   11 Shared worker: no access leak across viewers .............................. PASS
+  End to end in a real browser (throwaway system: slim CMS backend on an in-memory
+  database, a second CMS frontend, CCTV with synthetic video and fake NVRs -- your
+  servers and real database untouched): admin assigned Rahul's and Priya's cameras in
+  People & roles; Rahul opened CCTV from the CMS and saw only his 2 cameras with the
+  right controls; other cameras' URLs 403; playback listed only HR office and played it
+  without sound; admin removed Reception and Rahul's open stream ended in ~2 s; Sam was
+  refused with the reason; Neha saw the empty state; the admin saw all 25 cameras. PASS
+
+==========================================================================================
+15. NOT TESTED
+==========================================================================================
+  * Production (cctv.grav.in on the Alienware + your production CMS backend): nothing is
+    deployed. See DEPLOY below.
+  * The real NVRs with per-person access (all tests used synthetic video / fake NVRs;
+    the permission code does not depend on the NVR).
+  * The onboarding launcher's CCTV tile for a person without CCTV access -- unchanged
+    code (it already shows only for admins / CCTV-enabled departments); the server now
+    refuses such a person anyway (tested).
+  * Your own running servers: your CMS backend on :5000 was restarted at 21:48 and holds
+    the new secret (the "secret was published" message came from the copy started at
+    20:39, before the new secret was written). Your CCTV server on :8000 was started at
+    21:23, before the key-link change -- restart it once to load it.
+
+==========================================================================================
+16. THE ADMINISTRATORS' KEY LINK (kept, on your instruction -- PASS)
+==========================================================================================
+  https://cctv.grav.in/?key=<key> and http://<laptop>:8000/?key=<key> open everything
+  with no password, as before. Opened in a browser, the server answers with a signed,
+  HttpOnly cookie and reloads the same page WITHOUT ?key= -- the key does not stay in the
+  address bar, in bookmarks made afterwards, or in later links. The cookie is signed with
+  a value derived from the key (it never contains the key), lasts 400 days, renews itself
+  whenever a page is opened, and "Sign out" on the page removes it; changing the key
+  signs every such browser out. Scripts and tools sending ?key= are answered directly.
+  People never see the key: the CMS sends them to /sso?token=<a 90-second one-time
+  token for that person>, which becomes a clean address with their own cameras only.
+  Tests: 302 to the clean address + cookie; other query parameters kept; the cookie alone
+  opens pages, all cameras, Settings, streams; renewed on page opens only; valid after
+  days, not after 400 days or with another key; forged cookie -> 401; wrong key -> 401 and
+  no cookie; sign-out clears it; a person signing in on the same browser replaces it.
+  Real browser (throwaway server on 127.0.0.1:8014, synthetic video, a test key, no
+  network): the key link landed on http://127.0.0.1:8014/ with 6 live tiles and
+  "Administrator (key link)"; the key was nowhere in the page, its links or stream URLs,
+  and page scripts cannot read the cookie; reload, Playback and Settings worked with the
+  clean address; Sign out -> "Signed out", then the site asked to sign in; a wrong key was
+  refused.                                                                         PASS
+
+DEPLOY (production, when you decide)
+  1. Generate NEW values (not the local ones): CCTV_SSO_SECRET and CCTV_SERVICE_KEY
+     (python -c "import secrets; print(secrets.token_hex(32))"). CCTV_TOKEN stays as it
+     is -- the key link keeps working.
+  2. Production CMS backend .env: CCTV_SSO_SECRET, CCTV_SERVICE_KEY, CCTV_APP_URL=https://cctv.grav.in;
+     remove CCTV_KEY. Deploy grav-cms-backend + grav-cms.
+  3. Alienware grav-cctv .env: keep CCTV_TOKEN; add CCTV_SSO_SECRET, CCTV_SERVICE_KEY (same
+     as the CMS), CCTV_CMS_API_URL=<production CMS backend URL>, CCTV_CMS_APP_URL=<CMS web
+     URL>; git pull; restart server.py. The startup line says which ways in are ON.
+  4. Assign cameras per person in Access control -> People & roles -> CCTV.
+  The key link works through every step, in any order. People's sign-in from the CMS
+  starts working once BOTH sides have the same new secrets (a leaked or missing secret
+  switches only sign-in off, never the key link).
+
+Security notes
+  * The key-link key is NOT secret today: it is written in test_lifecycle.py on the main
+    branch of the PUBLIC GitHub repository itdeptgrav/Grav_Ai_CCTV (since commit a4824f3;
+    github.com shows the repository without signing in), and it was hard-coded in
+    grav-cms-backend routes/cctvSso.js (removed now, still in git history) and shown in
+    the address bar of everybody the CMS sent to CCTV. Anyone who has it sees every
+    camera, sound, recording and Settings. Removed from the comment in the working tree
+    (not committed); it stays in git history. To make it secret again: put a new value in
+    CCTV_TOKEN on the Alienware (and the laptop) and restart -- the link keeps the same
+    shape, https://cctv.grav.in/?key=<new value>.
+  * The CCTV SSO secret published in grav-cctv .env.example (commit 52d9266) is replaced
+    by a placeholder and refused by fingerprint; both local .env files now use a new one.
+  * grav-cms-backend services/cctv/config.js (the old, unmounted in-CMS streaming code)
+    still contains hard-coded NVR host/user/password fallbacks -- not changed here;
+    worth removing and rotating those NVR passwords.

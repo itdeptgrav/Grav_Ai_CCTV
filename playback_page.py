@@ -138,6 +138,9 @@ input[type=date]:focus,input[type=time]:focus{outline:none;border-color:var(--ac
 .seg button[aria-pressed=true]{background:var(--surface-4);color:var(--text)}
 #vol{width:110px;accent-color:var(--accent)}
 .abox{display:flex;align-items:center;gap:8px;min-width:0}
+.who{display:inline-flex;align-items:center;gap:8px;margin-left:10px;font-size:12.5px;color:var(--text-2);white-space:nowrap}
+.who .wn{max-width:160px;overflow:hidden;text-overflow:ellipsis}
+.who a{color:var(--text-2)} .who a:hover{color:var(--text)}
 .abox #audBtn.on{color:var(--accent);border-color:var(--accent)}
 .atx{font-size:12px;color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px}
 .atx.warn{color:#fcd34d}
@@ -165,6 +168,7 @@ input[type=date]:focus,input[type=time]:focus{outline:none;border-color:var(--ac
     <a class=on href="#" aria-current=page><svg class=ic><use href="#i-history"/></svg><span class=hide-sm>Playback</span></a>
     <a id=navSettings href="/settings"><svg class=ic><use href="#i-sliders"/></svg><span class=hide-sm>Settings</span></a>
   </nav>
+  <span class=who id=who hidden><span class="wn hide-sm" id=whoName></span><a href="/logout">Sign out</a></span>
 </header>
 <main class=wrap>
   <section class=filter aria-label="Search recordings">
@@ -455,9 +459,11 @@ function renderTile(t){
     if (['OPENING', 'SEEKING', 'SEARCHING', 'WAITING_SLOT'].includes(t.state)){ const sp = document.createElement('span'); sp.className = 'spinner'; e.over.prepend(sp); }
   }
   const fast = ST && ST.speed !== 1, mine = AUD.tile === t.id, pa = e.el.querySelector('.paud');
-  e.note.textContent = t.audio ? (mine ? (fast ? 'Audio at 1× only' : AUD.muted ? 'Audio muted' : 'Listening')
+  const soundDenied = t.audioAllowed === false;             // not this viewer's to hear: no speaker at all
+  e.note.textContent = soundDenied ? '' : t.audio ? (mine ? (fast ? 'Audio at 1× only' : AUD.muted ? 'Audio muted' : 'Listening')
       : 'Audio available') + ' (' + t.audio + ')'
     : (t.state === 'PLAYING' || t.state === 'PAUSED') ? 'No recorded audio' : '';
+  pa.hidden = soundDenied;
   pa.disabled = !t.audio;
   pa.title = !t.audio ? 'No recorded audio for this camera' : fast ? 'Listen to this camera (sound plays at 1× — fast playback has none)'
     : mine && !AUD.muted ? 'Stop listening' : 'Listen to this camera (one camera at a time)';
@@ -659,7 +665,9 @@ function measureOut(){                                      // what reaches the 
 }
 function renderAudio(){
   const box = $('abox'); if (!RES){ box.hidden = true; return; }
-  const vis = pageTiles(), sel = AUD.tile >= 0 ? RES.tiles[AUD.tile] : null, tx = $('audTx'), btn = $('audBtn');
+  // only cameras whose sound this viewer may hear take part (per-person CCTV permissions)
+  const vis = pageTiles().filter(t => t.audioAllowed !== false), sel = AUD.tile >= 0 ? RES.tiles[AUD.tile] : null, tx = $('audTx'), btn = $('audBtn');
+  if (!vis.length && !sel){ box.hidden = true; return; }
   let msg, warn = false, on = false;
   if (sel){
     const nm = sel.name;
@@ -719,6 +727,15 @@ window.addEventListener('pagehide', () => {
 // ── start ─────────────────────────────────────────────────────────────────
 fetch('/api/playback/config' + q).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).then(c => {
   CFG = c; loadedAt = Date.now(); cams = c.cameras;
+  // Who is looking: the camera list above is already only what they may play back.
+  const v = c.viewer || {};
+  $('navSettings').hidden = !v.admin;
+  $('navLive').hidden = !v.admin && !v.live;
+  $('who').hidden = !v.signOut; $('whoName').textContent = v.name || v.email || ''; $('whoName').title = v.email || '';
+  if (!cams.length){
+    $('empty').innerHTML = '<b>No recorded playback assigned</b>No cameras with recorded playback have been assigned to your account.';
+    $('searchBtn').disabled = true;
+  }
   const now = nvrNowMs(); setRange(now - 3600000, now);
   renderCount();                                            // (+ the footage-kept hint)
   if (!keptFor()) setTimeout(refreshKept, 20000);           // checked right after a server start
