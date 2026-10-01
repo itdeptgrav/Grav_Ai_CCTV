@@ -163,7 +163,9 @@ def resolve_nvr_ips(verbose=True):
             print(f"Remote mode: using public IP {PUBLIC_IP} + forwarded ports.")
         for key in NVRS:
             host, port = endpoint(key)
-            ok = _port_open(host, port)
+            # Over the internet one quick knock can miss (a Wi-Fi stall, a busy NVR)
+            # and print a false "NOT reachable": as patient as the running monitor.
+            ok = any(_port_open(host, port, NETWORK_TIMEOUT) for _ in range(2))
             if verbose:
                 print(f"  {key}: {host}:{port} -> {'reachable' if ok else 'NOT reachable'}")
         return
